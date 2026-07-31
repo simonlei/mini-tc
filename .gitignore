@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Rust build output
+src-tauri/target/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WorkBuddy project memory
+.workbuddy/
+
+# Installers / build artifacts
+*.exe
+*.msi
+
+# Environment
+.env
+.env.local

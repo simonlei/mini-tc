@@ -1,0 +1,140 @@
+/* ===== 石墨工业 ===== */
+:root,
+[data-theme="graphite"] {
+  --bg: #1a1a1d;
+  --panel-bg: #202023;
+  --tab-bg: #161618;
+  --tab-active: #2a2a30;
+  --tab-hover: #252528;
+  --text: #d4d4d8;
+  --text-dim: #888;
+  --text-muted: #555;
+  --accent: #4a8eff;
+  --accent-dim: #2d5fbb;
+  --border: #353538;
+  --hover: #2a2a30;
+  --selected: #1a3a6e;
+  --selected-text: #e0e0e0;
+  --header-bg: #121214;
+  --row-hover: #26262b;
+  --danger: #f44747;
+  --success: #4ec9b0;
+}
+
+/* ===== 霓虹暗夜 ===== */
+[data-theme="neon"] {
+  --bg: #0d1117;
+  --panel-bg: #161b22;
+  --tab-bg: #0d1117;
+  --tab-active: #1c2433;
+  --tab-hover: #121820;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --text-muted: #484f58;
+  --accent: #58a6ff;
+  --accent-dim: #1f6feb;
+  --border: #30363d;
+  --hover: #1c2433;
+  --selected: #13233a;
+  --selected-text: #e6edf3;
+  --header-bg: #0d1117;
+  --row-hover: #1a212e;
+  --danger: #f85149;
+  --success: #3fb950;
+}
+
+/* ===== 暖茶拿铁 ===== */
+[data-theme="latte"] {
+  --bg: #f5f0e8;
+  --panel-bg: #fffdf7;
+  --tab-bg: #ede6d6;
+  --tab-active: #fffdf7;
+  --tab-hover: #f0ebe0;
+  --text: #3d3226;
+  --text-dim: #8c7b65;
+  --text-muted: #b8a994;
+  --accent: #b87333;
+  --accent-dim: #8b5319;
+  --border: #d9ceb8;
+  --hover: #f0ebe0;
+  --selected: #e8d5b0;
+  --selected-text: #3d3226;
+  --header-bg: #ede6d6;
+  --row-hover: #f5efe2;
+  --danger: #c0392b;
+  --success: #3d7a5c;
+}
+
+/* ===== 墨竹青翠 ===== */
+[data-theme="forest"] {
+  --bg: #1a2321;
+  --panel-bg: #1f2b27;
+  --tab-bg: #141c19;
+  --tab-active: #25332e;
+  --tab-hover: #1a2421;
+  --text: #d4e0d8;
+  --text-dim: #7a9a88;
+  --text-muted: #4a6b58;
+  --accent: #4d9e78;
+  --accent-dim: #2e6d4f;
+  --border: #2d3d34;
+  --hover: #26352e;
+  --selected: #1a3d2c;
+  --selected-text: #e0f0e4;
+  --header-bg: #121916;
+  --row-hover: #233028;
+  --danger: #e0554a;
+  --success: #6abf69;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  user-select: none;
+  transition: background 0.3s, color 0.3s;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text);
+  padding: 2px 8px;
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+
+button:hover {
+  background: var(--hover);
+}
+
+button:active {
+  background: var(--accent-dim);
+}
+
+input {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
