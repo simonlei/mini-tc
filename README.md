@@ -10,6 +10,7 @@
 - 文件列表按名称 / 大小 / 修改时间排序
 - 4 套内置主题（石墨工业 / 霓虹暗夜 / 暖茶拿铁 / 墨竹青翠）
 - Ctrl+Tab 快速切换左右面板
+- **自动更新**（帮助 → 检查更新）
 - Windows / macOS / Linux 跨平台支持
 
 ## 技术栈
@@ -46,10 +47,22 @@ npx tauri dev
 ## 构建生产版本
 
 ```bash
-npx tauri build
+# 生成签名密钥（仅首次）
+npx tauri signer generate -p mini-tc-updater -w src-tauri/keys/mini-tc.key
+
+# 构建并准备发布产物
+bash scripts/release/build-release.sh
 ```
 
-产物在 `src-tauri/target/release/bundle/` 下。
+产物在 `scripts/release/out/` 下，包含 `.msi` 安装包和 `latest.json` 更新清单。
+
+## 发布新版本
+
+1. 修改 `package.json` 和 `src-tauri/tauri.conf.json` 中的版本号
+2. 运行 `bash scripts/release/build-release.sh`
+3. 在 [CNB Releases](https://cnb.cool/simon-lei/mini-tc/-/releases) 创建新 Release
+4. 上传 `scripts/release/out/` 中的 `.msi` 和 `latest.json`
+5. 已安装用户下次启动时点击 **帮助 → 检查更新** 即可自动升级
 
 ## 项目结构
 

@@ -27,11 +27,23 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVFMTE2M0ZDRTYzMzMwRjgKUldUNE1EUG0vR01SWGpWNG1BVXpXTmtJdW1sZFhOaXI0QmYwRDVaeU84Wm9VbE5NUDdFSXp5UkgK",
+      "endpoints": [
+        "https://cnb.cool/simon-lei/mini-tc/-/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

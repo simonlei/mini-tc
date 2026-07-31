@@ -22,3 +22,9 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Tauri updater private key (DO NOT commit!)
+src-tauri/keys/*.key
+
+# Build scripts output
+scripts/release/out/

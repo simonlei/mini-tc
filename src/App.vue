@@ -19,10 +19,37 @@
           </div>
         </div>
       </div>
+      <div class="menu-item" @click="checkUpdate">
+        <span>帮助</span>
+        <span class="menu-arrow">▾</span>
+        <div class="menu-dropdown" v-if="helpMenuOpen" @click.stop>
+          <div class="menu-option" @click="checkUpdate; helpMenuOpen = false">
+            <span class="check-mark"></span>
+            <span>检查更新</span>
+          </div>
+          <div class="menu-option" @click="helpMenuOpen = false">
+            <span class="check-mark"></span>
+            <span>关于 MiniTC</span>
+          </div>
+        </div>
+      </div>
+      <span class="update-status" v-if="updateStatus">{{ updateStatus }}</span>
     </div>
 
     <!-- Click-outside overlay -->
-    <div v-if="themeMenuOpen" class="menu-overlay" @click="themeMenuOpen = false"></div>
+    <div v-if="themeMenuOpen || helpMenuOpen" class="menu-overlay" @click="themeMenuOpen = false; helpMenuOpen = false"></div>
+
+    <!-- Update dialog -->
+    <div class="update-dialog-overlay" v-if="updateDialog.visible" @click="updateDialog.visible = false">
+      <div class="update-dialog" @click.stop>
+        <h3>{{ updateDialog.title }}</h3>
+        <p>{{ updateDialog.body }}</p>
+        <div class="update-dialog-actions">
+          <button v-if="updateDialog.showDownload" class="btn-primary" @click="downloadUpdate">下载更新</button>
+          <button class="btn-secondary" @click="updateDialog.visible = false">关闭</button>
+        </div>
+      </div>
+    </div>
 
     <!-- Main content: two panels with a draggable separator -->
     <div class="main-content">
@@ -54,6 +81,8 @@
 <script setup>
 import { ref, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 const activePanel = ref("left");
 
@@ -65,8 +94,20 @@ const themes = [
 ];
 const currentTheme = ref("neon");
 const themeMenuOpen = ref(false);
+const helpMenuOpen = ref(false);
+const updateStatus = ref("");
+
+const updateDialog = ref({
+  visible: false,
+  title: "",
+  body: "",
+  showDownload: false,
+});
+
+let pendingUpdate = null;
 
 function toggleThemeMenu() {
+  helpMenuOpen.value = false;
   themeMenuOpen.value = !themeMenuOpen.value;
 }
 
@@ -74,6 +115,61 @@ function setTheme(key) {
   currentTheme.value = key;
   document.documentElement.setAttribute("data-theme", key);
   localStorage.setItem("mini-tc-theme", key);
+}
+
+// ── Update checking ──
+
+async function checkUpdate() {
+  helpMenuOpen.value = false;
+  updateStatus.value = "正在检查更新...";
+
+  try {
+    const update = await check();
+    if (update) {
+      pendingUpdate = update;
+      updateStatus.value = "";
+      updateDialog.value = {
+        visible: true,
+        title: `发现新版本 v${update.version}`,
+        body: update.body || `当前版本可升级到 ${update.version}。`,
+        showDownload: true,
+      };
+    } else {
+      updateStatus.value = "已是最新版本";
+      setTimeout(() => { updateStatus.value = ""; }, 3000);
+    }
+  } catch (e) {
+    updateStatus.value = "检查更新失败";
+    console.error("Update check failed:", e);
+    setTimeout(() => { updateStatus.value = ""; }, 3000);
+  }
+}
+
+async function downloadUpdate() {
+  if (!pendingUpdate) return;
+  updateDialog.value.visible = false;
+  updateStatus.value = "正在下载更新...";
+
+  try {
+    await pendingUpdate.downloadAndInstall((event) => {
+      switch (event.event) {
+        case "Started":
+          updateStatus.value = "开始下载...";
+          break;
+        case "Progress":
+          updateStatus.value = `下载中... ${Math.round((event.data?.downloaded || 0) / 1024)} KB`;
+          break;
+        case "Finished":
+          updateStatus.value = "下载完成，即将重启...";
+          break;
+      }
+    });
+    await relaunch();
+  } catch (e) {
+    updateStatus.value = "更新失败";
+    console.error("Update download failed:", e);
+    setTimeout(() => { updateStatus.value = ""; }, 5000);
+  }
 }
 
 onMounted(() => {
@@ -246,5 +342,83 @@ onMounted(() => {
   margin: 0 auto;
   background: var(--border);
   transition: background 0.15s;
+}
+
+/* ── Update status ── */
+
+.update-status {
+  font-size: 11px;
+  color: var(--accent);
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+/* ── Update dialog ── */
+
+.update-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.update-dialog {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  min-width: 320px;
+  max-width: 420px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.update-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.update-dialog p {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.update-dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.btn-primary {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  opacity: 0.9;
+}
+
+.btn-secondary {
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  background: var(--hover-bg);
 }
 </style>
