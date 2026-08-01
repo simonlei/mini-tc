@@ -163,6 +163,76 @@ fn list_drives() -> Result<Vec<String>, String> {
     }
 }
 
+/// Expand `%ENV_VAR%` placeholders inside a path string into their values.
+fn expand_env_vars(input: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '%' {
+            let mut j = i + 1;
+            while j < len && chars[j] != '%' {
+                j += 1;
+            }
+            if j < len {
+                let var_name: String = chars[(i + 1)..j].iter().collect();
+                if let Ok(v) = std::env::var(&var_name) {
+                    result.push_str(&v);
+                }
+                i = j + 1;
+            } else {
+                result.push('%');
+                i = j + 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Normalize path separators to the platform-native form so that a mixed
+/// input like `C:/Users\simon` becomes consistent (`C:\Users\simon` on Windows).
+fn normalize_separators(input: &str) -> String {
+    #[cfg(windows)]
+    {
+        input.replace('/', "\\")
+    }
+    #[cfg(not(windows))]
+    {
+        input.to_string()
+    }
+}
+
+/// Resolve a path that may contain `%ENV_VAR%` placeholders and a leading `~`
+/// (home directory) into an absolute path usable by the rest of the app.
+#[tauri::command]
+fn expand_path(path: String) -> String {
+    let expanded = expand_env_vars(&path);
+
+    let resolved = if expanded == "~" {
+        home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "~".to_string())
+    } else if expanded.starts_with("~/") || expanded.starts_with("~\\") {
+        match home_dir() {
+            // Join through `PathBuf` so the separator between the home
+            // directory and the remainder is always inserted exactly once.
+            Some(home) => {
+                let rest = expanded[1..].trim_start_matches(|c| c == '/' || c == '\\');
+                home.join(rest).to_string_lossy().to_string()
+            }
+            None => expanded,
+        }
+    } else {
+        expanded
+    };
+
+    normalize_separators(&resolved)
+}
+
 /// Check if a path exists.
 #[tauri::command]
 fn path_exists(path: String) -> bool {
@@ -399,6 +469,7 @@ pub fn run() {
             get_parent_dir,
             list_drives,
             path_exists,
+            expand_path,
             join_path,
             read_file_preview,
             get_dir_size,

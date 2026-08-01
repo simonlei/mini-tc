@@ -20,6 +20,10 @@ export async function pathExists(path) {
   return invoke("path_exists", { path });
 }
 
+export async function expandPath(path) {
+  return invoke("expand_path", { path });
+}
+
 export async function joinPath(parent, child) {
   return invoke("join_path", { parent, child });
 }

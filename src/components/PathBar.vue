@@ -16,7 +16,7 @@
       <input
         ref="inputRef"
         class="path-input"
-        :value="displayValue"
+        v-model="displayValue"
         @focus="onFocus"
         @blur="onBlur"
         @keydown.enter="onEnter"
@@ -34,7 +34,7 @@
 
 <script setup>
 import { ref, computed, watch } from "vue";
-import { pathExists } from "../api.js";
+import { pathExists, expandPath } from "../api.js";
 
 const props = defineProps({
   path: { type: String, default: "" },
@@ -97,15 +97,21 @@ function onEnter() {
     if (inputRef.value) inputRef.value.blur();
     return;
   }
-  pathExists(newPath).then((exists) => {
-    if (exists) {
-      invalid.value = false;
-      emit("navigate", newPath);
-      editing.value = false;
-      if (inputRef.value) inputRef.value.blur();
-    } else {
+  expandPath(newPath).then((resolved) => {
+    if (!resolved) {
       invalid.value = true;
+      return;
     }
+    pathExists(resolved).then((exists) => {
+      if (exists) {
+        invalid.value = false;
+        emit("navigate", resolved);
+        editing.value = false;
+        if (inputRef.value) inputRef.value.blur();
+      } else {
+        invalid.value = true;
+      }
+    });
   });
 }
 
