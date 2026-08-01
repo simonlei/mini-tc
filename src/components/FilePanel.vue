@@ -331,6 +331,7 @@ const fileListRef = ref(null);
 defineExpose({
   selectedEntry,
   currentPath: computed(() => activeTab.value?.path || ""),
+  refresh,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
 });
 </script>

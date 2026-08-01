@@ -1,6 +1,8 @@
 use serde::Serialize;
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use tauri::Emitter;
 
 #[cfg(windows)]
 #[link(name = "shell32")]
@@ -347,6 +349,321 @@ fn delete_to_trash(path: String) -> Result<(), String> {
     trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))
 }
 
+/// Payload streamed to the frontend during a copy/move so it can render a
+/// progress bar. `copied_bytes` / `total_bytes` drive the bar; `current_name`
+/// shows which file is currently being copied.
+#[derive(Serialize, Clone)]
+pub struct CopyProgress {
+    pub current_name: String,
+    pub copied_bytes: u64,
+    pub total_bytes: u64,
+    pub file_index: usize,
+    pub file_total: usize,
+}
+
+/// Result of a copy/move operation. `errors` are genuine IO failures;
+/// `skipped` counts items left untouched because a same-named destination
+/// existed and the user chose NOT to overwrite (the dialog decision).
+#[derive(Serialize, Default)]
+pub struct CopyResult {
+    pub errors: Vec<String>,
+    pub skipped: usize,
+}
+
+/// Recursively remove a file or directory.
+fn remove_recursive(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Walk a single source (file or directory) and append every file (with its
+/// destination path and byte size) plus every directory (size 0) to `tasks`.
+fn collect_copy_tasks(src: &Path, dest: &Path, tasks: &mut Vec<(PathBuf, PathBuf, u64)>) {
+    if src.is_dir() {
+        tasks.push((src.to_path_buf(), dest.to_path_buf(), 0));
+        if let Ok(entries) = fs::read_dir(src) {
+            for entry in entries.flatten() {
+                let child_src = entry.path();
+                let child_dest = dest.join(entry.file_name());
+                collect_copy_tasks(&child_src, &child_dest, tasks);
+            }
+        }
+    } else if src.is_file() {
+        let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
+    }
+}
+
+/// Emit a progress event for the current copy state.
+fn emit_progress(
+    app: &tauri::AppHandle,
+    name: &str,
+    file_index: usize,
+    file_total: usize,
+    copied_bytes: u64,
+    total_bytes: u64,
+) {
+    let _ = app.emit(
+        "copy-progress",
+        CopyProgress {
+            current_name: name.to_string(),
+            copied_bytes,
+            total_bytes,
+            file_index,
+            file_total,
+        },
+    );
+}
+
+/// Copy a single file in 1 MB chunks, emitting progress roughly every 1% of the
+/// overall job size (or at least every chunk for small jobs).
+fn copy_file_with_progress(
+    app: &tauri::AppHandle,
+    src: &Path,
+    dest: &Path,
+    _file_size: u64,
+    copied: &mut u64,
+    total_bytes: u64,
+    file_index: usize,
+    file_total: usize,
+) -> io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create(dest)?;
+    let mut buf = vec![0u8; 1024 * 1024]; // 1 MB chunks
+    let step = (total_bytes / 100).max(256 * 1024).max(1);
+    let mut last_emit = *copied;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        *copied += n as u64;
+        if *copied - last_emit >= step {
+            last_emit = *copied;
+            emit_progress(
+                app,
+                &src.file_name().unwrap().to_string_lossy(),
+                file_index,
+                file_total,
+                *copied,
+                total_bytes,
+            );
+        }
+    }
+    writer.flush()?;
+    // Final emit so the bar reaches 100% for this file.
+    emit_progress(
+        app,
+        &src.file_name().unwrap().to_string_lossy(),
+        file_index,
+        file_total,
+        *copied,
+        total_bytes,
+    );
+    Ok(())
+}
+
+/// Copy all `sources` into `dest_dir`, emitting `copy-progress` events so the
+/// frontend can render a progress bar.
+///
+/// Conflict policy is driven by `overwrite`:
+/// - `false`: any destination that already exists is left untouched and counted
+///   in `*skipped` (the user chose to skip via the dialog).
+/// - `true`: the existing destination is removed first, then replaced.
+///
+/// Genuine IO failures are returned in the error vector.
+fn copy_all(
+    app: &tauri::AppHandle,
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    overwrite: bool,
+    skipped: &mut usize,
+) -> Vec<String> {
+    let mut tasks: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for src in sources {
+        if !src.exists() {
+            errors.push(format!("源不存在: {}", src.display()));
+            continue;
+        }
+        let name = match src.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => {
+                errors.push(format!("无效路径: {}", src.display()));
+                continue;
+            }
+        };
+        let dest_item = dest_dir.join(&name);
+        if dest_item.exists() {
+            if overwrite {
+                // Remove the existing target so the copy replaces it.
+                if let Err(e) = remove_recursive(&dest_item) {
+                    errors.push(format!("无法覆盖 {}: {}", name, e));
+                    continue;
+                }
+            } else {
+                *skipped += 1;
+                continue;
+            }
+        }
+        collect_copy_tasks(src, &dest_item, &mut tasks);
+    }
+
+    let total_bytes: u64 = tasks.iter().map(|t| t.2).sum();
+    let file_total = tasks.len();
+    let mut copied: u64 = 0;
+
+    for (i, (src, dest, size)) in tasks.iter().enumerate() {
+        // Nested conflict (inside a copied directory): honor the same policy.
+        if dest.exists() {
+            if overwrite {
+                if let Err(e) = remove_recursive(dest) {
+                    errors.push(format!("无法覆盖 {}: {}", dest.display(), e));
+                    continue;
+                }
+            } else {
+                *skipped += 1;
+                continue;
+            }
+        }
+        emit_progress(
+            app,
+            &src.file_name().unwrap().to_string_lossy(),
+            i + 1,
+            file_total,
+            copied,
+            total_bytes,
+        );
+        let res = if src.is_dir() {
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::create_dir_all(dest)
+        } else {
+            copy_file_with_progress(
+                app,
+                src,
+                dest,
+                *size,
+                &mut copied,
+                total_bytes,
+                i + 1,
+                file_total,
+            )
+            .map(|_| ())
+        };
+        if let Err(e) = res {
+            errors.push(format!(
+                "复制失败 {}: {}",
+                src.file_name().unwrap().to_string_lossy(),
+                e
+            ));
+        }
+    }
+
+    errors
+}
+
+/// Copy one or more source items into `dest_dir`.
+/// `overwrite` controls the conflict policy (see `copy_all`). Returns a
+/// `CopyResult` with genuine errors and the count of skipped conflicts.
+#[tauri::command]
+fn copy_items(
+    app: tauri::AppHandle,
+    sources: Vec<String>,
+    dest_dir: String,
+    overwrite: bool,
+) -> Result<CopyResult, String> {
+    let dest_path = Path::new(&dest_dir);
+    if !dest_path.is_dir() {
+        return Result::Err(format!("目标目录不存在: {}", dest_dir));
+    }
+    let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+    let mut skipped = 0;
+    let errors = copy_all(&app, &srcs, dest_path, overwrite, &mut skipped);
+    Result::Ok(CopyResult { errors, skipped })
+}
+
+/// Move (cut) one or more source items into `dest_dir`.
+/// Tries a fast `rename` first (same volume); if that fails (e.g. cross-drive),
+/// falls back to chunked copy + delete (with progress events). `overwrite`
+/// controls the conflict policy (see `copy_all`). Returns a `CopyResult`.
+#[tauri::command]
+fn move_items(
+    app: tauri::AppHandle,
+    sources: Vec<String>,
+    dest_dir: String,
+    overwrite: bool,
+) -> Result<CopyResult, String> {
+    let dest_path = Path::new(&dest_dir);
+    if !dest_path.is_dir() {
+        return Result::Err(format!("目标目录不存在: {}", dest_dir));
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut skipped: usize = 0;
+    let mut cross_volume: Vec<PathBuf> = Vec::new();
+
+    for src in &sources {
+        let src_path = Path::new(src);
+        if !src_path.exists() {
+            errors.push(format!("源不存在: {}", src));
+            continue;
+        }
+        let name = match src_path.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => {
+                errors.push(format!("无效路径: {}", src));
+                continue;
+            }
+        };
+        let dest_item = dest_path.join(&name);
+        if dest_item.exists() {
+            if overwrite {
+                if let Err(e) = remove_recursive(&dest_item) {
+                    errors.push(format!("无法覆盖 {}: {}", name, e));
+                    continue;
+                }
+            } else {
+                skipped += 1;
+                continue;
+            }
+        }
+        // Try rename first; if it fails (cross-volume), defer to copy+delete.
+        match fs::rename(src_path, &dest_item) {
+            Result::Ok(_) => {}
+            Result::Err(_) => cross_volume.push(src_path.to_path_buf()),
+        }
+    }
+
+    // Cross-volume items: copy with progress, then delete the original.
+    if !cross_volume.is_empty() {
+        let mut cv_skipped = 0;
+        let copy_errors = copy_all(&app, &cross_volume, dest_path, overwrite, &mut cv_skipped);
+        errors.extend(copy_errors);
+        skipped += cv_skipped;
+        for src_path in &cross_volume {
+            let name = src_path.file_name().unwrap().to_string_lossy().to_string();
+            let dest_item = dest_path.join(&name);
+            if dest_item.exists() {
+                if let Err(e) = remove_recursive(src_path) {
+                    errors.push(format!("删除源失败 {}: {}", name, e));
+                }
+            }
+        }
+    }
+
+    Result::Ok(CopyResult { errors, skipped })
+}
+
 /// Write debug log to temp file (survives dev restarts).
 fn debug_log(msg: &str) {
     use std::io::Write;
@@ -475,6 +792,8 @@ pub fn run() {
             get_dir_size,
             delete_to_trash,
             open_file,
+            copy_items,
+            move_items,
             load_video_config,
             save_video_config,
         ])

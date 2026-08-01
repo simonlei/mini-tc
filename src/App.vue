@@ -123,6 +123,46 @@
         />
       </div>
     </div>
+    <!-- Toast feedback (clipboard / copy / move results) -->
+    <div class="toast" v-if="toast.visible" :class="'toast-' + toast.type">{{ toast.text }}</div>
+
+    <!-- Copy / move progress bar (large files) -->
+    <div class="progress-overlay" v-if="progress.visible">
+      <div class="progress-card">
+        <div class="progress-row">
+          <span class="progress-title">正在{{ clipboard && clipboard.operation === 'cut' ? '移动' : '复制' }}</span>
+          <span class="progress-pct">{{ progress.percent.toFixed(0) }}%</span>
+        </div>
+        <div class="progress-name" :title="progress.name">{{ progress.name }}</div>
+        <div class="progress-bar">
+          <div class="progress-fill" :style="{ width: progress.percent + '%' }"></div>
+        </div>
+        <div class="progress-meta">
+          {{ formatBytes(progress.copied) }} / {{ formatBytes(progress.total) }}
+          <span v-if="progress.fileTotal > 1"> · 文件 {{ progress.fileIndex }}/{{ progress.fileTotal }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Confirm dialog (same-name conflict on paste) -->
+    <div class="confirm-overlay" v-if="confirmDialog.visible" @click.self="onConfirmChoice('cancel')">
+      <div class="confirm-dialog" @click.stop>
+        <h3>{{ confirmDialog.title }}</h3>
+        <p v-if="confirmDialog.body">{{ confirmDialog.body }}</p>
+        <ul class="confirm-list" v-if="confirmDialog.items.length">
+          <li v-for="(it, i) in confirmDialog.items.slice(0, 5)" :key="i">{{ it }}</li>
+          <li v-if="confirmDialog.items.length > 5">…等 {{ confirmDialog.items.length }} 项</li>
+        </ul>
+        <div class="confirm-actions">
+          <button
+            v-for="opt in confirmDialog.options"
+            :key="opt.value"
+            :class="opt.primary ? 'btn-primary' : 'btn-secondary'"
+            @click="onConfirmChoice(opt.value)"
+          >{{ opt.label }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -131,7 +171,8 @@ import { ref, watch, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
-import { joinPath } from "./api.js";
+import { joinPath, pathExists, copyItems, moveItems } from "./api.js";
+import { listen } from "@tauri-apps/api/event";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -307,6 +348,187 @@ function getActivePanelRef() {
   return activePanel.value === "left" ? leftPanel.value : rightPanel.value;
 }
 
+// ── Clipboard (Ctrl+C / Ctrl+X / Ctrl+V) ──
+//
+// In-app clipboard: holds the source paths plus the operation kind.
+// `copy` keeps the buffer after pasting (re-paste to other targets);
+// `cut` consumes it on the first paste (the sources are moved).
+
+const clipboard = ref(null); // { operation: 'copy' | 'cut', paths: string[] }
+
+function setClipboard(operation) {
+  const panel = getActivePanelRef();
+  const entry = panel?.selectedEntry;
+  const currentPath = panel?.currentPath;
+  if (!entry || !currentPath) {
+    showToast("请先选中一个文件或文件夹", "error");
+    return;
+  }
+  joinPath(currentPath, entry.name).then((fullPath) => {
+    clipboard.value = { operation, paths: [fullPath] };
+    showToast(
+      `${operation === "cut" ? "已剪切" : "已复制"}：${entry.name}`,
+      "info"
+    );
+  });
+}
+
+// ── Copy / move progress bar ──
+// Backend streams a `copy-progress` event (name + copied/total bytes) while a
+// large copy runs. We mirror it into this reactive state to render a bar.
+const progress = ref({
+  visible: false,
+  name: "",
+  percent: 0,
+  copied: 0,
+  total: 0,
+  fileIndex: 0,
+  fileTotal: 0,
+});
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const v = bytes / Math.pow(1024, i);
+  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
+}
+
+// ── Confirm dialog (e.g. same-name conflict on paste) ──
+const confirmDialog = ref({
+  visible: false,
+  title: "",
+  body: "",
+  items: [],
+  options: [],
+});
+let confirmResolve = null;
+
+// Show a modal with the given options; resolves to the chosen option's `value`
+// (or "cancel" if dismissed). `options` is an array of { label, value, primary }.
+function showConfirm({ title, body, items = [], options }) {
+  confirmDialog.value = { visible: true, title, body, items, options };
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+  });
+}
+
+function onConfirmChoice(value) {
+  confirmDialog.value.visible = false;
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (resolve) resolve(value);
+}
+
+async function pasteFromClipboard() {
+  if (!clipboard.value || clipboard.value.paths.length === 0) return;
+
+  const operation = clipboard.value.operation;
+  const sources = clipboard.value.paths;
+
+  // Paste target = the currently active panel — i.e. the directory the user
+  // is currently focused on ("selected"). Ctrl+V drops into whatever folder
+  // the active panel is showing, so it lands in the directory you're looking
+  // at (matching the common expectation, and fixing the earlier bug where it
+  // went to the other panel's stale directory).
+  const targetPanel = getActivePanelRef();
+  const destDir = targetPanel?.currentPath;
+  if (!destDir) {
+    showToast("当前面板目录无效", "error");
+    return;
+  }
+
+  // Pre-scan for same-named items in the destination (top-level only; nested
+  // conflicts inside a copied directory are resolved by the backend using the
+  // same overwrite policy). If any conflict exists, ask the user once.
+  const conflicts = [];
+  for (const src of sources) {
+    const name = src.split(/[\\/]/).pop();
+    if (!name) continue;
+    const destPath = await joinPath(destDir, name);
+    if (await pathExists(destPath)) conflicts.push(name);
+  }
+
+  let overwrite = false;
+  if (conflicts.length > 0) {
+    const choice = await showConfirm({
+      title: "目标已存在同名文件",
+      body: "以下项目在目标目录中已存在，如何处理？",
+      items: conflicts,
+      options: [
+        { label: "跳过", value: "skip" },
+        { label: "覆盖", value: "overwrite", primary: true },
+      ],
+    });
+    if (choice === "cancel") {
+      showToast("已取消粘贴", "info");
+      return;
+    }
+    overwrite = choice === "overwrite";
+  }
+
+  // Listen for progress events emitted by the backend during the copy. The
+  // listener must be registered BEFORE the invoke so we don't miss early
+  // events. We unlisten once the operation finishes.
+  let unlisten = null;
+  try {
+    unlisten = await listen("copy-progress", (event) => {
+      const p = event.payload;
+      progress.value = {
+        visible: true,
+        name: p.current_name,
+        percent: p.total_bytes > 0 ? (p.copied_bytes / p.total_bytes) * 100 : 0,
+        copied: p.copied_bytes,
+        total: p.total_bytes,
+        fileIndex: p.file_index,
+        fileTotal: p.file_total,
+      };
+    });
+
+    const res = operation === "cut"
+      ? await moveItems(sources, destDir, overwrite)
+      : await copyItems(sources, destDir, overwrite);
+
+    // Refresh BOTH panels: on a cut/move the SOURCE panel just lost the files,
+    // on both copy and move the DESTINATION gained them. The active panel is
+    // the target, so the source panel must be refreshed too — otherwise a cut
+    // leaves the moved files still shown in the origin list.
+    leftPanel.value?.refresh?.();
+    rightPanel.value?.refresh?.();
+
+    const verb = operation === "cut" ? "移动" : "复制";
+    if (res.errors && res.errors.length) {
+      showToast(`${verb}部分失败：\n` + res.errors.join("\n"), "error");
+    } else if (res.skipped > 0) {
+      showToast(`${verb}完成，跳过 ${res.skipped} 个同名文件`, "success");
+    } else {
+      showToast(`${verb}完成`, "success");
+    }
+
+    if (operation === "cut") {
+      clipboard.value = null; // consumed
+    }
+  } catch (e) {
+    showToast("操作失败：\n" + String(e), "error");
+  } finally {
+    progress.value.visible = false;
+    if (unlisten) unlisten();
+  }
+}
+
+// ── Toast feedback (success / error / info) ──
+
+const toast = ref({ visible: false, text: "", type: "info" });
+let toastTimer = null;
+
+function showToast(text, type = "info") {
+  toast.value = { visible: true, text, type };
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.value.visible = false;
+  }, 3200);
+}
+
 // Show a normal (image/text) preview on the opposite panel.
 async function showFilePreview(entry, path) {
   const fullPath = await joinPath(path, entry.name);
@@ -457,6 +679,27 @@ onMounted(() => {
       e.preventDefault();
       togglePreview();
       return;
+    }
+
+    // Ctrl+C / Ctrl+X / Ctrl+V: clipboard copy / cut / paste.
+    // Let the browser handle these normally when typing in a text input
+    // (e.g. the filename filter) so text editing shortcuts still work.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+      if (e.key === "c" || e.key === "C") {
+        e.preventDefault();
+        setClipboard("copy");
+        return;
+      }
+      if (e.key === "x" || e.key === "X") {
+        e.preventDefault();
+        setClipboard("cut");
+        return;
+      }
+      if (e.key === "v" || e.key === "V") {
+        e.preventDefault();
+        pasteFromClipboard();
+        return;
+      }
     }
 
     // Ctrl+Tab: Switch active panel (skip if target is showing preview)
@@ -707,5 +950,166 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ── Toast feedback ── */
+
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 70%;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-line;
+  z-index: 300;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  text-align: center;
+}
+
+.toast-info {
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.toast-success {
+  background: #1f6f3f;
+  color: #e8ffe8;
+  border: 1px solid #2f9d5b;
+}
+
+.toast-error {
+  background: #7a1f1f;
+  color: #ffe8e8;
+  border: 1px solid #c0392b;
+}
+
+/* ── Copy / move progress bar ── */
+
+.progress-overlay {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 300;
+  pointer-events: none;
+}
+
+.progress-card {
+  min-width: 320px;
+  max-width: 70%;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
+}
+
+.progress-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.progress-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.progress-name {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-bar {
+  margin-top: 8px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--hover-bg);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.15s ease;
+}
+
+.progress-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Confirm dialog ── */
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 400;
+}
+
+.confirm-dialog {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  min-width: 280px;
+  max-width: 420px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+.confirm-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.confirm-dialog p {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.confirm-list {
+  margin: 0 0 14px;
+  padding-left: 18px;
+  max-height: 140px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.confirm-list li {
+  margin: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 </style>

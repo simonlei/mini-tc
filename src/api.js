@@ -43,3 +43,18 @@ export async function deleteToTrash(path) {
 export async function openFile(path) {
   return invoke("open_file", { path });
 }
+
+/// Copy the given source paths into destDir.
+/// `overwrite` = true replaces same-named destinations; false skips them.
+/// Resolves to { errors: string[], skipped: number } (never throws for
+/// conflicts — real IO failures still surface in `errors`).
+export async function copyItems(sources, destDir, overwrite = false) {
+  return invoke("copy_items", { sources, destDir, overwrite });
+}
+
+/// Move (cut) the given source paths into destDir.
+/// `overwrite` = true replaces same-named destinations; false skips them.
+/// Resolves to { errors: string[], skipped: number }.
+export async function moveItems(sources, destDir, overwrite = false) {
+  return invoke("move_items", { sources, destDir, overwrite });
+}
