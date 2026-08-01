@@ -30,6 +30,7 @@ main:
 
         - name: Rust 代码检查
           script: |
+            rustup component add rustfmt clippy
             cd src-tauri
             cargo check
             cargo fmt --check
@@ -71,6 +72,7 @@ main:
 
         - name: Rust 代码检查
           script: |
+            rustup component add rustfmt clippy
             cd src-tauri
             cargo check
             cargo fmt --check

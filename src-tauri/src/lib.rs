@@ -38,13 +38,13 @@ fn system_time_to_millis(time: std::io::Result<std::time::SystemTime>) -> i64 {
 }
 
 /// Check whether a file/folder is hidden (Unix dot-file or Windows hidden attribute).
-fn is_hidden(name: &str, path: &Path) -> bool {
+fn is_hidden(name: &str, _path: &Path) -> bool {
     if name.starts_with('.') {
         return true;
     }
     #[cfg(windows)]
     {
-        if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(metadata) = fs::metadata(_path) {
             use std::os::windows::fs::MetadataExt;
             const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
             if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
@@ -98,12 +98,10 @@ fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     }
 
     // Sort: directories first, then by name
-    result.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    result.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     Ok(result)
@@ -112,7 +110,9 @@ fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
 /// Return the user's home directory.
 #[tauri::command]
 fn get_home_dir() -> Result<String, String> {
-    home_dir().map(|p| p.to_string_lossy().to_string()).ok_or_else(|| "Could not determine home directory".to_string())
+    home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Could not determine home directory".to_string())
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -217,7 +217,7 @@ pub struct FilePreview {
     pub content: String,      // text content or data URL
     pub mime_type: String,
     pub size: u64,
-    pub encoding: String,     // "utf-8" for text, "base64" for image
+    pub encoding: String, // "utf-8" for text, "base64" for image
 }
 
 const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD"];
@@ -235,8 +235,7 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
         return Err("Cannot preview a directory".to_string());
     }
 
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| format!("Failed to get metadata: {}", e))?;
+    let metadata = fs::metadata(file_path).map_err(|e| format!("Failed to get metadata: {}", e))?;
     let size = metadata.len();
 
     let extension = file_path
@@ -251,8 +250,8 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
                 MAX_TEXT_SIZE / 1024 / 1024
             ));
         }
-        let content = fs::read_to_string(file_path)
-            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let content =
+            fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
         Ok(FilePreview {
             preview_type: "text".to_string(),
             content,
@@ -329,15 +328,21 @@ fn open_file(path: String) -> Result<(), String> {
             })
             .unwrap_or_default();
 
-        debug_log(&format!("Calling ShellExecuteW, dir={:?}",
-            p.parent().map(|d| d.to_string_lossy().to_string())));
+        debug_log(&format!(
+            "Calling ShellExecuteW, dir={:?}",
+            p.parent().map(|d| d.to_string_lossy().to_string())
+        ));
         let result = unsafe {
             ShellExecuteW(
                 0,
                 wide_verb.as_ptr(),
                 wide_path.as_ptr(),
                 std::ptr::null(),
-                if wide_dir.is_empty() { std::ptr::null() } else { wide_dir.as_ptr() },
+                if wide_dir.is_empty() {
+                    std::ptr::null()
+                } else {
+                    wide_dir.as_ptr()
+                },
                 1, // SW_SHOWNORMAL
             )
         };
