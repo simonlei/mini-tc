@@ -1,5 +1,5 @@
 <template>
-  <div class="file-list" tabindex="0" @keydown="onKeydown" @mousedown="onMouseDown" @mouseup="onMouseUp">
+  <div class="file-list" ref="listContainer" tabindex="0" title="按 / 过滤当前目录文件" @keydown="onKeydown" @mousedown="onMouseDown" @mouseup="onMouseUp" @compositionstart="onCompositionStart">
     <!-- Column headers -->
     <div class="file-header">
       <div class="col-name sortable" @click="$emit('sort', 'name')">
@@ -16,11 +16,30 @@
       </div>
     </div>
 
+    <!-- Incremental filename filter bar. Always in the DOM (just moved
+         off-screen when idle) so it can be synchronously focused on the first
+         keydown — that lets an IME compose its very first key into the input
+         instead of committing it as a stray English char on the div. -->
+    <div class="search-bar" :class="{ hidden: !isSearching }">
+      <span class="search-icon">🔍</span>
+      <input
+        ref="searchInput"
+        class="search-input"
+        v-model="searchQuery"
+        type="text"
+        placeholder="Filter files… (Esc to cancel)"
+        @keydown="onSearchKeydown"
+        @compositionstart="onCompositionStart"
+      />
+      <span class="search-count">{{ displayedEntries.length }} match{{ displayedEntries.length === 1 ? "" : "es" }}</span>
+      <button class="search-clear" @click="closeSearch" title="Clear (Esc)">×</button>
+    </div>
+
     <!-- Scrollable file entries -->
     <div class="file-entries" ref="entriesContainer">
-      <!-- Parent dir entry -->
+      <!-- Parent dir entry (hidden only while an actual filter is active) -->
       <div
-        v-if="hasParent"
+        v-if="hasParent && (!isSearching || searchQuery === '')"
         class="file-row parent-row"
         :class="{ selected: selectedIndex === -1 }"
         @click="selectedIndex = -1"
@@ -31,9 +50,9 @@
         <div class="col-modified"></div>
       </div>
 
-      <!-- Actual file entries -->
+      <!-- Actual file entries (search-filtered) -->
       <div
-        v-for="(entry, index) in sortedEntries"
+        v-for="(entry, index) in displayedEntries"
         :key="entry.name"
         class="file-row"
         :class="{
@@ -61,18 +80,19 @@
         <div class="col-modified">{{ formatDate(entry.modified) }}</div>
       </div>
 
-      <!-- Empty state -->
-      <div v-if="sortedEntries.length === 0 && !loading" class="empty-state">Empty folder</div>
+      <!-- Empty / no-match state -->
+      <div v-if="displayedEntries.length === 0 && !loading && !error" class="empty-state">{{ searchEmptyMessage }}</div>
       <div v-if="error" class="error-state">{{ error }}</div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, nextTick } from "vue";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
+  path: { type: String, default: "" },
   sortColumn: { type: String, default: "name" },
   sortDirection: { type: String, default: "asc" },
   loading: { type: Boolean, default: false },
@@ -87,7 +107,13 @@ const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc
 
 const selectedIndex = ref(-1);
 const entriesContainer = ref(null);
+const listContainer = ref(null);
 const pendingSelectName = ref(null);
+
+// ── Incremental search state ──
+const searchQuery = ref("");
+const isSearching = ref(false);
+const searchInput = ref(null);
 
 // Reset selection when entries change, unless we have a pending selection from delete or parent navigation.
 // flush: "post" so the DOM has already re-rendered the new rows before we scrollIntoView.
@@ -97,7 +123,7 @@ watch(
     if (pendingSelectName.value) {
       const name = pendingSelectName.value;
       pendingSelectName.value = null;
-      const idx = sortedEntries.value.findIndex((e) => e.name === name);
+      const idx = displayedEntries.value.findIndex((e) => e.name === name);
       if (idx >= 0) {
         selectRow(idx);
         scrollToRow(idx);
@@ -107,7 +133,7 @@ watch(
       }
     } else if (props.pendingSelectName) {
       const name = props.pendingSelectName;
-      const idx = sortedEntries.value.findIndex((e) => e.name === name);
+      const idx = displayedEntries.value.findIndex((e) => e.name === name);
       if (idx >= 0) {
         selectRow(idx);
         scrollToRow(idx);
@@ -122,6 +148,16 @@ watch(
     }
   },
   { flush: "post" }
+);
+
+// Clear the search filter whenever the directory changes (path changes), but keep
+// it across a delete so the remaining matches stay filtered.
+watch(
+  () => props.path,
+  () => {
+    isSearching.value = false;
+    searchQuery.value = "";
+  }
 );
 
 // Sort entries based on current sort settings
@@ -153,32 +189,44 @@ const sortedEntries = computed(() => {
   return list;
 });
 
+// Filtered view: when searching, keep only names containing the query (case-insensitive).
+const displayedEntries = computed(() => {
+  if (!searchQuery.value) return sortedEntries.value;
+  const q = searchQuery.value.toLowerCase();
+  return sortedEntries.value.filter((e) => e.name.toLowerCase().includes(q));
+});
+
+const searchEmptyMessage = computed(() => {
+  if (isSearching.value && searchQuery.value) {
+    return `No matches for "${searchQuery.value}"`;
+  }
+  return "Empty folder";
+});
+
 function selectRow(index) {
   selectedIndex.value = index;
-  const entry = sortedEntries.value[index];
+  const entry = displayedEntries.value[index];
   if (entry) emit("select", entry);
 }
 
 function scrollToRow(index, block = "nearest") {
   const container = entriesContainer.value;
   if (!container) return;
-  // parent row (..) is the first .file-row when hasParent, so offset by 1
-  const offset = props.hasParent ? 1 : 0;
+  // parent row (..) is the first .file-row when hasParent (and not searching), so offset by 1
+  const offset = props.hasParent && !isSearching.value ? 1 : 0;
   const row = container.querySelectorAll(".file-row")[offset + index];
   if (row) row.scrollIntoView({ block, behavior: "auto" });
 }
 
-// Move the selection by delta (+1 down / -1 up). Does NOT wrap: at the first
-// item pressing Up, or at the last item pressing Down, is a no-op (it won't
-// jump to the opposite end, nor to the parent ".." row).
+// Move the selection by delta (+1 down / -1 up). Does NOT wrap.
 function moveSelection(delta) {
-  const list = sortedEntries.value;
+  const list = displayedEntries.value;
   if (list.length === 0) return;
   const cur = selectedIndex.value;
   let next;
   if (cur === -1) {
-    if (delta > 0) next = 0; // from ".." (parent) → first item
-    else return;             // from "..", Up → no-op
+    if (delta > 0) next = 0; // from nothing selected → first item
+    else return;             // from nothing, Up → no-op
   } else {
     next = cur + delta;
     if (next < 0) next = 0;                        // first item + Up → no-op
@@ -195,6 +243,73 @@ function onDoubleClick(entry) {
     emit("navigate", entry.name);
   } else {
     emit("open", entry.name);
+  }
+}
+
+// ── Search control ──
+
+function startSearch() {
+  isSearching.value = true;
+  // Focus synchronously (the input is always in the DOM). We open via the "/"
+  // activation key — a non-composing key — so by the time the user types the
+  // first real search character (which may be the first pinyin letter of a
+  // Chinese composition), the input is already focused. TSF-based IMEs bind
+  // composition to the focused element on the composing keypress, so the
+  // Chinese text composes into the input from the very first letter.
+  const el = searchInput.value;
+  if (el) {
+    el.focus();
+    const len = el.value.length;
+    el.setSelectionRange(len, len);
+  }
+}
+
+function closeSearch() {
+  isSearching.value = false;
+  searchQuery.value = "";
+  const el = searchInput.value;
+  if (el) el.blur();
+  selectedIndex.value = -1;
+  emit("select", null);
+  // Return focus to the list so "/" can re-open the search immediately.
+  nextTick(() => { listContainer.value?.focus(); });
+}
+
+// Keydown inside the search input: arrows/enter act on results, Esc/empty-backspace exits.
+function onSearchKeydown(e) {
+  // During IME composition (Chinese input), let the IME handle every key
+  // (including Enter to confirm a candidate) without our interference.
+  if (e.isComposing || e.keyCode === 229) return;
+
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    moveSelection(1);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    moveSelection(-1);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    const entry = displayedEntries.value[selectedIndex.value];
+    if (entry) {
+      if (entry.is_dir) emit("navigate", entry.name);
+      else emit("open", entry.name);
+    }
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    closeSearch();
+  } else if (e.key === "Backspace" && searchQuery.value === "") {
+    // Backspace on an empty filter closes the search (backs out to the list).
+    e.preventDefault();
+    closeSearch();
+  }
+}
+
+// Ensure the IME composition continues in the search input. If the composition
+// started on the list div before focus moved, hand focus to the input so the
+// Chinese text composes there and not in the div (which can't hold text).
+function onCompositionStart() {
+  if (searchInput.value && document.activeElement !== searchInput.value) {
+    searchInput.value.focus();
   }
 }
 
@@ -215,7 +330,23 @@ function onMouseUp(e) {
 }
 
 function onKeydown(e) {
-  const list = sortedEntries.value;
+  // If focus is inside the search input, let it handle keys itself.
+  if (e.target && e.target.tagName === "INPUT") return;
+
+  // Open the filter with an explicit activation key ("/"). Using a dedicated
+  // non-composing key — instead of "any printable key" — guarantees the search
+  // input is focused BEFORE the user types any composition character. Chinese
+  // IMEs (TSF) bind composition to the focused element on the keypress that
+  // starts composition; since "/" is plain text (not composition) and focuses
+  // the input synchronously, the very next key (the first pinyin letter) composes
+  // into the already-focused input. "/" itself is prevented from being typed.
+  if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    startSearch();
+    return;
+  }
+
+  const list = displayedEntries.value;
 
   // Backspace navigates to parent — works even in empty directories
   if (e.key === "Backspace") {
@@ -224,8 +355,8 @@ function onKeydown(e) {
     return;
   }
 
-  // Enter on ".." (selectedIndex === -1) navigates to parent — works even in empty directories
-  if (e.key === "Enter" && selectedIndex.value === -1) {
+  // Enter on ".." (selectedIndex === -1) navigates to parent — but only when not searching
+  if (e.key === "Enter" && selectedIndex.value === -1 && !isSearching.value) {
     e.preventDefault();
     emit("navigate-parent");
     return;
@@ -394,6 +525,68 @@ defineExpose({ moveSelection });
 .sort-arrow {
   color: var(--accent);
   font-size: 10px;
+}
+
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Idle (not searching): keep the bar in the DOM but move it off-screen so it
+   stays focusable for IME. Must NOT use display:none / visibility:hidden, which
+   would make it un-focusable and break composition on the first key. */
+.search-bar.hidden {
+  position: absolute;
+  left: -10000px;
+  top: -10000px;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  overflow: hidden;
+}
+
+.search-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.search-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.search-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.search-clear {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.search-clear:hover {
+  color: var(--danger);
 }
 
 .col-name {

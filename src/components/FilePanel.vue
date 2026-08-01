@@ -21,6 +21,7 @@
     <FileList
       ref="fileListRef"
       :entries="entries"
+      :path="activeTab ? activeTab.path : ''"
       :sort-column="activeTab ? activeTab.sortColumn : 'name'"
       :sort-direction="activeTab ? activeTab.sortDirection : 'asc'"
       :loading="loading"
