@@ -26,6 +26,7 @@
       :error="error"
       :has-parent="hasParent"
       :dir-sizes="dirSizes"
+      :pending-select-name="pendingSelectName"
       @sort="handleSort"
       @navigate="navigateInto"
       @navigate-parent="navigateParent"
@@ -33,6 +34,7 @@
       @calc-dir-size="calcDirSize"
       @delete="onDelete"
       @open="onOpen"
+      @pending-select-resolved="pendingSelectName = null"
     />
 
     <!-- Panel status bar -->
@@ -74,6 +76,7 @@ const selectedEntry = ref(null);
 const hasParent = ref(true);
 const drives = ref([]);
 const dirSizes = ref({});
+const pendingSelectName = ref(null);
 
 // ── Persistence helpers ──
 
@@ -223,8 +226,11 @@ async function navigateInto(folderName) {
 async function navigateParent() {
   if (!activeTab.value) return;
   try {
+    // Remember current folder name so we can re-select it in the parent listing
+    const currentName = activeTab.value.path.split("\\").filter(Boolean).pop() || "";
     const parent = await getParentDir(activeTab.value.path);
     if (parent && parent.length > 0) {
+      pendingSelectName.value = currentName;
       activeTab.value.path = parent;
     }
   } catch {

@@ -5,7 +5,7 @@ main:
   push:
     - name: 代码检查
       docker:
-        image: rust:1.85-slim
+        image: rust:1.97-slim
       env:
         CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       stages:
@@ -47,7 +47,7 @@ main:
   pull_request:
     - name: PR 检查
       docker:
-        image: rust:1.85-slim
+        image: rust:1.97-slim
       env:
         CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       stages:

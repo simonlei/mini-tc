@@ -79,15 +79,16 @@ const props = defineProps({
   error: { type: String, default: "" },
   hasParent: { type: Boolean, default: true },
   dirSizes: { type: Object, default: () => ({}) },
+  pendingSelectName: { type: String, default: null },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved"]);
 
 const selectedIndex = ref(-1);
 const entriesContainer = ref(null);
 const pendingSelectName = ref(null);
 
-// Reset selection when entries change, unless we have a pending selection from delete
+// Reset selection when entries change, unless we have a pending selection from delete or parent navigation
 watch(
   () => props.entries,
   () => {
@@ -99,10 +100,20 @@ watch(
         selectRow(idx);
         scrollToRow(idx);
       } else {
-        // File not found (e.g. folder became empty) — deselect
         selectedIndex.value = -1;
         emit("select", null);
       }
+    } else if (props.pendingSelectName) {
+      const name = props.pendingSelectName;
+      const idx = sortedEntries.value.findIndex((e) => e.name === name);
+      if (idx >= 0) {
+        selectRow(idx);
+        scrollToRow(idx);
+      } else {
+        selectedIndex.value = -1;
+        emit("select", null);
+      }
+      emit("pending-select-resolved");
     } else {
       selectedIndex.value = -1;
       emit("select", null);
