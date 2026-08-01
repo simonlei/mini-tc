@@ -25,10 +25,13 @@
       :loading="loading"
       :error="error"
       :has-parent="hasParent"
+      :dir-sizes="dirSizes"
       @sort="handleSort"
       @navigate="navigateInto"
       @navigate-parent="navigateParent"
       @select="onSelect"
+      @calc-dir-size="calcDirSize"
+      @delete="onDelete"
     />
 
     <!-- Panel status bar -->
@@ -45,7 +48,7 @@ import { ref, computed, watch, onMounted } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash } from "../api.js";
 
 const props = defineProps({
   isActive: { type: Boolean, default: false },
@@ -69,6 +72,7 @@ const error = ref("");
 const selectedEntry = ref(null);
 const hasParent = ref(true);
 const drives = ref([]);
+const dirSizes = ref({});
 
 // ── Persistence helpers ──
 
@@ -185,6 +189,7 @@ async function loadDirectory(path) {
   loading.value = true;
   error.value = "";
   selectedEntry.value = null;
+  dirSizes.value = {};
   try {
     entries.value = await listDirectory(path);
 
@@ -248,6 +253,41 @@ function handleSort(column) {
 
 function onSelect(entry) {
   selectedEntry.value = entry;
+}
+
+async function calcDirSize(folderName) {
+  if (!activeTab.value) return;
+  const fullPath = await joinPath(activeTab.value.path, folderName);
+  // Show loading state
+  dirSizes.value = { ...dirSizes.value, [folderName]: -1 };
+  try {
+    const size = await getDirSize(fullPath);
+    dirSizes.value = { ...dirSizes.value, [folderName]: size };
+  } catch (e) {
+    console.error("Failed to calculate dir size:", e);
+    // Remove the loading placeholder on error
+    const next = { ...dirSizes.value };
+    delete next[folderName];
+    dirSizes.value = next;
+  }
+}
+
+// ── Delete ──
+
+async function onDelete(entry) {
+  if (!activeTab.value || !entry) return;
+  const fullPath = await joinPath(activeTab.value.path, entry.name);
+  try {
+    await deleteToTrash(fullPath);
+    // Remove the deleted entry locally instead of full refresh,
+    // so FileList can restore selection to the next file.
+    entries.value = entries.value.filter((e) => e.name !== entry.name);
+    const next = { ...dirSizes.value };
+    delete next[entry.name];
+    dirSizes.value = next;
+  } catch (e) {
+    error.value = String(e);
+  }
 }
 
 // Expose selectedEntry and currentPath for parent access (preview feature)

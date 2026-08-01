@@ -27,3 +27,11 @@ export async function joinPath(parent, child) {
 export async function readFilePreview(path) {
   return invoke("read_file_preview", { path });
 }
+
+export async function getDirSize(path) {
+  return invoke("get_dir_size", { path });
+}
+
+export async function deleteToTrash(path) {
+  return invoke("delete_to_trash", { path });
+}

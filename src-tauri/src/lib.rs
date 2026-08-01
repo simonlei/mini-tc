@@ -165,6 +165,38 @@ fn join_path(parent: String, child: String) -> String {
         .to_string()
 }
 
+/// Recursively calculate the total size of a directory.
+#[tauri::command]
+fn get_dir_size(path: String) -> Result<u64, String> {
+    let dir_path = Path::new(&path);
+    if !dir_path.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    if !dir_path.is_dir() {
+        return Err(format!("Not a directory: {}", path));
+    }
+    dir_size(dir_path).map_err(|e| format!("Failed to calculate directory size: {}", e))
+}
+
+fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
+    let mut total: u64 = 0;
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                total += dir_size(&entry.path())?;
+            } else if file_type.is_symlink() {
+                // Skip symlinks to avoid loops
+                continue;
+            } else {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// Preview data returned to the frontend.
 #[derive(Serialize)]
 pub struct FilePreview {
@@ -223,6 +255,16 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
     }
 }
 
+/// Move a file or directory to the system recycle bin (trash).
+#[tauri::command]
+fn delete_to_trash(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -236,6 +278,8 @@ pub fn run() {
             path_exists,
             join_path,
             read_file_preview,
+            get_dir_size,
+            delete_to_trash,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

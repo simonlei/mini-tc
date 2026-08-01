@@ -50,7 +50,14 @@
           </span>
           <span class="file-name">{{ entry.name }}</span>
         </div>
-        <div class="col-size">{{ entry.is_dir ? "&lt;DIR&gt;" : formatSize(entry.size) }}</div>
+        <div class="col-size">
+          <template v-if="entry.is_dir">
+            <span v-if="dirSizes[entry.name] !== undefined">{{ formatSize(dirSizes[entry.name]) }}</span>
+            <span v-else-if="dirSizes[entry.name] === -1">...</span>
+            <span v-else>&lt;DIR&gt;</span>
+          </template>
+          <template v-else>{{ formatSize(entry.size) }}</template>
+        </div>
         <div class="col-modified">{{ formatDate(entry.modified) }}</div>
       </div>
 
@@ -71,18 +78,35 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   error: { type: String, default: "" },
   hasParent: { type: Boolean, default: true },
+  dirSizes: { type: Object, default: () => ({}) },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete"]);
 
 const selectedIndex = ref(-1);
 const entriesContainer = ref(null);
+const pendingSelectName = ref(null);
 
-// Reset selection when entries change
+// Reset selection when entries change, unless we have a pending selection from delete
 watch(
   () => props.entries,
   () => {
-    selectedIndex.value = -1;
+    if (pendingSelectName.value) {
+      const name = pendingSelectName.value;
+      pendingSelectName.value = null;
+      const idx = sortedEntries.value.findIndex((e) => e.name === name);
+      if (idx >= 0) {
+        selectRow(idx);
+        scrollToRow(idx);
+      } else {
+        // File not found (e.g. folder became empty) — deselect
+        selectedIndex.value = -1;
+        emit("select", null);
+      }
+    } else {
+      selectedIndex.value = -1;
+      emit("select", null);
+    }
   }
 );
 
@@ -175,6 +199,33 @@ function onKeydown(e) {
   } else if (e.key === "Backspace") {
     e.preventDefault();
     emit("navigate-parent");
+  } else if (e.key === " " || e.code === "Space") {
+    e.preventDefault();
+    if (selectedIndex.value >= 0) {
+      const entry = list[selectedIndex.value];
+      if (entry && entry.is_dir) {
+        emit("calc-dir-size", entry.name);
+      }
+    }
+  } else if (e.key === "Delete") {
+    e.preventDefault();
+    if (selectedIndex.value >= 0) {
+      const entry = list[selectedIndex.value];
+      if (entry) {
+        // Determine which file to select after deletion
+        if (selectedIndex.value < list.length - 1) {
+          // Not the last: next file shifts into this position
+          pendingSelectName.value = list[selectedIndex.value + 1].name;
+        } else if (selectedIndex.value > 0) {
+          // Last file: select the previous one (new last)
+          pendingSelectName.value = list[selectedIndex.value - 1].name;
+        } else {
+          // Only file: nothing to select after deletion
+          pendingSelectName.value = null;
+        }
+        emit("delete", entry);
+      }
+    }
   }
 }
 
