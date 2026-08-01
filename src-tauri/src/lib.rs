@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use base64::{engine::general_purpose, Engine};
 
 /// A single file/folder entry returned to the frontend.
 #[derive(Serialize)]
@@ -165,6 +166,88 @@ fn join_path(parent: String, child: String) -> String {
         .to_string()
 }
 
+/// Preview data returned to the frontend.
+#[derive(Serialize)]
+pub struct FilePreview {
+    pub preview_type: String, // "text" or "image"
+    pub content: String,      // text content or data URL
+    pub mime_type: String,
+    pub size: u64,
+    pub encoding: String,     // "utf-8" for text, "base64" for image
+}
+
+const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD"];
+const IMAGE_EXTENSIONS: &[&str] = &["JPG", "JPEG", "PNG", "GIF"];
+const MAX_TEXT_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
+const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024; // 20 MB
+
+/// Read a file for preview. Supports text (txt/md) and image (jpg/png/gif) files.
+#[tauri::command]
+fn read_file_preview(path: String) -> Result<FilePreview, String> {
+    let file_path = Path::new(&path);
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {}", path));
+    }
+    if file_path.is_dir() {
+        return Err("Cannot preview a directory".to_string());
+    }
+
+    let metadata = fs::metadata(file_path)
+        .map_err(|e| format!("Failed to get metadata: {}", e))?;
+    let size = metadata.len();
+
+    let extension = file_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+
+    if TEXT_EXTENSIONS.contains(&extension.as_str()) {
+        if size > MAX_TEXT_SIZE {
+            return Err(format!(
+                "File too large to preview (max {} MB)",
+                MAX_TEXT_SIZE / 1024 / 1024
+            ));
+        }
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        Ok(FilePreview {
+            preview_type: "text".to_string(),
+            content,
+            mime_type: "text/plain".to_string(),
+            size,
+            encoding: "utf-8".to_string(),
+        })
+    } else if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+        if size > MAX_IMAGE_SIZE {
+            return Err(format!(
+                "Image too large to preview (max {} MB)",
+                MAX_IMAGE_SIZE / 1024 / 1024
+            ));
+        }
+        let bytes = fs::read(file_path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let b64 = general_purpose::STANDARD.encode(&bytes);
+        let mime = match extension.as_str() {
+            "PNG" => "image/png",
+            "JPG" | "JPEG" => "image/jpeg",
+            "GIF" => "image/gif",
+            _ => "image/png",
+        };
+        Ok(FilePreview {
+            preview_type: "image".to_string(),
+            content: format!("data:{};base64,{}", mime, b64),
+            mime_type: mime.to_string(),
+            size,
+            encoding: "base64".to_string(),
+        })
+    } else {
+        Err(format!(
+            "Unsupported file type: .{}",
+            extension.to_lowercase()
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -177,6 +260,7 @@ pub fn run() {
             list_drives,
             path_exists,
             join_path,
+            read_file_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

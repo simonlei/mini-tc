@@ -19,11 +19,11 @@
           </div>
         </div>
       </div>
-      <div class="menu-item" @click="checkUpdate">
+      <div class="menu-item" @click="toggleHelpMenu">
         <span>帮助</span>
         <span class="menu-arrow">▾</span>
         <div class="menu-dropdown" v-if="helpMenuOpen" @click.stop>
-          <div class="menu-option" @click="checkUpdate; helpMenuOpen = false">
+          <div class="menu-option" @click="checkUpdate(); helpMenuOpen = false">
             <span class="check-mark"></span>
             <span>检查更新</span>
           </div>
@@ -54,11 +54,18 @@
     <!-- Main content: two panels with a draggable separator -->
     <div class="main-content">
       <div class="left-panel-wrapper" :style="{ flex: leftFlex + ' 1 0%' }">
+        <FilePreview
+          v-if="previewVisible && previewPanel === 'left'"
+          :file-path="previewFilePath"
+          :file-name="previewFileName"
+          @close="closePreview"
+        />
         <FilePanel
+          v-show="!(previewVisible && previewPanel === 'left')"
           ref="leftPanel"
           panel-id="left"
-          :is-active="activePanel === 'left'"
-          @activate="activePanel = 'left'"
+          :is-active="activePanel === 'left' && !(previewVisible && previewPanel === 'left')"
+          @activate="onPanelActivate('left')"
         />
       </div>
 
@@ -67,11 +74,18 @@
       </div>
 
       <div class="right-panel-wrapper" :style="{ flex: rightFlex + ' 1 0%' }">
+        <FilePreview
+          v-if="previewVisible && previewPanel === 'right'"
+          :file-path="previewFilePath"
+          :file-name="previewFileName"
+          @close="closePreview"
+        />
         <FilePanel
+          v-show="!(previewVisible && previewPanel === 'right')"
           ref="rightPanel"
           panel-id="right"
-          :is-active="activePanel === 'right'"
-          @activate="activePanel = 'right'"
+          :is-active="activePanel === 'right' && !(previewVisible && previewPanel === 'right')"
+          @activate="onPanelActivate('right')"
         />
       </div>
     </div>
@@ -79,8 +93,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, watch, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
+import FilePreview from "./components/FilePreview.vue";
+import { joinPath } from "./api.js";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -109,6 +125,11 @@ let pendingUpdate = null;
 function toggleThemeMenu() {
   helpMenuOpen.value = false;
   themeMenuOpen.value = !themeMenuOpen.value;
+}
+
+function toggleHelpMenu() {
+  themeMenuOpen.value = false;
+  helpMenuOpen.value = !helpMenuOpen.value;
 }
 
 function setTheme(key) {
@@ -205,11 +226,112 @@ function endDrag() {
   dragging.value = false;
 }
 
-// Keyboard shortcuts for switching active panel
+// ── File Preview (Ctrl+Q) ──
+
+const PREVIEWABLE_EXTENSIONS = ["txt", "md", "jpg", "jpeg", "png", "gif"];
+
+const previewVisible = ref(false);
+const previewPanel = ref(""); // which panel shows the preview
+const previewFilePath = ref("");
+const previewFileName = ref("");
+
+function onPanelActivate(panelId) {
+  // Don't activate a panel that's showing the preview
+  if (previewVisible.value && previewPanel.value === panelId) return;
+  activePanel.value = panelId;
+}
+
+function getActivePanelRef() {
+  return activePanel.value === "left" ? leftPanel.value : rightPanel.value;
+}
+
+async function togglePreview() {
+  if (previewVisible.value) {
+    closePreview();
+    return;
+  }
+
+  const panel = getActivePanelRef();
+  const entry = panel?.selectedEntry;
+  const path = panel?.currentPath;
+  if (!entry || entry.is_dir || !path) return;
+
+  const ext = entry.extension.toLowerCase();
+  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
+
+  const fullPath = await joinPath(path, entry.name);
+  previewPanel.value = activePanel.value === "left" ? "right" : "left";
+  previewFilePath.value = fullPath;
+  previewFileName.value = entry.name;
+  previewVisible.value = true;
+}
+
+function closePreview() {
+  previewVisible.value = false;
+  previewPanel.value = "";
+  previewFilePath.value = "";
+  previewFileName.value = "";
+}
+
+// Auto-update preview when the active panel's selection changes
+watch(
+  () => {
+    const panel = getActivePanelRef();
+    return panel?.selectedEntry;
+  },
+  async (entry) => {
+    if (!previewVisible.value) return;
+    if (!entry || entry.is_dir) return;
+
+    const ext = entry.extension.toLowerCase();
+    if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
+
+    const panel = getActivePanelRef();
+    const path = panel?.currentPath;
+    if (!path) return;
+
+    const fullPath = await joinPath(path, entry.name);
+    previewFilePath.value = fullPath;
+    previewFileName.value = entry.name;
+  }
+);
+
+// Also update preview when active panel switches
+watch(activePanel, async () => {
+  if (!previewVisible.value) return;
+
+  const panel = getActivePanelRef();
+  const entry = panel?.selectedEntry;
+  if (!entry || entry.is_dir) return;
+
+  const ext = entry.extension.toLowerCase();
+  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
+
+  const path = panel?.currentPath;
+  if (!path) return;
+
+  const fullPath = await joinPath(path, entry.name);
+  previewFilePath.value = fullPath;
+  previewFileName.value = entry.name;
+});
+
+// Keyboard shortcuts
 onMounted(() => {
   document.addEventListener("keydown", (e) => {
+    // Ctrl+Q: Toggle file preview
+    if (e.key === "q" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      togglePreview();
+      return;
+    }
+
+    // Ctrl+Tab: Switch active panel (skip if target is showing preview)
     if (e.key === "Tab" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
+      if (previewVisible.value) {
+        // Don't allow switching to the preview panel
+        return;
+      }
       activePanel.value = activePanel.value === "left" ? "right" : "left";
     }
   });

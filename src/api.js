@@ -23,3 +23,7 @@ export async function pathExists(path) {
 export async function joinPath(parent, child) {
   return invoke("join_path", { parent, child });
 }
+
+export async function readFilePreview(path) {
+  return invoke("read_file_preview", { path });
+}

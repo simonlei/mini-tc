@@ -249,6 +249,12 @@ function handleSort(column) {
 function onSelect(entry) {
   selectedEntry.value = entry;
 }
+
+// Expose selectedEntry and currentPath for parent access (preview feature)
+defineExpose({
+  selectedEntry,
+  currentPath: computed(() => activeTab.value?.path || ""),
+});
 </script>
 
 <style scoped>

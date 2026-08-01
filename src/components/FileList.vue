@@ -76,6 +76,7 @@ const props = defineProps({
 const emit = defineEmits(["sort", "navigate", "navigate-parent", "select"]);
 
 const selectedIndex = ref(-1);
+const entriesContainer = ref(null);
 
 // Reset selection when entries change
 watch(
@@ -120,6 +121,15 @@ function selectRow(index) {
   if (entry) emit("select", entry);
 }
 
+function scrollToRow(index, block = "nearest") {
+  const container = entriesContainer.value;
+  if (!container) return;
+  // parent row (..) is the first .file-row when hasParent, so offset by 1
+  const offset = props.hasParent ? 1 : 0;
+  const row = container.querySelectorAll(".file-row")[offset + index];
+  if (row) row.scrollIntoView({ block, behavior: "auto" });
+}
+
 function onDoubleClick(entry) {
   if (entry.is_dir) {
     emit("navigate", entry.name);
@@ -134,14 +144,24 @@ function onKeydown(e) {
     e.preventDefault();
     if (selectedIndex.value < list.length - 1) {
       selectRow(selectedIndex.value + 1);
+      scrollToRow(selectedIndex.value);
     }
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
     if (selectedIndex.value > -1) {
       selectRow(selectedIndex.value - 1);
+      scrollToRow(selectedIndex.value);
     } else if (props.hasParent) {
       selectedIndex.value = -1;
     }
+  } else if (e.key === "Home") {
+    e.preventDefault();
+    selectRow(0);
+    scrollToRow(0, "start");
+  } else if (e.key === "End") {
+    e.preventDefault();
+    selectRow(list.length - 1);
+    scrollToRow(list.length - 1, "end");
   } else if (e.key === "Enter") {
     e.preventDefault();
     if (selectedIndex.value === -1) {
