@@ -28,6 +28,7 @@
       :has-parent="hasParent"
       :dir-sizes="dirSizes"
       :pending-select-name="pendingSelectName"
+      :is-active="isActive"
       @sort="handleSort"
       @navigate="navigateInto"
       @navigate-parent="navigateParent"

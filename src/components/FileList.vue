@@ -1,5 +1,5 @@
 <template>
-  <div class="file-list" tabindex="0" @keydown="onKeydown">
+  <div class="file-list" tabindex="0" @keydown="onKeydown" @mousedown="onMouseDown" @mouseup="onMouseUp">
     <!-- Column headers -->
     <div class="file-header">
       <div class="col-name sortable" @click="$emit('sort', 'name')">
@@ -80,6 +80,7 @@ const props = defineProps({
   hasParent: { type: Boolean, default: true },
   dirSizes: { type: Object, default: () => ({}) },
   pendingSelectName: { type: String, default: null },
+  isActive: { type: Boolean, default: false },
 });
 
 const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved"]);
@@ -194,6 +195,22 @@ function onDoubleClick(entry) {
     emit("navigate", entry.name);
   } else {
     emit("open", entry.name);
+  }
+}
+
+// Mouse back button (XButton1, e.button === 3) navigates to parent, but only
+// when this panel is the active one. Matches the Backspace behaviour.
+// preventDefault on mousedown blocks any browser/Tauri back/forward side effects.
+function onMouseDown(e) {
+  if (e.button === 3 || e.button === 4) {
+    e.preventDefault();
+  }
+}
+
+function onMouseUp(e) {
+  if (e.button === 3 && props.isActive) {
+    e.preventDefault();
+    emit("navigate-parent");
   }
 }
 
