@@ -32,6 +32,7 @@
       @select="onSelect"
       @calc-dir-size="calcDirSize"
       @delete="onDelete"
+      @open="onOpen"
     />
 
     <!-- Panel status bar -->
@@ -48,7 +49,7 @@ import { ref, computed, watch, onMounted } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile } from "../api.js";
 
 const props = defineProps({
   isActive: { type: Boolean, default: false },
@@ -286,6 +287,21 @@ async function onDelete(entry) {
     delete next[entry.name];
     dirSizes.value = next;
   } catch (e) {
+    error.value = String(e);
+  }
+}
+
+// ── Open file ──
+
+async function onOpen(fileName) {
+  if (!activeTab.value) return;
+  const fullPath = await joinPath(activeTab.value.path, fileName);
+  console.log("[onOpen] fileName:", fileName, "fullPath:", fullPath);
+  try {
+    await openFile(fullPath);
+    console.log("[onOpen] openFile succeeded");
+  } catch (e) {
+    console.error("[onOpen] openFile failed:", e);
     error.value = String(e);
   }
 }

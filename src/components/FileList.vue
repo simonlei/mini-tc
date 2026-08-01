@@ -81,7 +81,7 @@ const props = defineProps({
   dirSizes: { type: Object, default: () => ({}) },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open"]);
 
 const selectedIndex = ref(-1);
 const entriesContainer = ref(null);
@@ -155,13 +155,31 @@ function scrollToRow(index, block = "nearest") {
 }
 
 function onDoubleClick(entry) {
+  console.log("[onDoubleClick] entry:", entry.name, "is_dir:", entry.is_dir);
   if (entry.is_dir) {
     emit("navigate", entry.name);
+  } else {
+    emit("open", entry.name);
   }
 }
 
 function onKeydown(e) {
   const list = sortedEntries.value;
+
+  // Backspace navigates to parent — works even in empty directories
+  if (e.key === "Backspace") {
+    e.preventDefault();
+    emit("navigate-parent");
+    return;
+  }
+
+  // Enter on ".." (selectedIndex === -1) navigates to parent — works even in empty directories
+  if (e.key === "Enter" && selectedIndex.value === -1) {
+    e.preventDefault();
+    emit("navigate-parent");
+    return;
+  }
+
   if (list.length === 0) return;
 
   if (e.key === "ArrowDown") {
@@ -188,17 +206,15 @@ function onKeydown(e) {
     scrollToRow(list.length - 1, "end");
   } else if (e.key === "Enter") {
     e.preventDefault();
-    if (selectedIndex.value === -1) {
-      emit("navigate-parent");
-    } else {
-      const entry = list[selectedIndex.value];
-      if (entry && entry.is_dir) {
+    const entry = list[selectedIndex.value];
+    console.log("[Enter] selectedIndex:", selectedIndex.value, "entry:", entry?.name, "is_dir:", entry?.is_dir);
+    if (entry) {
+      if (entry.is_dir) {
         emit("navigate", entry.name);
+      } else {
+        emit("open", entry.name);
       }
     }
-  } else if (e.key === "Backspace") {
-    e.preventDefault();
-    emit("navigate-parent");
   } else if (e.key === " " || e.code === "Space") {
     e.preventDefault();
     if (selectedIndex.value >= 0) {

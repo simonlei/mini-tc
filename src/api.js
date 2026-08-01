@@ -35,3 +35,7 @@ export async function getDirSize(path) {
 export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
+
+export async function openFile(path) {
+  return invoke("open_file", { path });
+}

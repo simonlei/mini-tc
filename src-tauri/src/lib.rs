@@ -2,6 +2,19 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+#[link(name = "shell32")]
+extern "system" {
+    fn ShellExecuteW(
+        hwnd: isize,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show_cmd: i32,
+    ) -> isize;
+}
+
 /// A single file/folder entry returned to the frontend.
 #[derive(Serialize)]
 pub struct FileEntry {
@@ -265,6 +278,90 @@ fn delete_to_trash(path: String) -> Result<(), String> {
     trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))
 }
 
+/// Write debug log to temp file (survives dev restarts).
+fn debug_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(std::env::temp_dir().join("mini-tc-debug.log"))
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
+/// Open a file or directory using ShellExecuteW (Windows) / xdg-open (Unix).
+/// ShellExecuteW is the same API Windows Explorer uses for double-click.
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    debug_log(&format!("open_file called: {}", path));
+    let p = Path::new(&path);
+    if !p.exists() {
+        let msg = format!("Path does not exist: {}", path);
+        debug_log(&format!("ERROR: {}", msg));
+        return Err(msg);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide_path: Vec<u16> = std::ffi::OsStr::new(&path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let wide_verb: Vec<u16> = "open\0".encode_utf16().collect();
+
+        // Set working directory to the file's parent, NOT the project root.
+        // This prevents the spawned exe from writing files into the Tauri
+        // watched dirs (src-tauri/src etc.) and triggering a dev recompile.
+        let wide_dir: Vec<u16> = p
+            .parent()
+            .map(|d| {
+                std::ffi::OsStr::new(d)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        debug_log(&format!("Calling ShellExecuteW, dir={:?}",
+            p.parent().map(|d| d.to_string_lossy().to_string())));
+        let result = unsafe {
+            ShellExecuteW(
+                0,
+                wide_verb.as_ptr(),
+                wide_path.as_ptr(),
+                std::ptr::null(),
+                if wide_dir.is_empty() { std::ptr::null() } else { wide_dir.as_ptr() },
+                1, // SW_SHOWNORMAL
+            )
+        };
+
+        // ShellExecuteW returns HINSTANCE > 32 on success, <= 32 on error
+        if result as usize <= 32 {
+            let msg = format!("ShellExecuteW failed, code={}", result);
+            debug_log(&format!("ERROR: {}", msg));
+            return Err(msg);
+        }
+        debug_log("ShellExecuteW succeeded");
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -280,6 +377,7 @@ pub fn run() {
             read_file_preview,
             get_dir_size,
             delete_to_trash,
+            open_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

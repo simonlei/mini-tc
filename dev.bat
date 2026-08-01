@@ -7,6 +7,9 @@ set "NODE_PATH=C:\Users\simon\.workbuddy\binaries\node\versions\22.22.2"
 
 set "PATH=%NODE_PATH%;%PATH%"
 
+REM Workaround for rustc 1.97.1 ICE (rmeta encoder panic) — disable incremental compilation
+set "CARGO_INCREMENTAL=0"
+
 set "CMD=%~1"
 if "%CMD%"=="" set "CMD=dev"
 

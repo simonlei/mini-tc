@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# Workaround for rustc 1.97.1 ICE (rmeta encoder panic) — disable incremental compilation
+export CARGO_INCREMENTAL=0
+
 # ---- 路径常量 ----
 PROJECT_ROOT="C:/Users/simon/WorkBuddy/mini-tc"
 SRC_TAURI="${PROJECT_ROOT}/src-tauri"
