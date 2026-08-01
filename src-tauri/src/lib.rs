@@ -367,6 +367,27 @@ fn open_file(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Load persisted video-player config from ~/.minitc/video-config.json.
+/// Returns the raw JSON string, or null if no config exists / it can't be read.
+#[tauri::command]
+fn load_video_config() -> Option<String> {
+    let dir = home_dir()?.join(".minitc");
+    let path = dir.join("video-config.json");
+    fs::read_to_string(path).ok()
+}
+
+/// Persist video-player config to ~/.minitc/video-config.json so it is shared
+/// across every run of the binary (dev vs bundled) regardless of cwd.
+#[tauri::command]
+fn save_video_config(config: String) -> Result<(), String> {
+    let home = home_dir().ok_or_else(|| "无法定位用户主目录".to_string())?;
+    let dir = home.join(".minitc");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("video-config.json");
+    fs::write(path, config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -383,6 +404,8 @@ pub fn run() {
             get_dir_size,
             delete_to_trash,
             open_file,
+            load_video_config,
+            save_video_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -88,7 +88,8 @@ const selectedIndex = ref(-1);
 const entriesContainer = ref(null);
 const pendingSelectName = ref(null);
 
-// Reset selection when entries change, unless we have a pending selection from delete or parent navigation
+// Reset selection when entries change, unless we have a pending selection from delete or parent navigation.
+// flush: "post" so the DOM has already re-rendered the new rows before we scrollIntoView.
 watch(
   () => props.entries,
   () => {
@@ -118,7 +119,8 @@ watch(
       selectedIndex.value = -1;
       emit("select", null);
     }
-  }
+  },
+  { flush: "post" }
 );
 
 // Sort entries based on current sort settings
@@ -165,6 +167,27 @@ function scrollToRow(index, block = "nearest") {
   if (row) row.scrollIntoView({ block, behavior: "auto" });
 }
 
+// Move the selection by delta (+1 down / -1 up). Does NOT wrap: at the first
+// item pressing Up, or at the last item pressing Down, is a no-op (it won't
+// jump to the opposite end, nor to the parent ".." row).
+function moveSelection(delta) {
+  const list = sortedEntries.value;
+  if (list.length === 0) return;
+  const cur = selectedIndex.value;
+  let next;
+  if (cur === -1) {
+    if (delta > 0) next = 0; // from ".." (parent) → first item
+    else return;             // from "..", Up → no-op
+  } else {
+    next = cur + delta;
+    if (next < 0) next = 0;                        // first item + Up → no-op
+    if (next > list.length - 1) next = list.length - 1; // last item + Down → no-op
+  }
+  if (next === cur) return;
+  selectRow(next);
+  scrollToRow(next);
+}
+
 function onDoubleClick(entry) {
   console.log("[onDoubleClick] entry:", entry.name, "is_dir:", entry.is_dir);
   if (entry.is_dir) {
@@ -195,18 +218,10 @@ function onKeydown(e) {
 
   if (e.key === "ArrowDown") {
     e.preventDefault();
-    if (selectedIndex.value < list.length - 1) {
-      selectRow(selectedIndex.value + 1);
-      scrollToRow(selectedIndex.value);
-    }
+    moveSelection(1);
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
-    if (selectedIndex.value > -1) {
-      selectRow(selectedIndex.value - 1);
-      scrollToRow(selectedIndex.value);
-    } else if (props.hasParent) {
-      selectedIndex.value = -1;
-    }
+    moveSelection(-1);
   } else if (e.key === "Home") {
     e.preventDefault();
     selectRow(0);
@@ -311,9 +326,24 @@ function getFileIcon(ext) {
     MP4: "🎬",
     AVI: "🎬",
     MKV: "🎬",
+    WEBM: "🎬",
+    MOV: "🎬",
+    OGV: "🎬",
+    FLV: "🎬",
+    WMV: "🎬",
+    M4V: "🎬",
+    MPG: "🎬",
+    MPEG: "🎬",
+    RM: "🎬",
+    RMVB: "🎬",
+    "3GP": "🎬",
+    TS: "🎬",
+    VOB: "🎬",
   };
   return icons[ext] || "📄";
 }
+
+defineExpose({ moveSelection });
 </script>
 
 <style scoped>

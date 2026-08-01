@@ -55,18 +55,34 @@
     <div class="main-content">
       <div class="left-panel-wrapper" :style="{ flex: leftFlex + ' 1 0%' }">
         <FilePreview
-          v-if="previewVisible && previewPanel === 'left'"
+          v-if="previewVisible && previewPanel === 'left' && previewKind === 'file'"
           :file-path="previewFilePath"
           :file-name="previewFileName"
           :file-bytes="previewFileBytes"
           @close="closePreview"
         />
+        <VideoPreview
+          v-else-if="previewVisible && previewPanel === 'left' && previewKind === 'video'"
+          :file-path="previewFilePath"
+          :file-name="previewFileName"
+          :file-bytes="previewFileBytes"
+          @close="closePreview"
+          @navigate-list="onNavigateList"
+        />
+        <div
+          v-else-if="previewVisible && previewPanel === 'left' && previewKind === 'unsupported'"
+          class="preview-placeholder"
+        >
+          <div class="preview-placeholder-title">暂不支持预览该格式</div>
+          <div class="preview-placeholder-name" v-if="previewFileName">{{ previewFileName }}</div>
+        </div>
         <FilePanel
           v-show="!(previewVisible && previewPanel === 'left')"
           ref="leftPanel"
           panel-id="left"
           :is-active="activePanel === 'left' && !(previewVisible && previewPanel === 'left')"
           @activate="onPanelActivate('left')"
+          @open-video="openVideo"
         />
       </div>
 
@@ -76,18 +92,34 @@
 
       <div class="right-panel-wrapper" :style="{ flex: rightFlex + ' 1 0%' }">
         <FilePreview
-          v-if="previewVisible && previewPanel === 'right'"
+          v-if="previewVisible && previewPanel === 'right' && previewKind === 'file'"
           :file-path="previewFilePath"
           :file-name="previewFileName"
           :file-bytes="previewFileBytes"
           @close="closePreview"
         />
+        <VideoPreview
+          v-else-if="previewVisible && previewPanel === 'right' && previewKind === 'video'"
+          :file-path="previewFilePath"
+          :file-name="previewFileName"
+          :file-bytes="previewFileBytes"
+          @close="closePreview"
+          @navigate-list="onNavigateList"
+        />
+        <div
+          v-else-if="previewVisible && previewPanel === 'right' && previewKind === 'unsupported'"
+          class="preview-placeholder"
+        >
+          <div class="preview-placeholder-title">暂不支持预览该格式</div>
+          <div class="preview-placeholder-name" v-if="previewFileName">{{ previewFileName }}</div>
+        </div>
         <FilePanel
           v-show="!(previewVisible && previewPanel === 'right')"
           ref="rightPanel"
           panel-id="right"
           :is-active="activePanel === 'right' && !(previewVisible && previewPanel === 'right')"
           @activate="onPanelActivate('right')"
+          @open-video="openVideo"
         />
       </div>
     </div>
@@ -98,6 +130,7 @@
 import { ref, watch, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
+import VideoPreview from "./components/VideoPreview.vue";
 import { joinPath } from "./api.js";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -231,12 +264,38 @@ function endDrag() {
 // ── File Preview (Ctrl+Q) ──
 
 const PREVIEWABLE_EXTENSIONS = ["txt", "md", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
 
 const previewVisible = ref(false);
 const previewPanel = ref(""); // which panel shows the preview
 const previewFilePath = ref("");
 const previewFileName = ref("");
 const previewFileBytes = ref(0);
+
+// ── Preview kind & source panel ──
+// previewKind === 'video' 时对面栏渲染 VideoPreview，否则渲染 FilePreview（图片/文本）。
+const previewKind = ref("");
+
+function openVideo(payload) {
+  const source = payload.panelId || payload.sourcePanel || activePanel.value;
+  previewPanel.value = source === "left" ? "right" : "left";
+  previewKind.value = "video";
+  previewFilePath.value = payload.path;
+  previewFileName.value = payload.name;
+  previewFileBytes.value = payload.bytes || 0;
+  previewVisible.value = true;
+}
+
+// Switch to another video within the SAME preview panel (↑/↓ navigation in VideoPreview).
+// Unlike openVideo, this keeps previewPanel unchanged.
+// ↑/↓ pressed inside the video preview: delegate to the file list paired with
+// the preview (the opposite panel). This lets navigation span ALL file types in
+// the directory and switch previews across types, and it does not wrap around.
+function onNavigateList(delta) {
+  const source = previewPanel.value === "left" ? "right" : "left";
+  const panel = source === "left" ? leftPanel.value : rightPanel.value;
+  panel?.moveSelection?.(delta);
+}
 
 function onPanelActivate(panelId) {
   // Don't activate a panel that's showing the preview
@@ -248,6 +307,25 @@ function getActivePanelRef() {
   return activePanel.value === "left" ? leftPanel.value : rightPanel.value;
 }
 
+// Show a normal (image/text) preview on the opposite panel.
+async function showFilePreview(entry, path) {
+  const fullPath = await joinPath(path, entry.name);
+  previewPanel.value = activePanel.value === "left" ? "right" : "left";
+  previewKind.value = "file";
+  previewFilePath.value = fullPath;
+  previewFileName.value = entry.name;
+  previewFileBytes.value = entry.size;
+  previewVisible.value = true;
+}
+
+// Show a "format not supported" placeholder on the opposite panel.
+function showUnsupportedPreview(entry) {
+  previewPanel.value = activePanel.value === "left" ? "right" : "left";
+  previewKind.value = "unsupported";
+  previewFileName.value = entry.name;
+  previewVisible.value = true;
+}
+
 async function togglePreview() {
   if (previewVisible.value) {
     closePreview();
@@ -256,23 +334,34 @@ async function togglePreview() {
 
   const panel = getActivePanelRef();
   const entry = panel?.selectedEntry;
+  if (!entry) return;
+  if (entry.is_dir) {
+    showUnsupportedPreview(entry);
+    return;
+  }
+
   const path = panel?.currentPath;
-  if (!entry || entry.is_dir || !path) return;
+  if (!path) return;
 
   const ext = entry.extension.toLowerCase();
-  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
+  if (VIDEO_EXTENSIONS.includes(ext)) {
+    const fullPath = await joinPath(path, entry.name);
+    openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
+    return;
+  }
 
-  const fullPath = await joinPath(path, entry.name);
-  previewPanel.value = activePanel.value === "left" ? "right" : "left";
-  previewFilePath.value = fullPath;
-  previewFileName.value = entry.name;
-  previewFileBytes.value = entry.size;
-  previewVisible.value = true;
+  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) {
+    showUnsupportedPreview(entry);
+    return;
+  }
+
+  await showFilePreview(entry, path);
 }
 
 function closePreview() {
   previewVisible.value = false;
   previewPanel.value = "";
+  previewKind.value = "";
   previewFilePath.value = "";
   previewFileName.value = "";
   previewFileBytes.value = 0;
@@ -286,22 +375,39 @@ watch(
   },
   async (entry) => {
     if (!previewVisible.value) return;
-    if (!entry || entry.is_dir) {
-      closePreview();
+    if (!entry) return; // keep the current preview when nothing is selected (e.g. after navigating to another directory)
+    if (entry.is_dir) {
+      showUnsupportedPreview(entry);
       return;
     }
 
     const ext = entry.extension.toLowerCase();
-    if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
+    if (VIDEO_EXTENSIONS.includes(ext)) {
+      const panel = getActivePanelRef();
+      const path = panel?.currentPath;
+      if (!path) return;
+      const fullPath = await joinPath(path, entry.name);
+      if (previewVisible.value && previewKind.value === "video") {
+        // Already in video preview → just swap the source without remounting.
+        previewFilePath.value = fullPath;
+        previewFileName.value = entry.name;
+        previewFileBytes.value = entry.size;
+      } else {
+        closePreview();
+        openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
+      }
+      return;
+    }
+    if (!PREVIEWABLE_EXTENSIONS.includes(ext)) {
+      showUnsupportedPreview(entry);
+      return;
+    }
 
     const panel = getActivePanelRef();
     const path = panel?.currentPath;
     if (!path) return;
 
-    const fullPath = await joinPath(path, entry.name);
-    previewFilePath.value = fullPath;
-    previewFileName.value = entry.name;
-    previewFileBytes.value = entry.size;
+    await showFilePreview(entry, path);
   }
 );
 
@@ -311,18 +417,36 @@ watch(activePanel, async () => {
 
   const panel = getActivePanelRef();
   const entry = panel?.selectedEntry;
-  if (!entry || entry.is_dir) return;
+  if (!entry) return;
+  if (entry.is_dir) {
+    showUnsupportedPreview(entry);
+    return;
+  }
 
   const ext = entry.extension.toLowerCase();
-  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
+  if (VIDEO_EXTENSIONS.includes(ext)) {
+    const path = panel?.currentPath;
+    if (!path) return;
+    const fullPath = await joinPath(path, entry.name);
+    if (previewVisible.value && previewKind.value === "video") {
+      previewFilePath.value = fullPath;
+      previewFileName.value = entry.name;
+      previewFileBytes.value = entry.size;
+    } else {
+      closePreview();
+      openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
+    }
+    return;
+  }
+  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) {
+    showUnsupportedPreview(entry);
+    return;
+  }
 
   const path = panel?.currentPath;
   if (!path) return;
 
-  const fullPath = await joinPath(path, entry.name);
-  previewFilePath.value = fullPath;
-  previewFileName.value = entry.name;
-  previewFileBytes.value = entry.size;
+  await showFilePreview(entry, path);
 });
 
 // Keyboard shortcuts
@@ -552,5 +676,36 @@ onMounted(() => {
 
 .btn-secondary:hover {
   background: var(--hover-bg);
+}
+
+/* ── Preview placeholder (unsupported format) ── */
+
+.preview-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  user-select: none;
+  text-align: center;
+  padding: 16px;
+}
+
+.preview-placeholder-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.preview-placeholder-name {
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 90%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

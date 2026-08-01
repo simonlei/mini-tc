@@ -19,6 +19,7 @@
 
     <!-- File list -->
     <FileList
+      ref="fileListRef"
       :entries="entries"
       :sort-column="activeTab ? activeTab.sortColumn : 'name'"
       :sort-direction="activeTab ? activeTab.sortDirection : 'asc'"
@@ -58,7 +59,7 @@ const props = defineProps({
   panelId: { type: String, required: true },
 });
 
-const emit = defineEmits(["activate"]);
+const emit = defineEmits(["activate", "open-video"]);
 
 const STORAGE_KEY = `mini-tc-tabs-${props.panelId}`;
 
@@ -299,9 +300,19 @@ async function onDelete(entry) {
 
 // ── Open file ──
 
+const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
+
 async function onOpen(fileName) {
   if (!activeTab.value) return;
   const fullPath = await joinPath(activeTab.value.path, fileName);
+  const ext = fileName.split(".").pop()?.toLowerCase() || "";
+
+  // Route video files to the in-app video preview instead of the OS player.
+  if (VIDEO_EXTS.includes(ext)) {
+    emit("open-video", { path: fullPath, name: fileName, bytes: selectedEntry.value?.size || 0, panelId: props.panelId });
+    return;
+  }
+
   console.log("[onOpen] fileName:", fileName, "fullPath:", fullPath);
   try {
     await openFile(fullPath);
@@ -313,9 +324,12 @@ async function onOpen(fileName) {
 }
 
 // Expose selectedEntry and currentPath for parent access (preview feature)
+const fileListRef = ref(null);
+
 defineExpose({
   selectedEntry,
   currentPath: computed(() => activeTab.value?.path || ""),
+  moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
 });
 </script>
 
