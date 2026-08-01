@@ -226,6 +226,8 @@ function getFileIcon(ext) {
     GIF: "🖼️",
     SVG: "🖼️",
     BMP: "🖼️",
+    WEBP: "🖼️",
+    AVIF: "🖼️",
     MP3: "🎵",
     WAV: "🎵",
     MP4: "🎬",

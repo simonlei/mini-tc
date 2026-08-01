@@ -58,6 +58,7 @@
           v-if="previewVisible && previewPanel === 'left'"
           :file-path="previewFilePath"
           :file-name="previewFileName"
+          :file-bytes="previewFileBytes"
           @close="closePreview"
         />
         <FilePanel
@@ -78,6 +79,7 @@
           v-if="previewVisible && previewPanel === 'right'"
           :file-path="previewFilePath"
           :file-name="previewFileName"
+          :file-bytes="previewFileBytes"
           @close="closePreview"
         />
         <FilePanel
@@ -228,12 +230,13 @@ function endDrag() {
 
 // ── File Preview (Ctrl+Q) ──
 
-const PREVIEWABLE_EXTENSIONS = ["txt", "md", "jpg", "jpeg", "png", "gif"];
+const PREVIEWABLE_EXTENSIONS = ["txt", "md", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 
 const previewVisible = ref(false);
 const previewPanel = ref(""); // which panel shows the preview
 const previewFilePath = ref("");
 const previewFileName = ref("");
+const previewFileBytes = ref(0);
 
 function onPanelActivate(panelId) {
   // Don't activate a panel that's showing the preview
@@ -263,6 +266,7 @@ async function togglePreview() {
   previewPanel.value = activePanel.value === "left" ? "right" : "left";
   previewFilePath.value = fullPath;
   previewFileName.value = entry.name;
+  previewFileBytes.value = entry.size;
   previewVisible.value = true;
 }
 
@@ -271,6 +275,7 @@ function closePreview() {
   previewPanel.value = "";
   previewFilePath.value = "";
   previewFileName.value = "";
+  previewFileBytes.value = 0;
 }
 
 // Auto-update preview when the active panel's selection changes
@@ -293,6 +298,7 @@ watch(
     const fullPath = await joinPath(path, entry.name);
     previewFilePath.value = fullPath;
     previewFileName.value = entry.name;
+    previewFileBytes.value = entry.size;
   }
 );
 
@@ -313,6 +319,7 @@ watch(activePanel, async () => {
   const fullPath = await joinPath(path, entry.name);
   previewFilePath.value = fullPath;
   previewFileName.value = entry.name;
+  previewFileBytes.value = entry.size;
 });
 
 // Keyboard shortcuts

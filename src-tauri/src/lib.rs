@@ -1,7 +1,6 @@
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use base64::{engine::general_purpose, Engine};
 
 /// A single file/folder entry returned to the frontend.
 #[derive(Serialize)]
@@ -177,11 +176,10 @@ pub struct FilePreview {
 }
 
 const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD"];
-const IMAGE_EXTENSIONS: &[&str] = &["JPG", "JPEG", "PNG", "GIF"];
 const MAX_TEXT_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
-const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024; // 20 MB
 
-/// Read a file for preview. Supports text (txt/md) and image (jpg/png/gif) files.
+/// Read a text file for preview (txt/md only).
+/// Images are loaded directly by the frontend via convertFileSrc (asset protocol).
 #[tauri::command]
 fn read_file_preview(path: String) -> Result<FilePreview, String> {
     let file_path = Path::new(&path);
@@ -216,29 +214,6 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
             mime_type: "text/plain".to_string(),
             size,
             encoding: "utf-8".to_string(),
-        })
-    } else if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
-        if size > MAX_IMAGE_SIZE {
-            return Err(format!(
-                "Image too large to preview (max {} MB)",
-                MAX_IMAGE_SIZE / 1024 / 1024
-            ));
-        }
-        let bytes = fs::read(file_path)
-            .map_err(|e| format!("Failed to read file: {}", e))?;
-        let b64 = general_purpose::STANDARD.encode(&bytes);
-        let mime = match extension.as_str() {
-            "PNG" => "image/png",
-            "JPG" | "JPEG" => "image/jpeg",
-            "GIF" => "image/gif",
-            _ => "image/png",
-        };
-        Ok(FilePreview {
-            preview_type: "image".to_string(),
-            content: format!("data:{};base64,{}", mime, b64),
-            mime_type: mime.to_string(),
-            size,
-            encoding: "base64".to_string(),
         })
     } else {
         Err(format!(

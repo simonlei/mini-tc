@@ -26,7 +26,7 @@
 
     <!-- Image preview -->
     <div class="preview-body image-body" v-else-if="previewType === 'image'">
-      <img :src="previewContent" class="preview-image" @load="onImageLoad" />
+      <img :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
     </div>
 
     <!-- Text preview -->
@@ -45,14 +45,18 @@
 
 <script setup>
 import { ref, watch, computed } from "vue";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
 
 const props = defineProps({
   filePath: { type: String, required: true },
   fileName: { type: String, required: true },
+  fileBytes: { type: Number, default: 0 },
 });
 
 defineEmits(["close"]);
+
+const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 
 const loading = ref(false);
 const error = ref("");
@@ -82,9 +86,19 @@ function formatSize(bytes) {
   return val.toFixed(i === 0 ? 0 : 1) + " " + units[i];
 }
 
+function getExtension(name) {
+  const parts = name.split(".");
+  return parts.length > 1 ? parts.pop().toLowerCase() : "";
+}
+
 function onImageLoad(e) {
   const img = e.target;
   imageInfo.value = `${img.naturalWidth}x${img.naturalHeight}`;
+}
+
+function onImageError() {
+  error.value = "无法加载图片，文件可能已损坏";
+  previewType.value = "";
 }
 
 async function loadPreview() {
@@ -95,6 +109,18 @@ async function loadPreview() {
   lineCount.value = null;
   imageInfo.value = "";
 
+  const ext = getExtension(props.fileName);
+
+  // Image: use convertFileSrc to load directly via asset protocol (bypasses IPC entirely)
+  if (IMAGE_EXTENSIONS.includes(ext)) {
+    previewType.value = "image";
+    previewContent.value = convertFileSrc(props.filePath);
+    fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
+    loading.value = false;
+    return;
+  }
+
+  // Text: use IPC to read content
   try {
     const result = await readFilePreview(props.filePath);
     previewType.value = result.preview_type;

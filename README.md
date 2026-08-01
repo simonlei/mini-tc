@@ -8,6 +8,7 @@
 - 每栏独立多 Tab 管理，Tab 状态自动持久化
 - 可编辑路径栏 + 盘符下拉切换
 - 文件列表按名称 / 大小 / 修改时间排序
+- **文件预览**（Ctrl+Q）：文本（txt/md）和图片（jpg/png/gif/webp/bmp/svg/avif），图片通过 asset protocol 直接加载，无大小限制
 - 4 套内置主题（石墨工业 / 霓虹暗夜 / 暖茶拿铁 / 墨竹青翠）
 - Ctrl+Tab 快速切换左右面板
 - **自动更新**（帮助 → 检查更新）
@@ -19,7 +20,7 @@
 |---|------|
 | 桌面框架 | [Tauri 2](https://v2.tauri.app/) |
 | 前端 | Vue 3 + Vite 5 |
-| 后端 | Rust (6 条文件系统命令) |
+| 后端 | Rust (7 条 Tauri 命令) |
 | 编译 | MSVC (Windows) / Clang (macOS) / GCC (Linux) |
 
 ## 前置条件
@@ -77,11 +78,12 @@ mini-tc/
 │       ├── FilePanel.vue     # 面板容器（Tab + 路径 + 文件列表）
 │       ├── TabBar.vue        # 多 Tab 管理
 │       ├── PathBar.vue       # 可编辑路径栏 + 盘符切换
-│       └── FileList.vue      # 文件列表（排序）
+│       ├── FileList.vue      # 文件列表（排序）
+│       └── FilePreview.vue   # 文件预览（文本/图片）
 ├── src-tauri/                # Rust 后端
 │   ├── src/
 │   │   ├── main.rs
-│   │   └── lib.rs            # list_directory / get_home_dir / list_drives 等
+│   │   └── lib.rs            # list_directory / read_file_preview / list_drives 等
 │   ├── tauri.conf.json
 │   └── icons/
 ├── .cnb.yml                  # CNB CI 流水线配置
