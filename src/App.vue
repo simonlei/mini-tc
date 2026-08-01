@@ -286,7 +286,10 @@ watch(
   },
   async (entry) => {
     if (!previewVisible.value) return;
-    if (!entry || entry.is_dir) return;
+    if (!entry || entry.is_dir) {
+      closePreview();
+      return;
+    }
 
     const ext = entry.extension.toLowerCase();
     if (!PREVIEWABLE_EXTENSIONS.includes(ext)) return;
