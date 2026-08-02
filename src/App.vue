@@ -769,9 +769,17 @@ onMounted(() => {
     }
 
     // Ctrl+C / Ctrl+X / Ctrl+V: clipboard copy / cut / paste.
-    // Let the browser handle these normally when typing in a text input
-    // (e.g. the filename filter) so text editing shortcuts still work.
+    // When focus is in a text input (the address bar or the filename filter),
+    // let the browser handle these natively — e.g. pasting a copied path
+    // string into the address bar. The file-clipboard handler below only makes
+    // sense on the file grid, and intercepting here would preventDefault the
+    // native text paste (and then wrongly report "剪贴板为空" when the
+    // clipboard holds plain text, not a file list).
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+        return; // let the browser do native text copy/cut/paste
+      }
       if (e.key === "c" || e.key === "C") {
         e.preventDefault();
         setClipboard("copy");
