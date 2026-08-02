@@ -358,16 +358,22 @@ const clipboard = ref(null); // { operation: 'copy' | 'cut', paths: string[] }
 
 function setClipboard(operation) {
   const panel = getActivePanelRef();
-  const entry = panel?.selectedEntry;
+  const entries = panel?.selectedEntries;
   const currentPath = panel?.currentPath;
-  if (!entry || !currentPath) {
-    showToast("请先选中一个文件或文件夹", "error");
+  if (!entries || entries.length === 0 || !currentPath) {
+    showToast("请先选中文件或文件夹", "error");
     return;
   }
-  joinPath(currentPath, entry.name).then((fullPath) => {
-    clipboard.value = { operation, paths: [fullPath] };
+  Promise.all(entries.map((e) => joinPath(currentPath, e.name))).then((paths) => {
+    clipboard.value = { operation, paths };
+    // Mark cut items in the source panel so they appear ghosted until pasted.
+    if (operation === "cut") {
+      panel.setCutNames(entries.map((e) => e.name));
+    } else {
+      panel.clearCut();
+    }
     showToast(
-      `${operation === "cut" ? "已剪切" : "已复制"}：${entry.name}`,
+      `${operation === "cut" ? "已剪切" : "已复制"} ${paths.length} 项`,
       "info"
     );
   });
@@ -508,6 +514,9 @@ async function pasteFromClipboard() {
     if (operation === "cut") {
       clipboard.value = null; // consumed
     }
+    // Clear any cut-state ghosting (the moved items are gone after the op).
+    leftPanel.value?.clearCut?.();
+    rightPanel.value?.clearCut?.();
   } catch (e) {
     showToast("操作失败：\n" + String(e), "error");
   } finally {
@@ -678,6 +687,15 @@ onMounted(() => {
     if (e.key === "q" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       togglePreview();
+      return;
+    }
+
+    // Ctrl+A: select all entries in the active panel (skip when typing in a text input).
+    if (e.key === "a" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      const t = e.target;
+      if (t && t.tagName === "INPUT") return; // let the filter input select its text
+      e.preventDefault();
+      getActivePanelRef()?.selectAll?.();
       return;
     }
 

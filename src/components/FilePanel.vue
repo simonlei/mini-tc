@@ -30,6 +30,7 @@
       :dir-sizes="dirSizes"
       :pending-select-name="pendingSelectName"
       :is-active="isActive"
+      :cut-names="cutNames"
       @sort="handleSort"
       @navigate="navigateInto"
       @navigate-parent="navigateParent"
@@ -43,6 +44,7 @@
     <!-- Panel status bar -->
     <div class="panel-status">
       <span>{{ entries.length }} items</span>
+      <span v-if="selectedEntries.length">{{ selectedEntries.length }} selected</span>
       <span v-if="selectedEntry">{{ selectedEntry.name }}</span>
       <span v-if="loading" class="loading-text">Loading...</span>
     </div>
@@ -76,6 +78,8 @@ const entries = ref([]);
 const loading = ref(false);
 const error = ref("");
 const selectedEntry = ref(null);
+const selectedEntries = ref([]);
+const cutNames = ref([]);
 const hasParent = ref(true);
 const drives = ref([]);
 const dirSizes = ref({});
@@ -196,6 +200,8 @@ async function loadDirectory(path) {
   loading.value = true;
   error.value = "";
   selectedEntry.value = null;
+  selectedEntries.value = [];
+  cutNames.value = [];
   dirSizes.value = {};
   try {
     entries.value = await listDirectory(path);
@@ -261,8 +267,18 @@ function handleSort(column) {
 
 // ── Selection ──
 
-function onSelect(entry) {
-  selectedEntry.value = entry;
+function onSelect(entries, active) {
+  selectedEntries.value = entries || [];
+  selectedEntry.value = active || null;
+}
+
+// Mark the given entry names as "cut" (pending move) so FileList can ghost them.
+function setCutNames(names) {
+  cutNames.value = names || [];
+}
+
+function clearCut() {
+  cutNames.value = [];
 }
 
 async function calcDirSize(folderName) {
@@ -284,20 +300,28 @@ async function calcDirSize(folderName) {
 
 // ── Delete ──
 
-async function onDelete(entry) {
-  if (!activeTab.value || !entry) return;
-  const fullPath = await joinPath(activeTab.value.path, entry.name);
-  try {
-    await deleteToTrash(fullPath);
-    // Remove the deleted entry locally instead of full refresh,
-    // so FileList can restore selection to the next file.
-    entries.value = entries.value.filter((e) => e.name !== entry.name);
-    const next = { ...dirSizes.value };
-    delete next[entry.name];
-    dirSizes.value = next;
-  } catch (e) {
-    error.value = String(e);
+async function onDelete(targets) {
+  if (!activeTab.value) return;
+  const list = Array.isArray(targets) ? targets : [targets];
+  if (list.length === 0) return;
+
+  const names = list.map((e) => e.name);
+  for (const entry of list) {
+    const fullPath = await joinPath(activeTab.value.path, entry.name);
+    try {
+      await deleteToTrash(fullPath);
+    } catch (e) {
+      error.value = String(e);
+    }
   }
+
+  // Remove the deleted entries locally instead of full refresh, so FileList can
+  // restore selection. Multi-delete just clears the selection (handled by the
+  // entries watch in FileList); single-delete re-selects the next neighbour.
+  entries.value = entries.value.filter((e) => !names.includes(e.name));
+  const next = { ...dirSizes.value };
+  names.forEach((n) => delete next[n]);
+  dirSizes.value = next;
 }
 
 // ── Open file ──
@@ -330,9 +354,14 @@ const fileListRef = ref(null);
 
 defineExpose({
   selectedEntry,
+  selectedEntries,
   currentPath: computed(() => activeTab.value?.path || ""),
   refresh,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
+  selectAll: () => fileListRef.value?.selectAll(),
+  clearSelection: () => fileListRef.value?.clearSelection(),
+  setCutNames,
+  clearCut,
 });
 </script>
 

@@ -36,13 +36,12 @@
     </div>
 
     <!-- Scrollable file entries -->
-    <div class="file-entries" ref="entriesContainer">
+    <div class="file-entries" ref="entriesContainer" @click="onEntriesClick">
       <!-- Parent dir entry (hidden only while an actual filter is active) -->
       <div
         v-if="hasParent && (!isSearching || searchQuery === '')"
         class="file-row parent-row"
-        :class="{ selected: selectedIndex === -1 }"
-        @click="selectedIndex = -1"
+        @click="clearSelection"
         @dblclick="$emit('navigate-parent')"
       >
         <div class="col-name"><span class="file-icon folder-icon">📁</span>..</div>
@@ -56,11 +55,12 @@
         :key="entry.name"
         class="file-row"
         :class="{
-          selected: selectedIndex === index,
+          selected: selectedIndices.has(index),
           'is-dir': entry.is_dir,
           'is-hidden': entry.is_hidden,
+          'is-cut': cutSet.has(entry.name),
         }"
-        @click="selectRow(index)"
+        @click="onRowClick(index, $event)"
         @dblclick="onDoubleClick(entry)"
       >
         <div class="col-name">
@@ -101,11 +101,22 @@ const props = defineProps({
   dirSizes: { type: Object, default: () => ({}) },
   pendingSelectName: { type: String, default: null },
   isActive: { type: Boolean, default: false },
+  cutNames: { type: Array, default: () => [] },
 });
 
 const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved"]);
 
-const selectedIndex = ref(-1);
+// ── Multi-selection state ──
+// selectedIndices: indices (into displayedEntries) of every selected row.
+// activeIndex:    the "focused" row (last clicked / keyboard caret); used for
+//                 dblclick / Enter / preview / delete target.
+// anchorIndex:    the anchor for Shift+range selection.
+const selectedIndices = ref(new Set());
+const activeIndex = ref(-1);
+const anchorIndex = ref(-1);
+
+const cutSet = computed(() => new Set(props.cutNames || []));
+
 const entriesContainer = ref(null);
 const listContainer = ref(null);
 const pendingSelectName = ref(null);
@@ -120,6 +131,11 @@ const searchInput = ref(null);
 watch(
   () => props.entries,
   () => {
+    // Any directory-content change clears the multi-selection (each panel
+    // manages its own state, so left/right stay isolated automatically).
+    selectedIndices.value = new Set();
+    anchorIndex.value = -1;
+
     if (pendingSelectName.value) {
       const name = pendingSelectName.value;
       pendingSelectName.value = null;
@@ -128,8 +144,8 @@ watch(
         selectRow(idx);
         scrollToRow(idx);
       } else {
-        selectedIndex.value = -1;
-        emit("select", null);
+        activeIndex.value = -1;
+        emitSelection();
       }
     } else if (props.pendingSelectName) {
       const name = props.pendingSelectName;
@@ -138,13 +154,13 @@ watch(
         selectRow(idx);
         scrollToRow(idx);
       } else {
-        selectedIndex.value = -1;
-        emit("select", null);
+        activeIndex.value = -1;
+        emitSelection();
       }
       emit("pending-select-resolved");
     } else {
-      selectedIndex.value = -1;
-      emit("select", null);
+      activeIndex.value = -1;
+      emitSelection();
     }
   },
   { flush: "post" }
@@ -203,10 +219,80 @@ const searchEmptyMessage = computed(() => {
   return "Empty folder";
 });
 
+// Collect the entry objects for every selected index.
+function getSelectedEntries() {
+  const arr = [];
+  for (const i of selectedIndices.value) {
+    const e = displayedEntries.value[i];
+    if (e) arr.push(e);
+  }
+  return arr;
+}
+
+// Emit the current selection up to the parent panel.
+function emitSelection() {
+  const entries = getSelectedEntries();
+  const active = activeIndex.value >= 0 ? displayedEntries.value[activeIndex.value] || null : null;
+  emit("select", entries, active);
+}
+
+// Plain single-select: clears other rows, sets anchor + active to this index.
 function selectRow(index) {
-  selectedIndex.value = index;
-  const entry = displayedEntries.value[index];
-  if (entry) emit("select", entry);
+  selectedIndices.value = new Set([index]);
+  activeIndex.value = index;
+  anchorIndex.value = index;
+  emitSelection();
+}
+
+function clearSelection() {
+  selectedIndices.value = new Set();
+  anchorIndex.value = -1;
+  activeIndex.value = -1;
+  emitSelection();
+}
+
+function selectAll() {
+  const set = new Set();
+  for (let i = 0; i < displayedEntries.value.length; i++) set.add(i);
+  selectedIndices.value = set;
+  anchorIndex.value = 0;
+  activeIndex.value = displayedEntries.value.length - 1;
+  emitSelection();
+}
+
+// Row click with modifier awareness.
+function onRowClick(index, e) {
+  const ctrl = e.ctrlKey || e.metaKey;
+  const shift = e.shiftKey;
+
+  if (shift && anchorIndex.value >= 0) {
+    // Continuous range select from anchor to this row (replaces selection).
+    const a = Math.min(anchorIndex.value, index);
+    const b = Math.max(anchorIndex.value, index);
+    const set = new Set();
+    for (let i = a; i <= b; i++) set.add(i);
+    selectedIndices.value = set;
+    activeIndex.value = index;
+  } else if (ctrl) {
+    // Discontinuous toggle.
+    const set = new Set(selectedIndices.value);
+    if (set.has(index)) set.delete(index);
+    else set.add(index);
+    selectedIndices.value = set;
+    activeIndex.value = index;
+    anchorIndex.value = index;
+  } else {
+    // Plain click: single-select this row.
+    selectedIndices.value = new Set([index]);
+    activeIndex.value = index;
+    anchorIndex.value = index;
+  }
+  emitSelection();
+}
+
+// Clicking empty space inside the list (not a row) clears the selection.
+function onEntriesClick(e) {
+  if (e.target === e.currentTarget) clearSelection();
 }
 
 function scrollToRow(index, block = "nearest") {
@@ -218,11 +304,11 @@ function scrollToRow(index, block = "nearest") {
   if (row) row.scrollIntoView({ block, behavior: "auto" });
 }
 
-// Move the selection by delta (+1 down / -1 up). Does NOT wrap.
+// Move the single selection by delta (+1 down / -1 up). Does NOT wrap.
 function moveSelection(delta) {
   const list = displayedEntries.value;
   if (list.length === 0) return;
-  const cur = selectedIndex.value;
+  const cur = activeIndex.value;
   let next;
   if (cur === -1) {
     if (delta > 0) next = 0; // from nothing selected → first item
@@ -234,6 +320,28 @@ function moveSelection(delta) {
   }
   if (next === cur) return;
   selectRow(next);
+  scrollToRow(next);
+}
+
+// Shift+Arrow: extend the selection continuously from the anchor.
+function extendSelection(delta) {
+  const list = displayedEntries.value;
+  if (list.length === 0) return;
+  if (activeIndex.value === -1) {
+    selectRow(0);
+    return;
+  }
+  let next = activeIndex.value + delta;
+  if (next < 0) next = 0;
+  if (next > list.length - 1) next = list.length - 1;
+  if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value;
+  const a = Math.min(anchorIndex.value, next);
+  const b = Math.max(anchorIndex.value, next);
+  const set = new Set();
+  for (let i = a; i <= b; i++) set.add(i);
+  selectedIndices.value = set;
+  activeIndex.value = next;
+  emitSelection();
   scrollToRow(next);
 }
 
@@ -269,8 +377,7 @@ function closeSearch() {
   searchQuery.value = "";
   const el = searchInput.value;
   if (el) el.blur();
-  selectedIndex.value = -1;
-  emit("select", null);
+  clearSelection();
   // Return focus to the list so "/" can re-open the search immediately.
   nextTick(() => { listContainer.value?.focus(); });
 }
@@ -289,7 +396,7 @@ function onSearchKeydown(e) {
     moveSelection(-1);
   } else if (e.key === "Enter") {
     e.preventDefault();
-    const entry = displayedEntries.value[selectedIndex.value];
+    const entry = displayedEntries.value[activeIndex.value];
     if (entry) {
       if (entry.is_dir) emit("navigate", entry.name);
       else emit("open", entry.name);
@@ -355,8 +462,8 @@ function onKeydown(e) {
     return;
   }
 
-  // Enter on ".." (selectedIndex === -1) navigates to parent — but only when not searching
-  if (e.key === "Enter" && selectedIndex.value === -1 && !isSearching.value) {
+  // Enter on ".." (activeIndex === -1) navigates to parent — but only when not searching
+  if (e.key === "Enter" && activeIndex.value === -1 && !isSearching.value) {
     e.preventDefault();
     emit("navigate-parent");
     return;
@@ -366,22 +473,47 @@ function onKeydown(e) {
 
   if (e.key === "ArrowDown") {
     e.preventDefault();
-    moveSelection(1);
+    if (e.shiftKey) extendSelection(1);
+    else moveSelection(1);
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
-    moveSelection(-1);
+    if (e.shiftKey) extendSelection(-1);
+    else moveSelection(-1);
   } else if (e.key === "Home") {
     e.preventDefault();
-    selectRow(0);
-    scrollToRow(0, "start");
+    if (e.shiftKey) {
+      if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value === -1 ? 0 : activeIndex.value;
+      const end = anchorIndex.value;
+      const set = new Set();
+      for (let i = 0; i <= end; i++) set.add(i);
+      selectedIndices.value = set;
+      activeIndex.value = 0;
+      emitSelection();
+      scrollToRow(0, "start");
+    } else {
+      selectRow(0);
+      scrollToRow(0, "start");
+    }
   } else if (e.key === "End") {
     e.preventDefault();
-    selectRow(list.length - 1);
-    scrollToRow(list.length - 1, "end");
+    const last = list.length - 1;
+    if (e.shiftKey) {
+      if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value === -1 ? last : activeIndex.value;
+      const start = anchorIndex.value;
+      const set = new Set();
+      for (let i = start; i <= last; i++) set.add(i);
+      selectedIndices.value = set;
+      activeIndex.value = last;
+      emitSelection();
+      scrollToRow(last, "end");
+    } else {
+      selectRow(last);
+      scrollToRow(last, "end");
+    }
   } else if (e.key === "Enter") {
     e.preventDefault();
-    const entry = list[selectedIndex.value];
-    console.log("[Enter] selectedIndex:", selectedIndex.value, "entry:", entry?.name, "is_dir:", entry?.is_dir);
+    const entry = list[activeIndex.value];
+    console.log("[Enter] activeIndex:", activeIndex.value, "entry:", entry?.name, "is_dir:", entry?.is_dir);
     if (entry) {
       if (entry.is_dir) {
         emit("navigate", entry.name);
@@ -391,31 +523,38 @@ function onKeydown(e) {
     }
   } else if (e.key === " " || e.code === "Space") {
     e.preventDefault();
-    if (selectedIndex.value >= 0) {
-      const entry = list[selectedIndex.value];
+    if (activeIndex.value >= 0) {
+      const entry = list[activeIndex.value];
       if (entry && entry.is_dir) {
         emit("calc-dir-size", entry.name);
       }
     }
+  } else if (e.key === "Escape") {
+    // Cancel the current selection (when not searching).
+    if (!isSearching.value) {
+      e.preventDefault();
+      clearSelection();
+    }
   } else if (e.key === "Delete") {
     e.preventDefault();
-    if (selectedIndex.value >= 0) {
-      const entry = list[selectedIndex.value];
-      if (entry) {
-        // Determine which file to select after deletion
-        if (selectedIndex.value < list.length - 1) {
-          // Not the last: next file shifts into this position
-          pendingSelectName.value = list[selectedIndex.value + 1].name;
-        } else if (selectedIndex.value > 0) {
-          // Last file: select the previous one (new last)
-          pendingSelectName.value = list[selectedIndex.value - 1].name;
-        } else {
-          // Only file: nothing to select after deletion
-          pendingSelectName.value = null;
-        }
-        emit("delete", entry);
+    const targets = getSelectedEntries();
+    if (targets.length === 0 && activeIndex.value >= 0) {
+      const e0 = list[activeIndex.value];
+      if (e0) targets.push(e0);
+    }
+    if (targets.length === 0) return;
+
+    // Preserve focus on a neighbour for the single-delete case.
+    let pendingName = null;
+    if (targets.length === 1) {
+      const idx = list.indexOf(targets[0]);
+      if (idx >= 0) {
+        if (idx < list.length - 1) pendingName = list[idx + 1].name;
+        else if (idx > 0) pendingName = list[idx - 1].name;
       }
     }
+    if (pendingName) pendingSelectName.value = pendingName;
+    emit("delete", targets);
   }
 }
 
@@ -491,7 +630,7 @@ function getFileIcon(ext) {
   return icons[ext] || "📄";
 }
 
-defineExpose({ moveSelection });
+defineExpose({ moveSelection, selectAll, clearSelection });
 </script>
 
 <style scoped>
@@ -631,6 +770,12 @@ defineExpose({ moveSelection });
 
 .file-row.is-hidden {
   opacity: 0.5;
+}
+
+/* Cut (pending move) items: ghosted so the user can see what will be moved. */
+.file-row.is-cut {
+  opacity: 0.45;
+  font-style: italic;
 }
 
 .file-row > div {
