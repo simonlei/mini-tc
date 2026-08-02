@@ -232,7 +232,7 @@ fn expand_path(path: String) -> String {
             // Join through `PathBuf` so the separator between the home
             // directory and the remainder is always inserted exactly once.
             Some(home) => {
-                let rest = expanded[1..].trim_start_matches(|c| c == '/' || c == '\\');
+                let rest = expanded[1..].trim_start_matches(['/', '\\']);
                 home.join(rest).to_string_lossy().to_string()
             }
             None => expanded,
@@ -477,6 +477,7 @@ fn emit_progress(
 
 /// Copy a single file in 1 MB chunks, emitting progress roughly every 1% of the
 /// overall job size (or at least every chunk for small jobs).
+#[allow(clippy::too_many_arguments)]
 fn copy_file_with_progress(
     app: &tauri::AppHandle,
     src: &Path,
@@ -1271,7 +1272,7 @@ fn clear_clipboard() -> Result<(), String> {
 /// context menu. mini-tc does NOT bundle an extractor; instead it discovers an
 /// already-installed tool on the host and shells out to it.
 /// ─────────────────────────────────────────────────────────────────────────
-
+///
 /// A discovered external extraction tool.
 #[derive(Serialize)]
 pub struct ArchiveTool {
@@ -1311,6 +1312,7 @@ fn find_in_path(name: &str) -> Option<String> {
 /// installs such as `D:\Soft\7-Zip\7z.exe` that the standard paths miss.
 /// Unavailable or inaccessible drives are skipped silently so detection never
 /// blocks the UI.
+#[cfg(windows)]
 fn scan_drives_for_exe(basenames: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
     let known_subdirs: &[&str] = &[
