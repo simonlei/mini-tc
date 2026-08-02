@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
@@ -301,8 +301,11 @@ pub struct FilePreview {
     pub encoding: String, // "utf-8" for text, "base64" for image
 }
 
-const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD", "JSON"];
+const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD", "JSON", "LOG"];
 const MAX_TEXT_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
+                                            // For large log files, only the most recent portion (tail) is read so that
+                                            // previewing multi-GB logs stays responsive. txt/md/json still error out.
+const LOG_TAIL_LIMIT: u64 = 512 * 1024; // 512 KB shown when a .log is oversized
 
 /// Read a text file for preview (txt/md/json). JSON is returned as raw text;
 /// Images are loaded directly by the frontend via convertFileSrc (asset protocol).
@@ -326,6 +329,36 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
 
     if TEXT_EXTENSIONS.contains(&extension.as_str()) {
         if size > MAX_TEXT_SIZE {
+            if extension == "LOG" {
+                // Tail large logs instead of failing: seek to the last
+                // LOG_TAIL_LIMIT bytes and read from there. The first (likely
+                // partial) line is dropped so we don't show a chopped entry.
+                let mut f =
+                    fs::File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+                let skip = size.saturating_sub(LOG_TAIL_LIMIT);
+                f.seek(io::SeekFrom::Start(skip))
+                    .map_err(|e| format!("Failed to seek file: {}", e))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)
+                    .map_err(|e| format!("Failed to read file: {}", e))?;
+                let mut content = String::from_utf8_lossy(&buf).to_string();
+                if let Some(idx) = content.find('\n') {
+                    content = content[idx + 1..].to_string();
+                }
+                let total_mb = size / 1024 / 1024;
+                let shown_kb = (LOG_TAIL_LIMIT / 1024) as usize;
+                let banner = format!(
+                    "──── 文件过大（共 {} MB），仅显示末尾 {} KB ────\n",
+                    total_mb, shown_kb
+                );
+                return Ok(FilePreview {
+                    preview_type: "text".to_string(),
+                    content: banner + &content,
+                    mime_type: "text/plain".to_string(),
+                    size,
+                    encoding: "utf-8".to_string(),
+                });
+            }
             return Err(format!(
                 "File too large to preview (max {} MB)",
                 MAX_TEXT_SIZE / 1024 / 1024

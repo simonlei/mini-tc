@@ -30,7 +30,7 @@
     </div>
 
     <!-- Text / JSON preview -->
-    <div class="preview-body text-body" v-else-if="previewType === 'text' || previewType === 'json'">
+    <div class="preview-body text-body" v-else-if="previewType === 'text' || previewType === 'json' || previewType === 'log'">
       <div class="json-warn" v-if="jsonWarn">{{ jsonWarn }}</div>
       <pre class="preview-text"><code>{{ previewContent }}</code></pre>
     </div>
@@ -38,7 +38,7 @@
     <!-- Footer -->
     <div class="preview-footer" v-if="!loading && !error">
       <span>{{ fileSize }}</span>
-      <span v-if="previewType === 'text' && lineCount !== null">{{ lineCount }} lines</span>
+      <span v-if="(previewType === 'text' || previewType === 'log') && lineCount !== null">{{ lineCount }} lines</span>
       <span v-if="previewType === 'image'">{{ imageInfo }}</span>
     </div>
   </div>
@@ -71,6 +71,7 @@ const jsonWarn = ref("");
 const headerIcon = computed(() => {
   if (previewType.value === "image") return "🖼️";
   if (previewType.value === "json") return "🔧";
+  if (previewType.value === "log") return "📜";
   if (previewType.value === "text") return "📄";
   return "👁️";
 });
@@ -78,6 +79,7 @@ const headerIcon = computed(() => {
 const typeLabel = computed(() => {
   if (previewType.value === "image") return "IMAGE";
   if (previewType.value === "json") return "JSON";
+  if (previewType.value === "log") return "LOG";
   if (previewType.value === "text") return "TEXT";
   return "PREVIEW";
 });
@@ -143,6 +145,9 @@ async function loadPreview() {
           jsonWarn.value = "JSON 格式错误，以下为原始文本";
         }
         previewType.value = "json";
+      } else if (ext === "log") {
+        // Logs are shown as-is (raw text, no pretty-printing).
+        previewType.value = "log";
       }
       lineCount.value = previewContent.value.split("\n").length;
     }
