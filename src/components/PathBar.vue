@@ -12,19 +12,42 @@
 
     <button class="path-btn" @click="$emit('refresh')" title="Refresh">↻</button>
 
-    <div class="path-input-wrapper">
-      <input
-        ref="inputRef"
-        class="path-input"
-        v-model="displayValue"
-        @focus="onFocus"
-        @blur="onBlur"
-        @keydown.enter="onEnter"
-        @keydown.esc="onEscape"
-        spellcheck="false"
-        :class="{ invalid: invalid }"
-      />
+    <div class="path-display">
+      <!-- Breadcrumb mode (default) -->
+      <div
+        v-if="!editing"
+        class="breadcrumb"
+        :title="path"
+        @dblclick="startEdit"
+      >
+        <template v-for="(seg, i) in segments" :key="i">
+          <span class="sep" v-if="i > 0">›</span>
+          <span
+            class="crumb"
+            :class="{ current: i === segments.length - 1 }"
+            @click.stop="onCrumbClick(seg.path)"
+            @dblclick.stop
+          >{{ seg.label }}</span>
+        </template>
+      </div>
+
+      <!-- Edit mode (only when explicitly requested) -->
+      <div v-else class="path-input-wrapper">
+        <input
+          ref="inputRef"
+          class="path-input"
+          v-model="displayValue"
+          @focus="onFocus"
+          @blur="onBlur"
+          @keydown.enter="onEnter"
+          @keydown.esc="onEscape"
+          spellcheck="false"
+          :class="{ invalid: invalid }"
+        />
+      </div>
     </div>
+
+    <button v-if="!editing" class="path-btn" @click="startEdit" title="Edit path">✎</button>
 
     <button class="path-btn" @click="copyPath" :title="copied ? 'Copied!' : 'Copy path'">
       {{ copied ? "✓" : "📋" }}
@@ -33,7 +56,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, nextTick } from "vue";
 import { pathExists, expandPath } from "../api.js";
 
 const props = defineProps({
@@ -48,6 +71,57 @@ const editing = ref(false);
 const invalid = ref(false);
 const copied = ref(false);
 const displayValue = ref(props.path);
+
+// ── Breadcrumb parsing ──
+// Split the (already-expanded) path into clickable segments. Each segment maps
+// back to the full path of that level, so clicking a parent navigates up.
+const segments = computed(() => {
+  const raw = props.path;
+  if (!raw) return [];
+  const segs = [];
+
+  // UNC: \\server\share\...
+  if (raw.startsWith("\\\\")) {
+    const m = raw.match(/^\\\\([^\\]+)\\([^\\]+)/);
+    if (m) {
+      const root = `\\${m[1]}\\${m[2]}`;
+      segs.push({ label: root, path: root });
+      let acc = root;
+      const parts = raw.slice(root.length).split("\\").filter(Boolean);
+      for (const p of parts) {
+        acc += "\\" + p;
+        segs.push({ label: p, path: acc });
+      }
+    }
+  } else {
+    const dm = raw.match(/^([A-Za-z]:)([\\/]?)([\s\S]*)$/);
+    if (dm) {
+      // Drive-rooted path: C:\Users\simon
+      const drive = dm[1];
+      segs.push({ label: drive, path: drive + "\\" });
+      let acc = drive + "\\";
+      const parts = dm[3].split(/[\\/]/).filter(Boolean);
+      for (const p of parts) {
+        acc += p + "\\";
+        segs.push({ label: p, path: acc });
+      }
+    } else {
+      // Relative / POSIX-style path
+      const sep = raw.includes("\\") ? "\\" : "/";
+      let acc = "";
+      const parts = raw.split(/[\\/]/).filter(Boolean);
+      for (const p of parts) {
+        acc += (acc ? sep : "") + p;
+        segs.push({ label: p, path: acc });
+      }
+    }
+  }
+
+  // Pin the final segment to the exact original path so trailing-slash
+  // differences never cause an unexpected extra navigation.
+  if (segs.length) segs[segs.length - 1].path = raw;
+  return segs;
+});
 
 watch(
   () => props.path,
@@ -70,10 +144,30 @@ function driveLabel(d) {
   return d.replace(/[\\/:]+$/, "");
 }
 
+// ── Navigation ──
+
+function onCrumbClick(target) {
+  emit("navigate", target);
+}
+
 function onDriveChange(drive) {
   if (drive && drive !== currentDrive.value) {
     emit("navigate", drive);
   }
+}
+
+// ── Edit mode ──
+
+function startEdit() {
+  editing.value = true;
+  displayValue.value = props.path;
+  invalid.value = false;
+  nextTick(() => {
+    if (inputRef.value) {
+      inputRef.value.focus();
+      inputRef.value.select();
+    }
+  });
 }
 
 function onFocus() {
@@ -177,6 +271,71 @@ async function copyPath() {
 
 .path-btn:hover {
   background: var(--hover);
+}
+
+.path-display {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.breadcrumb {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: "Consolas", "Cascadia Code", monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow-x: auto;
+  cursor: text;
+  scrollbar-width: thin;
+}
+
+.breadcrumb::-webkit-scrollbar {
+  height: 6px;
+}
+
+.breadcrumb::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.crumb {
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 2px;
+  user-select: none;
+}
+
+.crumb:hover {
+  color: var(--text);
+  background: var(--hover);
+  text-decoration: underline;
+}
+
+.crumb.current {
+  color: var(--text);
+  font-weight: 600;
+  cursor: default;
+}
+
+.crumb.current:hover {
+  background: transparent;
+  text-decoration: none;
+}
+
+.sep {
+  color: var(--text-dim);
+  opacity: 0.6;
+  user-select: none;
 }
 
 .path-input-wrapper {
