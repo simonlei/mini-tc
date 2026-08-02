@@ -120,7 +120,8 @@
 
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { loadConfig, saveConfig } from "../api.js";
 import { listDirectory, getParentDir, joinPath, openFile } from "../api.js";
 
 const props = defineProps({
@@ -136,7 +137,7 @@ const emit = defineEmits(["close", "open-video", "navigate-list"]);
 // it is shared regardless of where the binary runs (dev vs bundled) or cwd.
 async function loadPlayerConfig() {
   try {
-    const raw = await invoke("load_video_config");
+    const raw = await loadConfig("video-config");
     if (typeof raw !== "string" || !raw) return null;
     const c = JSON.parse(raw);
     return {
@@ -150,9 +151,10 @@ async function loadPlayerConfig() {
 }
 async function savePlayerConfig() {
   try {
-    await invoke("save_video_config", {
-      config: JSON.stringify({ rate: rate.value, volume: volume.value, muted: muted.value }),
-    });
+    await saveConfig(
+      "video-config",
+      JSON.stringify({ rate: rate.value, volume: volume.value, muted: muted.value })
+    );
   } catch {
     /* ignore persistence errors */
   }

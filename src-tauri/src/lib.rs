@@ -754,23 +754,38 @@ fn open_file(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Load persisted video-player config from ~/.minitc/video-config.json.
-/// Returns the raw JSON string, or null if no config exists / it can't be read.
+/// Validate a config name to prevent path traversal. Only bare names without
+/// directory separators or ".." segments are allowed (e.g. "theme",
+/// "tabs-left", "tabs-right", "video-config").
+fn is_valid_config_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains("..") && !name.contains('/') && !name.contains('\\')
+}
+
+/// Load a named config blob from ~/.minitc/<name>.json.
+/// Returns the raw JSON string, or null if the file does not exist / can't be read.
+/// All app config (theme, per-panel tabs, video player settings) is unified under
+/// ~/.minitc via this single pair of commands.
 #[tauri::command]
-fn load_video_config() -> Option<String> {
+fn load_config(name: String) -> Option<String> {
+    if !is_valid_config_name(&name) {
+        return None;
+    }
     let dir = home_dir()?.join(".minitc");
-    let path = dir.join("video-config.json");
+    let path = dir.join(format!("{}.json", name));
     fs::read_to_string(path).ok()
 }
 
-/// Persist video-player config to ~/.minitc/video-config.json so it is shared
-/// across every run of the binary (dev vs bundled) regardless of cwd.
+/// Persist a named config blob to ~/.minitc/<name>.json so it is shared across
+/// every run of the binary (dev vs bundled) regardless of cwd.
 #[tauri::command]
-fn save_video_config(config: String) -> Result<(), String> {
+fn save_config(name: String, config: String) -> Result<(), String> {
+    if !is_valid_config_name(&name) {
+        return Err("非法的配置名".to_string());
+    }
     let home = home_dir().ok_or_else(|| "无法定位用户主目录".to_string())?;
     let dir = home.join(".minitc");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("video-config.json");
+    let path = dir.join(format!("{}.json", name));
     fs::write(path, config).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -794,8 +809,8 @@ pub fn run() {
             open_file,
             copy_items,
             move_items,
-            load_video_config,
-            save_video_config,
+            load_config,
+            save_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

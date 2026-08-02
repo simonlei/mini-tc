@@ -58,3 +58,14 @@ export async function copyItems(sources, destDir, overwrite = false) {
 export async function moveItems(sources, destDir, overwrite = false) {
   return invoke("move_items", { sources, destDir, overwrite });
 }
+
+/// Load a named config blob from ~/.minitc/<name>.json.
+/// Resolves to the raw JSON string, or null when absent / unreadable.
+export async function loadConfig(name) {
+  return invoke("load_config", { name });
+}
+
+/// Persist a named config blob to ~/.minitc/<name>.json.
+export async function saveConfig(name, config) {
+  return invoke("save_config", { name, config });
+}

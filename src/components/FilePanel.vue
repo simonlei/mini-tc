@@ -56,7 +56,7 @@ import { ref, computed, watch, onMounted } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig } from "../api.js";
 
 const props = defineProps({
   isActive: { type: Boolean, default: false },
@@ -65,7 +65,8 @@ const props = defineProps({
 
 const emit = defineEmits(["activate", "open-video"]);
 
-const STORAGE_KEY = `mini-tc-tabs-${props.panelId}`;
+// Config name → ~/.minitc/tabs-<panelId>.json (unified cross-run store).
+const STORAGE_KEY = `tabs-${props.panelId}`;
 
 // Tab state
 const tabs = ref([]);
@@ -86,8 +87,10 @@ const dirSizes = ref({});
 const pendingSelectName = ref(null);
 
 // ── Persistence helpers ──
+// Tabs (per panel) are persisted to ~/.minitc/tabs-<panelId>.json via the
+// generic backend config commands, replacing the old localStorage approach.
 
-function saveState() {
+async function saveState() {
   const state = {
     tabs: tabs.value.map((t) => ({
       id: t.id,
@@ -97,19 +100,42 @@ function saveState() {
     })),
     activeTabId: activeTabId.value,
   };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  try {
+    await saveConfig(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.error("Failed to persist tabs:", e);
+  }
 }
 
-function loadState() {
+async function loadState() {
+  // 1) Unified ~/.minitc store.
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const state = JSON.parse(raw);
-    if (!state.tabs || state.tabs.length === 0) return null;
-    return state;
+    const raw = await loadConfig(STORAGE_KEY);
+    if (raw) {
+      const state = JSON.parse(raw);
+      if (state.tabs && state.tabs.length) return state;
+    }
   } catch {
-    return null;
+    /* fall through to migration */
   }
+
+  // 2) Migrate legacy localStorage data, then remove it so the two stores
+  //    don't drift apart.
+  try {
+    const legacy = localStorage.getItem(`mini-tc-tabs-${props.panelId}`);
+    if (legacy) {
+      localStorage.removeItem(`mini-tc-tabs-${props.panelId}`);
+      const state = JSON.parse(legacy);
+      if (state.tabs && state.tabs.length) {
+        await saveConfig(STORAGE_KEY, legacy); // promote to the unified store
+        return state;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  return null;
 }
 
 // Watch for state changes and persist
@@ -131,7 +157,7 @@ onMounted(async () => {
   }
 
   // Try to restore saved state
-  const saved = loadState();
+  const saved = await loadState();
   if (saved) {
     tabs.value = saved.tabs;
     activeTabId.value = saved.activeTabId;

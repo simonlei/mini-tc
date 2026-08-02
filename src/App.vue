@@ -171,7 +171,7 @@ import { ref, watch, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
-import { joinPath, pathExists, copyItems, moveItems } from "./api.js";
+import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig } from "./api.js";
 import { listen } from "@tauri-apps/api/event";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -208,10 +208,44 @@ function toggleHelpMenu() {
   helpMenuOpen.value = !helpMenuOpen.value;
 }
 
+const THEME_KEY = "theme";
+
 function setTheme(key) {
   currentTheme.value = key;
   document.documentElement.setAttribute("data-theme", key);
-  localStorage.setItem("mini-tc-theme", key);
+  // Persist to ~/.minitc/theme.json via the generic backend config command.
+  saveConfig(THEME_KEY, JSON.stringify(key)).catch((e) =>
+    console.error("Failed to persist theme:", e)
+  );
+}
+
+// Load the theme from the unified store, migrating any legacy localStorage value.
+async function initTheme() {
+  // 1) Unified ~/.minitc store.
+  try {
+    const raw = await loadConfig(THEME_KEY);
+    if (raw) {
+      const key = JSON.parse(raw);
+      if (key) {
+        setTheme(key);
+        return;
+      }
+    }
+  } catch {
+    /* fall through to migration */
+  }
+
+  // 2) Migrate legacy localStorage, then remove it.
+  try {
+    const legacy = localStorage.getItem("mini-tc-theme");
+    if (legacy) {
+      localStorage.removeItem("mini-tc-theme");
+      setTheme(legacy);
+      return;
+    }
+  } catch {
+    /* fall through */
+  }
 }
 
 // ── Update checking ──
@@ -270,8 +304,7 @@ async function downloadUpdate() {
 }
 
 onMounted(() => {
-  const saved = localStorage.getItem("mini-tc-theme");
-  if (saved) setTheme(saved);
+  initTheme();
 });
 
 // Panel split ratio
