@@ -69,3 +69,21 @@ export async function loadConfig(name) {
 export async function saveConfig(name, config) {
   return invoke("save_config", { name, config });
 }
+
+/// Write the given paths onto the OS clipboard as a file list.
+/// `cut = true` marks them for a move (File Explorer moves rather than copies).
+export async function setClipboardFiles(paths, cut = false) {
+  return invoke("set_clipboard_files", { paths, cut });
+}
+
+/// Read file paths from the OS clipboard (CF_HDROP or its text fallback).
+/// Resolves to `{ paths: string[], cut: boolean }` or `null` when empty.
+export async function getClipboardFiles() {
+  return invoke("get_clipboard_files");
+}
+
+/// Consume the current system clipboard (called after a cut-paste so it isn't
+/// re-pasted). On Windows this empties the clipboard; other platforms no-op.
+export async function clearClipboard() {
+  return invoke("clear_clipboard");
+}

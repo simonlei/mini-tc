@@ -130,7 +130,7 @@
     <div class="progress-overlay" v-if="progress.visible">
       <div class="progress-card">
         <div class="progress-row">
-          <span class="progress-title">正在{{ clipboard && clipboard.operation === 'cut' ? '移动' : '复制' }}</span>
+          <span class="progress-title">正在{{ pasteOperation === 'cut' ? '移动' : '复制' }}</span>
           <span class="progress-pct">{{ progress.percent.toFixed(0) }}%</span>
         </div>
         <div class="progress-name" :title="progress.name">{{ progress.name }}</div>
@@ -171,7 +171,7 @@ import { ref, watch, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
-import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig } from "./api.js";
+import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { listen } from "@tauri-apps/api/event";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -383,11 +383,10 @@ function getActivePanelRef() {
 
 // ── Clipboard (Ctrl+C / Ctrl+X / Ctrl+V) ──
 //
-// In-app clipboard: holds the source paths plus the operation kind.
-// `copy` keeps the buffer after pasting (re-paste to other targets);
-// `cut` consumes it on the first paste (the sources are moved).
-
-const clipboard = ref(null); // { operation: 'copy' | 'cut', paths: string[] }
+// The OS clipboard is the single source of truth — we never keep an in-app
+// mirror, so a copy/cut made in Explorer / Finder / any app is always picked
+// up on paste. `setClipboardFiles` writes a real file clipboard (CF_HDROP on
+// Windows, the platform pasteboard elsewhere); `getClipboardFiles` reads it.
 
 function setClipboard(operation) {
   const panel = getActivePanelRef();
@@ -398,7 +397,11 @@ function setClipboard(operation) {
     return;
   }
   Promise.all(entries.map((e) => joinPath(currentPath, e.name))).then((paths) => {
-    clipboard.value = { operation, paths };
+    // Write a real file clipboard so Explorer / Finder / any app can paste
+    // these paths. There is intentionally no in-app mirror buffer.
+    setClipboardFiles(paths, operation === "cut").catch((e) =>
+      console.warn("写入系统剪贴板失败:", e)
+    );
     // Mark cut items in the source panel so they appear ghosted until pasted.
     if (operation === "cut") {
       panel.setCutNames(entries.map((e) => e.name));
@@ -424,6 +427,11 @@ const progress = ref({
   fileIndex: 0,
   fileTotal: 0,
 });
+
+// Tracks the current paste operation ('copy' | 'cut') so the progress label
+// reflects the actual operation — important now that the OS clipboard (not the
+// internal buffer) is the source of truth, e.g. a cut made in Explorer.
+const pasteOperation = ref("copy");
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
@@ -460,11 +468,28 @@ function onConfirmChoice(value) {
 }
 
 async function pasteFromClipboard() {
-  if (!clipboard.value || clipboard.value.paths.length === 0) return;
+  // The OS clipboard is the single source of truth (no in-app mirror), so a
+  // copy/cut made in Explorer / Finder / any app is always picked up here.
+  // mini-tc's own Ctrl+C/X also writes a real file clipboard, so in-app
+  // copies are covered too.
+  let sys = null;
+  try {
+    sys = await getClipboardFiles();
+  } catch (e) {
+    sys = null;
+  }
+  if (!sys || !sys.paths || sys.paths.length === 0) {
+    showToast("剪贴板为空", "info");
+    return;
+  }
+  await doPaste(sys.cut ? "cut" : "copy", sys.paths);
+}
 
-  const operation = clipboard.value.operation;
-  const sources = clipboard.value.paths;
-
+// Core paste logic (used for both copy and cut pastes sourced from the OS
+// clipboard). `operation` is 'copy' (keep source) or 'cut' (move, then
+// consume the clipboard).
+async function doPaste(operation, sources) {
+  pasteOperation.value = operation;
   // Paste target = the currently active panel — i.e. the directory the user
   // is currently focused on ("selected"). Ctrl+V drops into whatever folder
   // the active panel is showing, so it lands in the directory you're looking
@@ -545,7 +570,8 @@ async function pasteFromClipboard() {
     }
 
     if (operation === "cut") {
-      clipboard.value = null; // consumed
+      // Consume the system clipboard so it isn't re-pasted (matches Explorer).
+      clearClipboard().catch(() => {});
     }
     // Clear any cut-state ghosting (the moved items are gone after the op).
     leftPanel.value?.clearCut?.();
@@ -715,6 +741,16 @@ watch(activePanel, async () => {
 
 // Keyboard shortcuts
 onMounted(() => {
+  // When the window regains focus (e.g. the user cut files in mini-tc, pasted
+  // them in File Explorer, then switched back), re-list both panels and clear
+  // any stale cut-ghosting. Without this the source panel keeps showing files
+  // that have already been moved away by another app.
+  listen("tauri://focus", () => {
+    leftPanel.value?.refresh?.();
+    rightPanel.value?.refresh?.();
+    leftPanel.value?.clearCut?.();
+    rightPanel.value?.clearCut?.();
+  });
   document.addEventListener("keydown", (e) => {
     // Ctrl+Q: Toggle file preview
     if (e.key === "q" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {

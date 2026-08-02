@@ -19,3 +19,8 @@ tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 trash = "5"
+# Cross-platform OS clipboard: Windows CF_HDROP, macOS NSPasteboard, Linux X11
+# CLIPBOARD (text/uri-list, via pure-Rust x11rb — no system headers needed, so
+# the CI `rust:slim` image still builds). `cut` (move) semantics are Windows-only
+# (Preferred DropEffect); other platforms paste as copy.
+arboard = "3"

@@ -15,6 +15,15 @@ extern "system" {
         directory: *const u16,
         show_cmd: i32,
     ) -> isize;
+    // Used to enumerate file paths from an HDROP handle read back from the
+    // clipboard. NOTE: we must NOT call DragFinish on such a handle (it would
+    // free clipboard-owned memory and corrupt the heap).
+    fn DragQueryFileW(
+        hDrop: *mut std::ffi::c_void,
+        iFile: u32,
+        lpszFile: *mut u16,
+        cch: u32,
+    ) -> u32;
 }
 
 /// A single file/folder entry returned to the frontend.
@@ -379,6 +388,21 @@ fn remove_recursive(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Returns true if `a` and `b` refer to the same filesystem location. Exact
+/// comparison first, then canonicalization (resolves case, `.`/`..`, and
+/// symlinks) when both paths exist. Used to detect a self-overwrite — copying
+/// or moving a file onto itself — which would otherwise delete the source
+/// before any copy runs and lose the data.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    false
+}
+
 /// Walk a single source (file or directory) and append every file (with its
 /// destination path and byte size) plus every directory (size 0) to `tasks`.
 fn collect_copy_tasks(src: &Path, dest: &Path, tasks: &mut Vec<(PathBuf, PathBuf, u64)>) {
@@ -502,6 +526,14 @@ fn copy_all(
             }
         };
         let dest_item = dest_dir.join(&name);
+        // Guard against overwriting a path with itself (e.g. pasting a file
+        // into the same folder it already lives in). Without this, the code
+        // below would `remove_recursive(dest_item)` — which *is* the source —
+        // deleting the file before any copy runs, so it's lost with nothing
+        // copied in. Skip such no-op entries instead.
+        if dest_item.exists() && same_path(src, &dest_item) {
+            continue;
+        }
         if dest_item.exists() {
             if overwrite {
                 // Remove the existing target so the copy replaces it.
@@ -523,6 +555,11 @@ fn copy_all(
 
     for (i, (src, dest, size)) in tasks.iter().enumerate() {
         // Nested conflict (inside a copied directory): honor the same policy.
+        // Skip a self-overwrite (dest is also the source) to avoid deleting it.
+        if dest.exists() && same_path(src, dest) {
+            *skipped += 1;
+            continue;
+        }
         if dest.exists() {
             if overwrite {
                 if let Err(e) = remove_recursive(dest) {
@@ -626,6 +663,12 @@ fn move_items(
             }
         };
         let dest_item = dest_path.join(&name);
+        // Guard against moving/cutting a path onto itself (e.g. paste into the
+        // same folder): would delete the source before the rename, losing data.
+        if dest_item.exists() && same_path(src_path, &dest_item) {
+            skipped += 1;
+            continue;
+        }
         if dest_item.exists() {
             if overwrite {
                 if let Err(e) = remove_recursive(&dest_item) {
@@ -790,6 +833,406 @@ fn save_config(name: String, config: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Result returned by `get_clipboard_files`: the list of file paths currently
+/// on the OS clipboard and whether they were cut (move) or copied.
+#[derive(Serialize)]
+pub struct ClipboardFiles {
+    pub paths: Vec<String>,
+    pub cut: bool,
+}
+
+/// Read / write the OS file clipboard so mini-tc interoperates with File
+/// Explorer, Finder, and other file managers. The OS clipboard is the single
+/// source of truth — there is deliberately no in-app mirror buffer, so a
+/// copy/cut made in any other app is always picked up on paste.
+///
+/// - Windows: native clipboard APIs (CF_HDROP + a Unicode-text fallback copy +
+///   a "Preferred DropEffect" marker so a cut pastes as a *move*).
+/// - macOS / Linux: `arboard` (NSPasteboard / X11 CLIPBOARD `text/uri-list`).
+///   These platforms have no clipboard move-flag, so `cut` is always `false`
+///   there (Ctrl+X pastes as a copy, matching Finder which has no file-cut).
+#[cfg(windows)]
+mod os_clipboard {
+    use std::path::Path;
+    use std::ptr;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hWnd: *mut std::ffi::c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(format: u32, hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GetClipboardData(format: u32) -> *mut std::ffi::c_void;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut std::ffi::c_void;
+        fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+        fn GlobalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const GMEM_ZEROINIT: u32 = 0x0040;
+    const DROPEFFECT_MOVE: u32 = 2;
+
+    // DROPFILES: pFiles, POINT{x,y}, fNC, fWide = 20 bytes total.
+    #[repr(C)]
+    struct DropFiles {
+        p_files: u32,
+        pt_x: i32,
+        pt_y: i32,
+        f_nc: i32,
+        f_wide: i32,
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect()
+    }
+
+    /// RAII guard that closes the clipboard when dropped — even if a panic
+    /// unwinds through the code that opened it. This prevents the clipboard
+    /// from being left permanently locked by a mid-operation failure.
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    /// Write `paths` onto the OS clipboard as a file list (CF_HDROP), plus a
+    /// Unicode-text copy (one path per line) and — when `cut` — a
+    /// "Preferred DropEffect" = DROPEFFECT_MOVE marker so Explorer moves (not
+    /// copies) the files on paste.
+    ///
+    /// # Safety
+    /// Must be called from a context where the OS clipboard may be opened.
+    unsafe fn set_files_inner(paths: &[String], cut: bool) -> Result<(), String> {
+        if OpenClipboard(ptr::null_mut()) == 0 {
+            return Err("无法打开系统剪贴板(可能被其他程序占用)".to_string());
+        }
+        // Guard guarantees CloseClipboard runs on every exit path (incl. panic).
+        let _guard = ClipboardGuard;
+        EmptyClipboard();
+
+        // Build the double-null-terminated wide-char file list.
+        let mut file_list: Vec<u16> = Vec::new();
+        for p in paths {
+            file_list.extend_from_slice(&to_wide(p));
+        }
+        file_list.push(0u16); // second terminating null
+
+        let header_size = std::mem::size_of::<DropFiles>() as u32;
+        let total = header_size as usize + file_list.len() * 2;
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
+        if hglobal.is_null() {
+            return Err("剪贴板内存分配失败".to_string());
+        }
+        let locked = GlobalLock(hglobal);
+        if locked.is_null() {
+            GlobalFree(hglobal);
+            return Err("剪贴板内存锁定失败".to_string());
+        }
+        std::ptr::write(
+            locked as *mut DropFiles,
+            DropFiles {
+                p_files: header_size,
+                pt_x: 0,
+                pt_y: 0,
+                f_nc: 0,
+                f_wide: 1,
+            },
+        );
+        let list_ptr = (locked as *mut u8).add(header_size as usize) as *mut u16;
+        std::ptr::copy_nonoverlapping(file_list.as_ptr(), list_ptr, file_list.len());
+        GlobalUnlock(hglobal);
+
+        if SetClipboardData(CF_HDROP, hglobal).is_null() {
+            GlobalFree(hglobal);
+            return Err("写入文件剪贴板(CF_HDROP)失败".to_string());
+        }
+
+        // Unicode-text copy (one path per line) for text targets / fallback.
+        let text = paths.join("\r\n");
+        let wide_text = to_wide(&text);
+        let th = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, wide_text.len() * 2);
+        if !th.is_null() {
+            let tlocked = GlobalLock(th);
+            if !tlocked.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    wide_text.as_ptr(),
+                    tlocked as *mut u16,
+                    wide_text.len(),
+                );
+                GlobalUnlock(th);
+                if SetClipboardData(CF_UNICODETEXT, th).is_null() {
+                    GlobalFree(th);
+                }
+            } else {
+                GlobalFree(th);
+            }
+        }
+
+        // Mark cut vs copy via the "Preferred DropEffect" custom format.
+        if cut {
+            let fmt = RegisterClipboardFormatW(to_wide("Preferred DropEffect").as_ptr());
+            if fmt != 0 {
+                let eh = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 4);
+                if !eh.is_null() {
+                    let elocked = GlobalLock(eh);
+                    if !elocked.is_null() {
+                        std::ptr::write(elocked as *mut u32, DROPEFFECT_MOVE);
+                        GlobalUnlock(eh);
+                        if SetClipboardData(fmt, eh).is_null() {
+                            GlobalFree(eh);
+                        }
+                    } else {
+                        GlobalFree(eh);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read file paths from the OS clipboard. Prefers CF_HDROP; falls back to
+    /// parsing the Unicode-text copy. Returns `None` when the clipboard holds
+    /// no usable file paths. The `cut` flag is derived from "Preferred
+    /// DropEffect" (or defaults to copy for the text fallback).
+    ///
+    /// # Safety
+    /// Must be called from a context where the OS clipboard may be opened.
+    unsafe fn get_files_inner() -> Result<Option<(Vec<String>, bool)>, String> {
+        if OpenClipboard(ptr::null_mut()) == 0 {
+            return Err("无法打开系统剪贴板(可能被其他程序占用)".to_string());
+        }
+        let _guard = ClipboardGuard;
+        let mut result: Option<(Vec<String>, bool)> = None;
+
+        if IsClipboardFormatAvailable(CF_HDROP) != 0 {
+            let hdrop = GetClipboardData(CF_HDROP);
+            if !hdrop.is_null() {
+                let count = crate::DragQueryFileW(hdrop, u32::MAX, ptr::null_mut(), 0);
+                let mut paths = Vec::new();
+                for i in 0..count {
+                    let len = crate::DragQueryFileW(hdrop, i, ptr::null_mut(), 0) as usize;
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf: Vec<u16> = vec![0u16; len + 1];
+                    crate::DragQueryFileW(hdrop, i, buf.as_mut_ptr(), (len + 1) as u32);
+                    // `len` from DragQueryFileW is the path length WITHOUT the
+                    // null terminator (the buffer is `len + 1` to hold it). The
+                    // valid path is `buf[..len]` — slicing `len - 1` would drop
+                    // the final character of the file name.
+                    paths.push(String::from_utf16_lossy(&buf[..len]));
+                }
+                // IMPORTANT: do NOT call DragFinish(hdrop) here. `hdrop` came from
+                // GetClipboardData and is owned by the clipboard; DragFinish would
+                // GlobalFree it, causing a double-free / STATUS_HEAP_CORRUPTION
+                // (0xc0000374) on the next clipboard free or process exit. The
+                // clipboard releases the handle itself when we CloseClipboard.
+
+                let mut cut = false;
+                let fmt = RegisterClipboardFormatW(to_wide("Preferred DropEffect").as_ptr());
+                if fmt != 0 && IsClipboardFormatAvailable(fmt) != 0 {
+                    let eh = GetClipboardData(fmt);
+                    if !eh.is_null() {
+                        let elocked = GlobalLock(eh);
+                        if !elocked.is_null() {
+                            let effect = std::ptr::read(elocked as *const u32);
+                            cut = effect == DROPEFFECT_MOVE;
+                            GlobalUnlock(eh);
+                        }
+                    }
+                }
+                result = Some((paths, cut));
+            }
+        }
+
+        // Fallback: parse the Unicode-text copy (one existing path per line).
+        if result.is_none() && IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 {
+            let htext = GetClipboardData(CF_UNICODETEXT);
+            if !htext.is_null() {
+                let locked = GlobalLock(htext);
+                if !locked.is_null() {
+                    let mut w: Vec<u16> = Vec::new();
+                    let p = locked as *const u16;
+                    let mut i = 0;
+                    loop {
+                        let c = *p.add(i);
+                        if c == 0 {
+                            break;
+                        }
+                        w.push(c);
+                        i += 1;
+                    }
+                    GlobalUnlock(htext);
+                    let text = String::from_utf16_lossy(&w);
+                    let paths: Vec<String> = text
+                        .split(['\r', '\n'])
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && Path::new(s).exists())
+                        .collect();
+                    if !paths.is_empty() {
+                        result = Some((paths, false));
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Public, panic-safe wrapper around `set_files_inner`. A panic inside the
+    /// Win32 code (e.g. an unexpected clipboard state) is caught and turned
+    /// into a normal `Err` instead of aborting the whole application.
+    pub fn set_files(paths: &[String], cut: bool) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        crate::debug_log(&format!(
+            "[clip] set_files: {} paths, cut={}",
+            paths.len(),
+            cut
+        ));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            set_files_inner(paths, cut)
+        }));
+        match res {
+            Ok(Ok(())) => {
+                crate::debug_log("[clip] set_files: ok");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                crate::debug_log(&format!("[clip] set_files: err {e}"));
+                Err(e)
+            }
+            Err(_) => {
+                let m = "剪贴板写入发生内部错误(已捕获，应用未崩溃)".to_string();
+                crate::debug_log("[clip] set_files: PANIC caught");
+                Err(m)
+            }
+        }
+    }
+
+    /// Public, panic-safe wrapper around `get_files_inner`.
+    pub fn get_files() -> Result<Option<(Vec<String>, bool)>, String> {
+        crate::debug_log("[clip] get_files: enter");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            get_files_inner()
+        }));
+        match res {
+            Ok(r) => {
+                crate::debug_log(&format!(
+                    "[clip] get_files: result={:?}",
+                    r.as_ref().map(|o| o.as_ref().map(|(p, c)| (p.len(), *c)))
+                ));
+                r
+            }
+            Err(_) => {
+                let m = "剪贴板读取发生内部错误(已捕获，应用未崩溃)".to_string();
+                crate::debug_log("[clip] get_files: PANIC caught");
+                Err(m)
+            }
+        }
+    }
+
+    /// Empty the system clipboard (consume a cut after paste). Mirrors
+    /// Explorer's behavior so a cut isn't re-pasted after it's used.
+    pub fn clear() -> Result<(), String> {
+        unsafe {
+            if OpenClipboard(ptr::null_mut()) == 0 {
+                return Err("无法打开系统剪贴板(可能被其他程序占用)".to_string());
+            }
+            let _guard = ClipboardGuard;
+            EmptyClipboard();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod os_clipboard {
+    use arboard::Clipboard;
+
+    /// Write `paths` onto the OS file clipboard. `_cut` is ignored: macOS/Linux
+    /// expose no clipboard move-flag, so a cut pastes as a copy (which also
+    /// matches Finder, which has no file-cut).
+    pub fn set_files(paths: &[String], _cut: bool) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut cb = Clipboard::new().map_err(|e| format!("无法访问系统剪贴板: {e}"))?;
+        let list: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        cb.set()
+            .file_list(&list)
+            .map_err(|e| format!("写入文件剪贴板失败: {e}"))?;
+        Ok(())
+    }
+
+    /// Read file paths from the OS clipboard. Returns `None` when empty.
+    pub fn get_files() -> Result<Option<(Vec<String>, bool)>, String> {
+        let cb = Clipboard::new().map_err(|e| format!("无法访问系统剪贴板: {e}"))?;
+        let paths = cb
+            .get()
+            .file_list()
+            .map_err(|e| format!("读取文件剪贴板失败: {e}"))?;
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let paths: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        // No clipboard move-flag on these platforms -> always copy.
+        Ok(Some((paths, false)))
+    }
+
+    /// Best-effort clear used to consume a cut after paste. macOS/Linux have no
+    /// portable "clear", and since cut there is effectively a copy, leaving the
+    /// clipboard is harmless — so this is intentionally a no-op.
+    pub fn clear() -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Write the given paths onto the OS clipboard as a file list. `cut = true`
+/// marks them for a move (so File Explorer moves rather than copies on paste —
+/// Windows only; other platforms paste as copy).
+#[tauri::command]
+fn set_clipboard_files(paths: Vec<String>, cut: bool) -> Result<(), String> {
+    os_clipboard::set_files(&paths, cut)
+}
+
+/// Read file paths from the OS clipboard. Returns `null` when the clipboard
+/// holds no usable file paths.
+#[tauri::command]
+fn get_clipboard_files() -> Result<Option<ClipboardFiles>, String> {
+    let opt = os_clipboard::get_files()?;
+    Ok(opt.map(|(paths, cut)| ClipboardFiles { paths, cut }))
+}
+
+/// Consume the current clipboard contents. On Windows this empties the system
+/// clipboard (matching Explorer's "cut then paste clears the clipboard"
+/// behavior) so a cut isn't re-pasted; on other platforms it's a no-op.
+#[tauri::command]
+fn clear_clipboard() -> Result<(), String> {
+    os_clipboard::clear()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -811,6 +1254,9 @@ pub fn run() {
             move_items,
             load_config,
             save_config,
+            set_clipboard_files,
+            get_clipboard_files,
+            clear_clipboard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
