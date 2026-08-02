@@ -36,13 +36,14 @@
     </div>
 
     <!-- Scrollable file entries -->
-    <div class="file-entries" ref="entriesContainer" @click="onEntriesClick">
+    <div class="file-entries" ref="entriesContainer" @click="onEntriesClick" @contextmenu.prevent="onEntriesContextMenu">
       <!-- Parent dir entry (hidden only while an actual filter is active) -->
       <div
         v-if="hasParent && (!isSearching || searchQuery === '')"
         class="file-row parent-row"
         @click="clearSelection"
         @dblclick="$emit('navigate-parent')"
+        @contextmenu.prevent.stop="onRowContextMenu(null, $event)"
       >
         <div class="col-name"><span class="file-icon folder-icon">📁</span>..</div>
         <div class="col-size"></div>
@@ -62,6 +63,7 @@
         }"
         @click="onRowClick(index, $event)"
         @dblclick="onDoubleClick(entry)"
+        @contextmenu.prevent.stop="onRowContextMenu(index, $event, entry)"
       >
         <div class="col-name">
           <span class="file-icon" :class="entry.is_dir ? 'folder-icon' : 'file-icon-' + entry.extension.toLowerCase()">
@@ -104,7 +106,7 @@ const props = defineProps({
   cutNames: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -293,6 +295,26 @@ function onRowClick(index, e) {
 // Clicking empty space inside the list (not a row) clears the selection.
 function onEntriesClick(e) {
   if (e.target === e.currentTarget) clearSelection();
+}
+
+// Right-click on a row (or the ".." parent row, where entry is null): select
+// the row first (unless it's already part of the current multi-selection), then
+// open the context menu with the entry + viewport coordinates.
+function onRowContextMenu(index, e, entry) {
+  if (entry && index >= 0 && !selectedIndices.value.has(index)) {
+    // Selecting a row also resets the multi-selection to just this row —
+    // matching Explorer, where right-clicking an unselected item pivots the
+    // selection to it. (When the row is already selected we keep the group.)
+    selectRow(index);
+  }
+  emit("ctx-menu", { entry: entry || null, x: e.clientX, y: e.clientY });
+}
+
+// Right-click on empty space inside the list (not a row): open the background
+// context menu (only fires when the target is the container itself).
+function onEntriesContextMenu(e) {
+  if (e.target !== e.currentTarget) return;
+  emit("ctx-menu", { entry: null, x: e.clientX, y: e.clientY });
 }
 
 function scrollToRow(index, block = "nearest") {

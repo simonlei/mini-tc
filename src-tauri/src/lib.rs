@@ -1266,6 +1266,293 @@ fn clear_clipboard() -> Result<(), String> {
     os_clipboard::clear()
 }
 
+/// ─────────────────────────────────────────────────────────────────────────
+/// External archive extraction (7-Zip / WinRAR / unzip) via the right-click
+/// context menu. mini-tc does NOT bundle an extractor; instead it discovers an
+/// already-installed tool on the host and shells out to it.
+/// ─────────────────────────────────────────────────────────────────────────
+
+/// A discovered external extraction tool.
+#[derive(Serialize)]
+pub struct ArchiveTool {
+    pub id: String,     // stable identifier (e.g. "7zip-7z", "path-7za")
+    pub name: String,   // display name shown in the menu (e.g. "7-Zip")
+    pub exe: String,    // absolute path to the executable
+    pub syntax: String, // "7z" | "unzip" | "winrar" — how to invoke it
+}
+
+/// Locate an executable by name using the system PATH.
+/// Returns the first resolved absolute/relative path, or None when absent.
+fn find_in_path(name: &str) -> Option<String> {
+    #[cfg(windows)]
+    let out = std::process::Command::new("where.exe")
+        .arg(name)
+        .output()
+        .ok();
+    #[cfg(not(windows))]
+    let out = std::process::Command::new("which").arg(name).output().ok();
+
+    if let Some(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let first = s.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort search for `basenames` (e.g. `["7z.exe", "7za.exe"]`) across all
+/// drive roots C:..Z:. For each available root it checks the root itself, a few
+/// well-known portable folders, and one level of sub-directories (including the
+/// conventional `7-Zip` / `WinRAR` sub-folder). This catches custom/portable
+/// installs such as `D:\Soft\7-Zip\7z.exe` that the standard paths miss.
+/// Unavailable or inaccessible drives are skipped silently so detection never
+/// blocks the UI.
+fn scan_drives_for_exe(basenames: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    let known_subdirs: &[&str] = &[
+        "Soft",
+        "Tools",
+        "PortableApps",
+        "Program Files",
+        "Program Files (x86)",
+    ];
+    let tool_dirs: &[&str] = &["7-Zip", "7zip", "WinRAR", "Winrar"];
+    for letter in b'C'..=b'Z' {
+        let root = format!("{}:\\", letter as char);
+        let rootp = Path::new(&root);
+        if !rootp.exists() {
+            continue;
+        }
+        for base in basenames {
+            // Directly at the drive root (rare but cheap).
+            let direct = rootp.join(base);
+            if direct.exists() {
+                found.push(direct.to_string_lossy().into_owned());
+            }
+            // <root>/<known_subdir>/<base>
+            for sub in known_subdirs {
+                let under = rootp.join(sub).join(base);
+                if under.exists() {
+                    found.push(under.to_string_lossy().into_owned());
+                }
+            }
+        }
+        // One level of sub-directories: <root>/<child>/<base> and
+        // <root>/<child>/<tool_dir>/<base>.
+        if let Ok(entries) = std::fs::read_dir(rootp) {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if !child.is_dir() {
+                    continue;
+                }
+                for base in basenames {
+                    let c1 = child.join(base);
+                    if c1.exists() {
+                        found.push(c1.to_string_lossy().into_owned());
+                    }
+                    for tool in tool_dirs {
+                        let c2 = child.join(tool).join(base);
+                        if c2.exists() {
+                            found.push(c2.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Discover extraction tools actually present on this machine. Only tools whose
+/// executable exists are returned, so the frontend can tailor the menu (and
+/// show a "not installed" placeholder when none are found).
+#[tauri::command]
+fn get_archive_tools() -> Vec<ArchiveTool> {
+    let mut tools: Vec<ArchiveTool> = Vec::new();
+
+    #[cfg(windows)]
+    {
+        // Collect every candidate executable path we can find, then classify &
+        // de-duplicate. Sources, in order:
+        //   1. Well-known install locations (fast, explicit).
+        //   2. System PATH (7z.exe / 7za.exe / winrar.exe / unrar.exe).
+        //   3. A best-effort scan of local drive roots for portable / custom
+        //      installs (e.g. D:\Soft\7-Zip\7z.exe) outside Program Files.
+        let mut candidates: Vec<(String, String)> = Vec::new(); // (path, id-hint)
+
+        for (path, id) in [
+            (r"C:\Program Files\7-Zip\7z.exe", "7zip-7z"),
+            (r"C:\Program Files (x86)\7-Zip\7z.exe", "7zip-7z-x86"),
+            (r"C:\Program Files\WinRAR\WinRAR.exe", "winrar-gui"),
+            (r"C:\Program Files\WinRAR\UnRAR.exe", "winrar-unrar"),
+        ] {
+            if Path::new(path).exists() {
+                candidates.push((path.to_string(), id.to_string()));
+            }
+        }
+
+        for name in ["7z.exe", "7za.exe", "winrar.exe", "unrar.exe"] {
+            if let Some(p) = find_in_path(name) {
+                candidates.push((p, format!("path-{}", name)));
+            }
+        }
+
+        for p in scan_drives_for_exe(&["7z.exe", "7za.exe"]) {
+            candidates.push((p, "scan-7z".to_string()));
+        }
+        for p in scan_drives_for_exe(&["winrar.exe", "unrar.exe"]) {
+            candidates.push((p, "scan-winrar".to_string()));
+        }
+
+        // De-duplicate by path and classify each survivor.
+        let mut seen = std::collections::HashSet::new();
+        for (path, id) in candidates {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let lower = path.to_lowercase();
+            let (name, syntax) = if lower.contains("winrar") || lower.contains("unrar") {
+                ("WinRAR".to_string(), "winrar".to_string())
+            } else {
+                ("7-Zip".to_string(), "7z".to_string())
+            };
+            tools.push(ArchiveTool {
+                id,
+                name,
+                exe: path,
+                syntax,
+            });
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // p7zip
+        for name in ["7z", "7za"] {
+            if let Some(p) = find_in_path(name) {
+                tools.push(ArchiveTool {
+                    id: format!("path-{}", name),
+                    name: "7-Zip".to_string(),
+                    exe: p,
+                    syntax: "7z".to_string(),
+                });
+            }
+        }
+        // unzip
+        if let Some(p) = find_in_path("unzip") {
+            tools.push(ArchiveTool {
+                id: "path-unzip".to_string(),
+                name: "unzip".to_string(),
+                exe: p,
+                syntax: "unzip".to_string(),
+            });
+        }
+    }
+
+    tools
+}
+
+/// Result returned by `extract_archive`.
+#[derive(Serialize)]
+pub struct ExtractResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Run an external archive tool to extract `archive` into `target_dir`.
+///
+/// - `mode == "here"`: extract directly into `target_dir`.
+/// - `mode == "to_folder"`: extract into a new sub-folder named after the
+///   archive's base name (e.g. `foo.zip` → `foo\`), which 7z/unzip create
+///   automatically.
+/// `tool_exe` + `syntax` come from `get_archive_tools` so this command stays
+/// agnostic to which tool is installed.
+#[tauri::command]
+fn extract_archive(
+    archive: String,
+    target_dir: String,
+    tool_exe: String,
+    syntax: String,
+    mode: String,
+) -> Result<ExtractResult, String> {
+    let archive_path = Path::new(&archive);
+    if !archive_path.exists() {
+        return Err(format!("压缩包不存在: {}", archive));
+    }
+    let target_base = Path::new(&target_dir);
+    if !target_base.is_dir() {
+        return Err(format!("目标目录无效: {}", target_dir));
+    }
+
+    // Resolve the final extraction target directory.
+    let target = if mode == "to_folder" {
+        let stem = archive_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "archive".to_string());
+        target_base.join(stem)
+    } else {
+        target_base.to_path_buf()
+    };
+
+    let target_str = target.to_string_lossy().to_string();
+
+    // Build the invocation per tool syntax.
+    let mut cmd = std::process::Command::new(&tool_exe);
+    match syntax.as_str() {
+        "unzip" => {
+            // unzip -o <archive> -d <target>  (-o = overwrite)
+            cmd.arg("-o").arg(&archive).arg("-d").arg(&target);
+        }
+        "winrar" => {
+            // WinRAR `x` = extract with full paths; the destination folder
+            // must end with a separator so WinRAR treats it as a directory.
+            let mut t = target_str.clone();
+            if !t.ends_with('\\') && !t.ends_with('/') {
+                t.push(std::path::MAIN_SEPARATOR);
+            }
+            cmd.arg("x").arg(&archive).arg(t);
+        }
+        _ => {
+            // Default / "7z": `7z x <archive> -o<target> -y`
+            // The `-o` switch is concatenated with the path (no space) so it
+            // survives paths containing spaces as a single argument.
+            cmd.arg("x")
+                .arg(&archive)
+                .arg(format!("-o{}", target_str))
+                .arg("-y");
+        }
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("compression tool launch failed: {}", e))?;
+
+    if output.status.success() {
+        Ok(ExtractResult {
+            success: true,
+            message: format!("已解压到: {}", target_str),
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let detail = (stderr + &stdout).trim().to_string();
+        Err(format!(
+            "解压失败 ({}):\n{}",
+            output.status,
+            if detail.is_empty() {
+                "未知错误（工具无输出）"
+            } else {
+                &detail
+            }
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1290,6 +1577,8 @@ pub fn run() {
             set_clipboard_files,
             get_clipboard_files,
             clear_clipboard,
+            get_archive_tools,
+            extract_archive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

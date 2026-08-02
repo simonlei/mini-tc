@@ -38,7 +38,18 @@
       @calc-dir-size="calcDirSize"
       @delete="onDelete"
       @open="onOpen"
+      @ctx-menu="onCtxMenu"
       @pending-select-resolved="pendingSelectName = null"
+    />
+
+    <!-- Right-click context menu (archive extraction, open, copy path…) -->
+    <ContextMenu
+      :visible="ctxMenu.visible"
+      :x="ctxMenu.x"
+      :y="ctxMenu.y"
+      :items="ctxMenu.items"
+      @close="closeCtxMenu"
+      @select="handleCtxSelect"
     />
 
     <!-- Panel status bar -->
@@ -48,6 +59,9 @@
       <span v-if="selectedEntry">{{ selectedEntry.name }}</span>
       <span v-if="loading" class="loading-text">Loading...</span>
     </div>
+
+    <!-- Local toast (context-menu feedback: extract / copy path) -->
+    <div class="panel-toast" v-if="toast.visible" :class="'toast-' + toast.type">{{ toast.text }}</div>
   </div>
 </template>
 
@@ -56,7 +70,16 @@ import { ref, computed, watch, onMounted } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig } from "../api.js";
+import ContextMenu from "./ContextMenu.vue";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive } from "../api.js";
+
+// Extensions we consider extractable archives. Covers everything the bundled
+// 7-Zip (and friends) can handle; the actual extraction is delegated to the
+// external tool, so this list only gates which rows show the extract entries.
+const ARCHIVE_EXTENSIONS = [
+  "zip", "rar", "7z", "gz", "tar", "tgz", "bz2", "xz", "zst", "lz4",
+  "cab", "iso", "wim", "jar", "apk", "deb", "rpm", "arj", "z", "lzh", "ace",
+];
 
 const props = defineProps({
   isActive: { type: Boolean, default: false },
@@ -85,6 +108,23 @@ const hasParent = ref(true);
 const drives = ref([]);
 const dirSizes = ref({});
 const pendingSelectName = ref(null);
+
+// Discovered external extraction tools (filled on mount).
+const archiveTools = ref([]);
+
+// Right-click context menu state.
+const ctxMenu = ref({ visible: false, x: 0, y: 0, items: [] });
+// Which entry the open menu was invoked on (null = background).
+const ctxEntry = ref(null);
+
+// Lightweight toast (mirrors App.vue's, kept local so this panel is self-contained).
+const toast = ref({ visible: false, text: "", type: "info" });
+let toastTimer = null;
+function showToast(text, type = "info") {
+  toast.value = { visible: true, text, type };
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.value.visible = false; }, 3200);
+}
 
 // ── Persistence helpers ──
 // Tabs (per panel) are persisted to ~/.minitc/tabs-<panelId>.json via the
@@ -154,6 +194,16 @@ onMounted(async () => {
     drives.value = await listDrives();
   } catch {
     drives.value = [];
+  }
+
+  // Discover external archive tools (7-Zip / WinRAR / unzip) so the right-click
+  // menu can offer extraction. Failures are non-fatal — the menu simply shows
+  // a "not installed" placeholder.
+  try {
+    archiveTools.value = await getArchiveTools();
+  } catch (e) {
+    console.warn("get_archive_tools failed:", e);
+    archiveTools.value = [];
   }
 
   // Try to restore saved state
@@ -375,6 +425,134 @@ async function onOpen(fileName) {
   }
 }
 
+// ── Right-click context menu ──
+
+function closeCtxMenu() {
+  ctxMenu.value = { ...ctxMenu.value, visible: false };
+}
+
+// Build the menu items for the given entry (null = empty background).
+function buildMenuItems(entry) {
+  const items = [];
+  if (!entry) {
+    items.push({ label: "刷新", action: "refresh" });
+    return items;
+  }
+
+  if (entry.is_dir) {
+    items.push({ label: "进入目录", action: "open" });
+  } else {
+    items.push({ label: "打开", action: "open" });
+  }
+  items.push({ label: "复制路径", action: "copy-path" });
+
+  const ext = (entry.extension || "").toLowerCase();
+  if (ARCHIVE_EXTENSIONS.includes(ext)) {
+    items.push({ separator: true });
+    if (archiveTools.value.length === 0) {
+      items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
+    } else {
+      const stem = entry.name.replace(/\.[^.]+$/, "");
+      for (const tool of archiveTools.value) {
+        items.push({
+          label: `用 ${tool.name} 解压到当前文件夹`,
+          action: "extract",
+          tool,
+          mode: "here",
+        });
+        items.push({
+          label: `用 ${tool.name} 解压到 "${stem}"`,
+          action: "extract",
+          tool,
+          mode: "to_folder",
+        });
+      }
+    }
+  }
+  return items;
+}
+
+// Open the context menu at the cursor for the given entry.
+function onCtxMenu({ entry, x, y }) {
+  ctxEntry.value = entry;
+  ctxMenu.value = { visible: true, x, y, items: buildMenuItems(entry) };
+}
+
+// Dispatch a menu selection.
+async function handleCtxSelect(item) {
+  closeCtxMenu();
+  if (item.disabled) return;
+  const entry = ctxEntry.value;
+  const path = activeTab.value?.path;
+  if (!path) return;
+
+  switch (item.action) {
+    case "open":
+      if (entry.is_dir) {
+        navigateInto(entry.name);
+      } else {
+        onOpen(entry.name);
+      }
+      break;
+    case "copy-path": {
+      const full = await joinPath(path, entry.name);
+      copyTextToClipboard(full);
+      break;
+    }
+    case "refresh":
+      refresh();
+      break;
+    case "extract":
+      await doExtract(entry, item.tool, item.mode);
+      break;
+  }
+}
+
+// Run an external extractor on the archive and refresh the panel afterwards.
+async function doExtract(entry, tool, mode) {
+  const path = activeTab.value?.path;
+  if (!path) return;
+  const fullArchive = await joinPath(path, entry.name);
+  try {
+    const res = await extractArchive(fullArchive, path, tool.exe, tool.syntax, mode);
+    if (res && res.success) {
+      showToast(res.message, "success");
+      refresh();
+    } else {
+      showToast("解压失败", "error");
+    }
+  } catch (e) {
+    showToast("解压失败：\n" + String(e), "error");
+  }
+}
+
+// Copy text to the OS clipboard, falling back to a hidden textarea + execCommand
+// when the async Clipboard API is unavailable.
+function copyTextToClipboard(text) {
+  const done = () => showToast("已复制路径", "info");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+
+function fallbackCopy(text, done) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    done();
+  } catch {
+    showToast("复制路径失败", "error");
+  }
+}
+
 // Expose selectedEntry and currentPath for parent access (preview feature)
 const fileListRef = ref(null);
 
@@ -400,6 +578,7 @@ defineExpose({
   background: var(--panel-bg);
   border: 1px solid var(--border);
   overflow: hidden;
+  position: relative;
 }
 
 .file-panel.active {
@@ -420,5 +599,42 @@ defineExpose({
 
 .loading-text {
   color: var(--accent);
+}
+
+/* ── Local toast (context-menu feedback) ── */
+
+.panel-toast {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 90%;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-line;
+  z-index: 300;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  text-align: center;
+}
+
+.panel-toast.toast-info {
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.panel-toast.toast-success {
+  background: #1f6f3f;
+  color: #e8ffe8;
+  border: 1px solid #2f9d5b;
+}
+
+.panel-toast.toast-error {
+  background: #7a1f1f;
+  color: #ffe8e8;
+  border: 1px solid #c0392b;
 }
 </style>

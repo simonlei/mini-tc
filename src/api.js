@@ -87,3 +87,24 @@ export async function getClipboardFiles() {
 export async function clearClipboard() {
   return invoke("clear_clipboard");
 }
+
+/// Discover external archive-extraction tools installed on the host
+/// (7-Zip / WinRAR / unzip). Resolves to an array of
+/// `{ id, name, exe, syntax }`; empty when none are found.
+export async function getArchiveTools() {
+  return invoke("get_archive_tools");
+}
+
+/// Extract `archive` into `targetDir` using the external tool described by
+/// `toolExe` + `syntax` (from `getArchiveTools`). `mode` is "here" (extract
+/// into targetDir) or "to_folder" (extract into a new sub-folder named after
+/// the archive). Resolves to `{ success, message }`.
+export async function extractArchive(archive, targetDir, toolExe, syntax, mode) {
+  return invoke("extract_archive", {
+    archive,
+    targetDir,
+    toolExe,
+    syntax,
+    mode,
+  });
+}

@@ -11,6 +11,7 @@
 - **文件预览**（Ctrl+Q）：文本（txt/md/json/log）和图片（jpg/png/gif/webp/bmp/svg/avif）；图片经 asset protocol 直接加载，无大小限制；文本预览区内可拖选文字按 Ctrl+C 复制，或点 footer「复制全部」复制整篇
 - 4 套内置主题（石墨工业 / 霓虹暗夜 / 暖茶拿铁 / 墨竹青翠）
 - Ctrl+Tab 快速切换左右面板
+- **右键上下文菜单**：在文件/文件夹上右键可「打开」「复制路径」；对压缩包（zip/rar/7z/tar/gz/iso…）自动探测本机已安装的 **7-Zip / WinRAR / unzip**，提供「解压到当前文件夹」「解压到同名文件夹」入口，解压后自动刷新面板
 - **自动更新**（帮助 → 检查更新）
 - Windows / macOS / Linux 跨平台支持
 
@@ -20,7 +21,7 @@
 |---|------|
 | 桌面框架 | [Tauri 2](https://v2.tauri.app/) |
 | 前端 | Vue 3 + Vite 5 |
-| 后端 | Rust (7 条 Tauri 命令) |
+| 后端 | Rust (20+ 条 Tauri 命令) |
 | 编译 | MSVC (Windows) / Clang (macOS) / GCC (Linux) |
 
 ## 前置条件
@@ -75,20 +76,22 @@ mini-tc/
 │   ├── api.js                # Tauri invoke 封装
 │   ├── style.css             # 全局样式（4 套主题变量）
 │   └── components/
-│       ├── FilePanel.vue     # 面板容器（Tab + 路径 + 文件列表）
+│       ├── FilePanel.vue     # 面板容器（Tab + 路径 + 文件列表 + 右键菜单）
 │       ├── TabBar.vue        # 多 Tab 管理
-│       ├── PathBar.vue       # 可编辑路径栏 + 盘符切换
-│       ├── FileList.vue      # 文件列表（排序）
-│       └── FilePreview.vue   # 文件预览（文本/图片）
+│       ├── PathBar.vue       # 可编辑路径栏 + 盘符切换 + 面包屑
+│       ├── FileList.vue      # 文件列表（排序 + 多选 + 右键触发）
+│       ├── FilePreview.vue   # 文件预览（文本/图片）
+│       ├── VideoPreview.vue  # 视频预览
+│       └── ContextMenu.vue   # 通用右键菜单组件
 ├── src-tauri/                # Rust 后端
 │   ├── src/
 │   │   ├── main.rs
-│   │   └── lib.rs            # list_directory / read_file_preview / list_drives 等
+│   │   └── lib.rs            # list_directory / read_file_preview / extract_archive / get_archive_tools 等
 │   ├── tauri.conf.json
 │   └── icons/
 ├── .cnb.yml                  # CNB CI 流水线配置
 ├── package.json
-└── vite.config.js
+└── vite.config.mjs
 ```
 
 ## License
