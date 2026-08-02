@@ -8,7 +8,7 @@
 - 每栏独立多 Tab 管理，Tab 状态自动持久化
 - 可编辑路径栏 + 盘符下拉切换
 - 文件列表按名称 / 大小 / 修改时间排序
-- **文件预览**（Ctrl+Q）：文本（txt/md）和图片（jpg/png/gif/webp/bmp/svg/avif），图片通过 asset protocol 直接加载，无大小限制
+- **文件预览**（Ctrl+Q）：文本（txt/md/json/log）和图片（jpg/png/gif/webp/bmp/svg/avif）；图片经 asset protocol 直接加载，无大小限制；文本预览区内可拖选文字按 Ctrl+C 复制，或点 footer「复制全部」复制整篇
 - 4 套内置主题（石墨工业 / 霓虹暗夜 / 暖茶拿铁 / 墨竹青翠）
 - Ctrl+Tab 快速切换左右面板
 - **自动更新**（帮助 → 检查更新）

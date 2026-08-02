@@ -40,6 +40,11 @@
       <span>{{ fileSize }}</span>
       <span v-if="(previewType === 'text' || previewType === 'log') && lineCount !== null">{{ lineCount }} lines</span>
       <span v-if="previewType === 'image'">{{ imageInfo }}</span>
+      <button
+        class="copy-all-btn"
+        v-if="previewType === 'text' || previewType === 'json' || previewType === 'log'"
+        @click="copyAll"
+      >{{ copyAllDone ? '已复制 ✓' : '复制全部' }}</button>
     </div>
   </div>
 </template>
@@ -67,6 +72,7 @@ const fileSize = ref("");
 const lineCount = ref(null);
 const imageInfo = ref("");
 const jsonWarn = ref("");
+const copyAllDone = ref(false);
 
 const headerIcon = computed(() => {
   if (previewType.value === "image") return "🖼️";
@@ -105,6 +111,36 @@ function onImageLoad(e) {
 function onImageError() {
   error.value = "无法加载图片，文件可能已损坏";
   previewType.value = "";
+}
+
+// Copy the entire preview text to the OS clipboard (for the "复制全部" button).
+// Falls back to a hidden-textarea + execCommand when the async clipboard API
+// is unavailable (some webviews / insecure contexts).
+async function copyAll() {
+  const text = previewContent.value;
+  if (!text) return;
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+  }
+  copyAllDone.value = ok;
+  if (ok) setTimeout(() => { copyAllDone.value = false; }, 1500);
 }
 
 async function loadPreview() {
@@ -314,10 +350,28 @@ watch(
   word-break: break-all;
   tab-size: 4;
   width: 100%;
+  user-select: text;
 }
 
 .preview-text code {
   font-family: inherit;
+}
+
+.copy-all-btn {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.copy-all-btn:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 
 /* Footer */

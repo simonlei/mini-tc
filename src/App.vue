@@ -388,6 +388,20 @@ function getActivePanelRef() {
 // up on paste. `setClipboardFiles` writes a real file clipboard (CF_HDROP on
 // Windows, the platform pasteboard elsewhere); `getClipboardFiles` reads it.
 
+// Returns true when the current selection is non-empty AND anchored inside a
+// file-preview text area (.preview-text). Used so Ctrl+C / Ctrl+X inside a
+// preview copies the selected text instead of triggering a file clipboard op.
+function hasPreviewTextSelection() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false;
+  const text = sel.toString();
+  if (!text || !text.trim()) return false;
+  let node = sel.anchorNode;
+  if (!node) return false;
+  const el = node.nodeType === 3 ? node.parentElement : node;
+  return !!(el && el.closest && el.closest(".preview-text"));
+}
+
 function setClipboard(operation) {
   const panel = getActivePanelRef();
   const entries = panel?.selectedEntries;
@@ -779,6 +793,12 @@ onMounted(() => {
       const t = e.target;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
         return; // let the browser do native text copy/cut/paste
+      }
+      if (e.key === "c" || e.key === "C" || e.key === "x" || e.key === "X") {
+        // If the user has selected text inside a preview pane, let the browser
+        // copy that text natively instead of treating it as a file clipboard op
+        // (file-list selection → copy file; preview text selection → copy text).
+        if (hasPreviewTextSelection()) return;
       }
       if (e.key === "c" || e.key === "C") {
         e.preventDefault();
