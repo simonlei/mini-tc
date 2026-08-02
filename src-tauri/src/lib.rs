@@ -1218,7 +1218,7 @@ mod os_clipboard {
 
     /// Read file paths from the OS clipboard. Returns `None` when empty.
     pub fn get_files() -> Result<Option<(Vec<String>, bool)>, String> {
-        let cb = Clipboard::new().map_err(|e| format!("无法访问系统剪贴板: {e}"))?;
+        let mut cb = Clipboard::new().map_err(|e| format!("无法访问系统剪贴板: {e}"))?;
         let paths = cb
             .get()
             .file_list()
