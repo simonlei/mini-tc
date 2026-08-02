@@ -29,8 +29,9 @@
       <img :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
     </div>
 
-    <!-- Text preview -->
-    <div class="preview-body text-body" v-else-if="previewType === 'text'">
+    <!-- Text / JSON preview -->
+    <div class="preview-body text-body" v-else-if="previewType === 'text' || previewType === 'json'">
+      <div class="json-warn" v-if="jsonWarn">{{ jsonWarn }}</div>
       <pre class="preview-text"><code>{{ previewContent }}</code></pre>
     </div>
 
@@ -65,15 +66,18 @@ const previewContent = ref("");
 const fileSize = ref("");
 const lineCount = ref(null);
 const imageInfo = ref("");
+const jsonWarn = ref("");
 
 const headerIcon = computed(() => {
   if (previewType.value === "image") return "🖼️";
+  if (previewType.value === "json") return "🔧";
   if (previewType.value === "text") return "📄";
   return "👁️";
 });
 
 const typeLabel = computed(() => {
   if (previewType.value === "image") return "IMAGE";
+  if (previewType.value === "json") return "JSON";
   if (previewType.value === "text") return "TEXT";
   return "PREVIEW";
 });
@@ -108,6 +112,7 @@ async function loadPreview() {
   previewContent.value = "";
   lineCount.value = null;
   imageInfo.value = "";
+  jsonWarn.value = "";
 
   const ext = getExtension(props.fileName);
 
@@ -120,14 +125,26 @@ async function loadPreview() {
     return;
   }
 
-  // Text: use IPC to read content
+  // Text (incl. JSON): use IPC to read content
   try {
     const result = await readFilePreview(props.filePath);
     previewType.value = result.preview_type;
     previewContent.value = result.content;
     fileSize.value = formatSize(result.size);
     if (result.preview_type === "text") {
-      lineCount.value = result.content.split("\n").length;
+      if (ext === "json") {
+        // Pretty-print valid JSON with a 2-space indent. On parse failure
+        // show a non-blocking warning and fall back to the raw text.
+        try {
+          const parsed = JSON.parse(result.content);
+          previewContent.value = JSON.stringify(parsed, null, 2);
+          jsonWarn.value = "";
+        } catch {
+          jsonWarn.value = "JSON 格式错误，以下为原始文本";
+        }
+        previewType.value = "json";
+      }
+      lineCount.value = previewContent.value.split("\n").length;
     }
   } catch (e) {
     error.value = String(e);
@@ -270,6 +287,15 @@ watch(
 .text-body {
   overflow: auto;
   background: var(--bg);
+  display: block;
+}
+
+.json-warn {
+  padding: 4px 12px;
+  font-size: 12px;
+  color: #1f1f1f;
+  background: #f2c14e;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.2);
 }
 
 .preview-text {

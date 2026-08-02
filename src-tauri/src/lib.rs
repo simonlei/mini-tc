@@ -292,10 +292,10 @@ pub struct FilePreview {
     pub encoding: String, // "utf-8" for text, "base64" for image
 }
 
-const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD"];
+const TEXT_EXTENSIONS: &[&str] = &["TXT", "MD", "JSON"];
 const MAX_TEXT_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
 
-/// Read a text file for preview (txt/md only).
+/// Read a text file for preview (txt/md/json). JSON is returned as raw text;
 /// Images are loaded directly by the frontend via convertFileSrc (asset protocol).
 #[tauri::command]
 fn read_file_preview(path: String) -> Result<FilePreview, String> {
