@@ -37,6 +37,15 @@ pub struct FileEntry {
     pub is_hidden: bool,
 }
 
+/// The result of `list_directory`: the entries plus whether the path has a
+/// parent (used to render the ".." row). Returning `has_parent` here lets the
+/// frontend skip a separate `get_parent_dir` round-trip on every listing.
+#[derive(Serialize)]
+pub struct DirectoryListing {
+    pub entries: Vec<FileEntry>,
+    pub has_parent: bool,
+}
+
 /// Convert a system time to milliseconds since UNIX_EPOCH.
 fn system_time_to_millis(time: std::io::Result<std::time::SystemTime>) -> i64 {
     match time {
@@ -67,9 +76,10 @@ fn is_hidden(name: &str, _path: &Path) -> bool {
 }
 
 /// List the contents of a directory.
-/// Returns `..` as the first entry if the path has a parent.
+/// The frontend renders a synthetic ".." row when `has_parent` is true, so we
+/// compute it here once instead of paying a separate `get_parent_dir` RPC.
 #[tauri::command]
-fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
+fn list_directory(path: String) -> Result<DirectoryListing, String> {
     let dir_path = Path::new(&path);
     if !dir_path.exists() {
         return Err(format!("Path does not exist: {}", path));
@@ -115,7 +125,15 @@ fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
-    Ok(result)
+    let has_parent = match dir_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => true,
+        _ => false,
+    };
+
+    Ok(DirectoryListing {
+        entries: result,
+        has_parent,
+    })
 }
 
 /// Return the user's home directory.

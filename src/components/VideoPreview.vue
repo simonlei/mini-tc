@@ -403,7 +403,7 @@ async function detectSubtitles() {
   try {
     const dir = await getParentDir(props.filePath);
     if (!dir) return;
-    const list = await listDirectory(dir);
+    const list = (await listDirectory(dir)).entries;
     const base = props.fileName.replace(/\.[^.]+$/, "");
     const found = list.filter((e) => !e.is_dir && SUB_EXTS.includes(getExt(e.name)));
     const enriched = await Promise.all(

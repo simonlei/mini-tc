@@ -104,10 +104,16 @@ const error = ref("");
 const selectedEntry = ref(null);
 const selectedEntries = ref([]);
 const cutNames = ref([]);
-const hasParent = ref(true);
+const hasParent = ref(false);
 const drives = ref([]);
 const dirSizes = ref({});
 const pendingSelectName = ref(null);
+
+// Per-tab listing cache so switching tabs is instant (no per-tab "Loading…"
+// flash). Keyed by tab id → { path, entries, hasParent }. Background-preloaded
+// for inactive tabs after the active one loads.
+const tabCache = ref({});
+let preloaded = false;
 
 // Discovered external extraction tools (filled on mount).
 const archiveTools = ref([]);
@@ -189,46 +195,52 @@ watch(activeTabId, (newId) => { newId && saveState(); });
 // ── Lifecycle ──
 
 onMounted(async () => {
-  // Load drives for parent detection
-  try {
-    drives.value = await listDrives();
-  } catch {
-    drives.value = [];
-  }
+  // Drives are only needed for the PathBar dropdown; `list_directory` already
+  // supplies `hasParent`, so we don't need this before the first listing. Load
+  // it in the background so it never delays showing the file list.
+  listDrives()
+    .then((d) => { drives.value = d; })
+    .catch(() => { drives.value = []; });
 
-  // Discover external archive tools (7-Zip / WinRAR / unzip) so the right-click
-  // menu can offer extraction. Failures are non-fatal — the menu simply shows
-  // a "not installed" placeholder.
-  try {
-    archiveTools.value = await getArchiveTools();
-  } catch (e) {
-    console.warn("get_archive_tools failed:", e);
-    archiveTools.value = [];
-  }
+  // Archive-extraction tools (7-Zip / WinRAR / unzip) are discovered lazily on
+  // the first right-click (see ensureArchiveTools). Scanning the filesystem for
+  // them — especially the C:..Z: drive walk in `get_archive_tools` — is the
+  // single biggest source of launch latency, so it is deliberately kept off the
+  // startup path.
 
-  // Try to restore saved state
+  // Try to restore saved state — this is the only await that gates the first
+  // directory listing, and it's a single tiny file read.
   const saved = await loadState();
   if (saved) {
     tabs.value = saved.tabs;
     activeTabId.value = saved.activeTabId;
-    return;
+  } else {
+    // First launch: create initial tab with home directory
+    let homePath = "C:\\";
+    try {
+      homePath = await getHomeDir();
+    } catch {
+      homePath = "C:\\";
+    }
+    createTab(homePath);
   }
-
-  // First launch: create initial tab with home directory
-  let homePath;
-  try {
-    homePath = await getHomeDir();
-  } catch {
-    homePath = "C:\\";
-  }
-  createTab(homePath);
 });
 
-// Reload when active tab path changes
+// Reload when active tab path changes. If this tab's listing is already cached
+// (e.g. it was background-preloaded, or we're returning to a previously visited
+// tab), apply it instantly with no "Loading…" flash.
 watch(
   () => activeTab.value?.path,
   (newPath) => {
-    if (newPath) loadDirectory(newPath);
+    if (!newPath) return;
+    const tab = activeTab.value;
+    const cached = tabCache.value[tab.id];
+    if (cached && cached.path === newPath) {
+      entries.value = cached.entries;
+      hasParent.value = cached.hasParent;
+    } else {
+      loadDirectory(newPath, tab.id);
+    }
   }
 );
 
@@ -257,6 +269,9 @@ function closeTab(id) {
   const idx = tabs.value.findIndex((t) => t.id === id);
   if (idx === -1) return;
 
+  // Drop any cached listing for the closed tab.
+  if (tabCache.value[id]) delete tabCache.value[id];
+
   tabs.value.splice(idx, 1);
 
   // If we closed the active tab, switch to adjacent
@@ -272,28 +287,54 @@ function switchTab(id) {
 
 // ── Navigation ──
 
-async function loadDirectory(path) {
-  loading.value = true;
-  error.value = "";
-  selectedEntry.value = null;
-  selectedEntries.value = [];
-  cutNames.value = [];
-  dirSizes.value = {};
+// Load a directory and cache the result by tab id. When `tabId` is not the
+// active tab, the listing runs purely in the background (warming the cache) and
+// never touches the visible UI / loading flag — this is what makes tab switches
+// instant. `hasParent` now comes straight from `list_directory`, eliminating a
+// second round-trip per load.
+async function loadDirectory(path, tabId = activeTabId.value) {
+  const isActive = tabId === activeTabId.value;
+  if (isActive) {
+    loading.value = true;
+    error.value = "";
+    selectedEntry.value = null;
+    selectedEntries.value = [];
+    cutNames.value = [];
+    dirSizes.value = {};
+  }
   try {
-    entries.value = await listDirectory(path);
-
-    // Check if path has a parent
-    try {
-      const parent = await getParentDir(path);
-      hasParent.value = parent && parent.length > 0;
-    } catch {
-      hasParent.value = false;
+    const res = await listDirectory(path);
+    tabCache.value[tabId] = { path, entries: res.entries, hasParent: res.has_parent };
+    if (isActive) {
+      entries.value = res.entries;
+      hasParent.value = res.has_parent;
+      // Warm the rest of the tabs in the background now that the active one is
+      // ready, so switching to them is also instant.
+      if (!preloaded) {
+        preloaded = true;
+        preloadOtherTabs();
+      }
     }
   } catch (e) {
-    error.value = String(e);
-    entries.value = [];
+    // Don't cache a failed load — allow a retry on the next switch/refresh.
+    if (tabCache.value[tabId]) delete tabCache.value[tabId];
+    if (isActive) {
+      error.value = String(e);
+      entries.value = [];
+      hasParent.value = false;
+    }
   } finally {
-    loading.value = false;
+    if (isActive) loading.value = false;
+  }
+}
+
+// Preload every non-active tab's directory in the background. Each result is
+// stored in `tabCache`; the UI only picks it up when that tab becomes active.
+function preloadOtherTabs() {
+  for (const t of tabs.value) {
+    if (t.id !== activeTabId.value && !tabCache.value[t.id]) {
+      loadDirectory(t.path, t.id);
+    }
   }
 }
 
@@ -325,7 +366,10 @@ async function navigateParent() {
 
 function refresh() {
   if (activeTab.value) {
-    loadDirectory(activeTab.value.path);
+    // Force a real reload by dropping the cached entry first.
+    const id = activeTab.value.id;
+    if (tabCache.value[id]) delete tabCache.value[id];
+    loadDirectory(activeTab.value.path, id);
   }
 }
 
@@ -472,9 +516,28 @@ function buildMenuItems(entry) {
   return items;
 }
 
+// Lazily discover external archive tools on first use. The filesystem scan is
+// expensive (drive walk for 7-Zip/WinRAR), so it is intentionally deferred from
+// startup to here, and cached so it only runs once per panel.
+let archiveToolsPromise = null;
+function ensureArchiveTools() {
+  if (archiveToolsPromise) return archiveToolsPromise;
+  archiveToolsPromise = getArchiveTools()
+    .then((t) => { archiveTools.value = t; return t; })
+    .catch((e) => {
+      console.warn("get_archive_tools failed:", e);
+      archiveTools.value = [];
+      return [];
+    });
+  return archiveToolsPromise;
+}
+
 // Open the context menu at the cursor for the given entry.
-function onCtxMenu({ entry, x, y }) {
+async function onCtxMenu({ entry, x, y }) {
   ctxEntry.value = entry;
+  // Ensure the archive-tool list is available before building the menu (first
+  // right-click only; afterwards it's cached and instant).
+  await ensureArchiveTools();
   ctxMenu.value = { visible: true, x, y, items: buildMenuItems(entry) };
 }
 
