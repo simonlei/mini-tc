@@ -28,8 +28,11 @@ export async function joinPath(parent, child) {
   return invoke("join_path", { parent, child });
 }
 
-export async function readFilePreview(path) {
-  return invoke("read_file_preview", { path });
+// `asText = true` forces the backend to read the file as plain text even when
+// its extension isn't a built-in text type (used for user-added "preview as
+// text" extensions persisted in ~/.minitc/text-preview-extensions.json).
+export async function readFilePreview(path, asText = false) {
+  return invoke("read_file_preview", { path, asText });
 }
 
 export async function getDirSize(path) {
