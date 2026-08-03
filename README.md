@@ -60,11 +60,21 @@ bash scripts/release/build-release.sh
 
 ## 发布新版本
 
+构建与发布由 GitHub Actions 自动完成（见 [`.github/workflows/release.yml`](.github/workflows/release.yml)）：
+
 1. 修改 `package.json` 和 `src-tauri/tauri.conf.json` 中的版本号
-2. 运行 `bash scripts/release/build-release.sh`
-3. 在 [CNB Releases](https://cnb.cool/simon-lei/mini-tc/-/releases) 创建新 Release
-4. 上传 `scripts/release/out/` 中的 `.msi` 和 `latest.json`
-5. 已安装用户下次启动时点击 **帮助 → 检查更新** 即可自动升级
+2. 提交后打 tag 并推送：`git tag v0.x.0 && git push github v0.x.0`
+3. Actions 自动构建 Windows / macOS / Linux 三平台安装包并发布到 [GitHub Releases](https://github.com/simonlei/mini-tc/releases)，同时生成带签名的 `latest.json` 更新清单
+4. 已安装用户下次启动时点击 **帮助 → 检查更新** 即可自动升级
+
+## Windows 安装提示（SmartScreen）
+
+`x64-setup.exe` 未做 Authenticode 代码签名（个人开源项目未购买证书），首次运行会被 Microsoft Defender SmartScreen 拦截，提示「已保护你的电脑 / 发布者未知」。
+
+继续安装：点击弹窗中 **「更多信息」→「仍要运行」** 即可。
+
+文件来自 [GitHub Actions 构建](https://github.com/simonlei/mini-tc/actions)，构建过程公开可审计，可放心运行。
+
 
 ## 项目结构
 
