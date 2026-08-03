@@ -125,10 +125,7 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
-    let has_parent = match dir_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => true,
-        _ => false,
-    };
+    let has_parent = matches!(dir_path.parent(), Some(p) if !p.as_os_str().is_empty());
 
     Ok(DirectoryListing {
         entries: result,
