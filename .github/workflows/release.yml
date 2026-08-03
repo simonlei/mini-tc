@@ -1,0 +1,110 @@
+name: Release
+
+# 构建 MiniTC 发布版本：三平台安装包 + Tauri 更新器签名 (latest.json)。
+#
+# 触发：
+#   1. 推送 v* 标签 → 自动构建并发布 Release
+#   2. Actions 页面手动运行 (workflow_dispatch)，需指定 tag
+#
+# 必需的 GitHub Secrets（Settings → Secrets and variables → Actions）：
+#   TAURI_SIGNING_PRIVATE_KEY          # src-tauri/keys/mini-tc.key 的文件内容（base64 字符串）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD # 生成密钥时设置的密码（生成脚本用 mini-tc-updater）
+#
+# 可选（macOS 公证；不配置则产出未签名 .app，可用但会触发 Gatekeeper 提示，且无法自动更新）：
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            rust_target: aarch64-apple-darwin
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            rust_target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ''
+            rust_target: ''
+          - platform: windows-latest
+            args: ''
+            rust_target: ''
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.rust_target || 'host' }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Tauri 更新器签名：生成各平台 .sig 并聚合为 latest.json
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS 公证（可选，未填则跳过）
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 规避 rustc 1.97.1 ICE（与 dev.sh 保持一致）
+          CARGO_INCREMENTAL: '0'
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: 'MiniTC ${{ github.event.inputs.tag || github.ref_name }}'
+          releaseDraft: false
+          prerelease: false
+          generateReleaseNotes: true
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}
