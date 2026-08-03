@@ -10,9 +10,10 @@ name: Release
 #   TAURI_SIGNING_PRIVATE_KEY          # src-tauri/keys/mini-tc.key 的文件内容（base64 字符串）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD # 生成密钥时设置的密码（生成脚本用 mini-tc-updater）
 #
-# 可选（macOS 公证；不配置则产出未签名 .app，可用但会触发 Gatekeeper 提示，且无法自动更新）：
-#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
-#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+# 可选（macOS 代码签名/公证；不配置则 ad-hoc 签名，产物可用但触发 Gatekeeper 提示）：
+#   配置后需在下方 env 加回：APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+#                       以及：APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+#   注：更新器签名与 Apple 签名相互独立，不配 Apple 证书不影响应用内自动更新。
 
 on:
   push:
@@ -91,13 +92,12 @@ jobs:
           # Tauri 更新器签名：生成各平台 .sig 并聚合为 latest.json
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS 公证（可选，未填则跳过）
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # macOS 代码签名/公证：未配置 Apple 证书时必须完全省略 APPLE_* 变量，
+          # 否则 tauri-action 会尝试导入空证书而失败（failed to import keychain certificate）。
+          # 当前走 ad-hoc 签名（产物可用但触发 Gatekeeper 提示；更新器签名仍由上方密钥生成）。
+          # 将来配置 Apple 证书后，在下方加回：
+          #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+          #   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
           # 规避 rustc 1.97.1 ICE（与 dev.sh 保持一致）
           CARGO_INCREMENTAL: '0'
         with:
