@@ -216,11 +216,11 @@ onMounted(async () => {
     activeTabId.value = saved.activeTabId;
   } else {
     // First launch: create initial tab with home directory
-    let homePath = "C:\\";
+    let homePath = "/";
     try {
       homePath = await getHomeDir();
     } catch {
-      homePath = "C:\\";
+      homePath = "/";
     }
     createTab(homePath);
   }
@@ -259,7 +259,7 @@ function createTab(path) {
 }
 
 function addTab() {
-  const currentPath = activeTab.value?.path || "C:\\";
+  const currentPath = activeTab.value?.path || "/";
   createTab(currentPath);
 }
 
@@ -353,7 +353,7 @@ async function navigateParent() {
   if (!activeTab.value) return;
   try {
     // Remember current folder name so we can re-select it in the parent listing
-    const currentName = activeTab.value.path.split("\\").filter(Boolean).pop() || "";
+    const currentName = activeTab.value.path.split(/[\\/]/).filter(Boolean).pop() || "";
     const parent = await getParentDir(activeTab.value.path);
     if (parent && parent.length > 0) {
       pendingSelectName.value = currentName;
