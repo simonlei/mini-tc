@@ -108,3 +108,24 @@ jobs:
           generateReleaseNotes: true
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
+
+      - name: Upload portable Windows binary
+        # 额外上传可直接运行的裸 exe（免安装版），与 NSIS 安装器并存于同一 Release。
+        # 便携版前端已嵌入二进制，单文件即可运行；但依赖系统 WebView2 运行时，
+        # 且不参与应用内自动更新（仅 NSIS 安装版走更新器通道）。
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SRC="src-tauri/target/release/mini-tc.exe"
+          ASSET="MiniTC_${VERSION}_x64_portable.exe"
+          if [ ! -f "$SRC" ]; then
+            echo "ERROR: portable binary not found at $SRC"
+            exit 1
+          fi
+          cp "$SRC" "$ASSET"
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Uploaded portable binary: $ASSET"
