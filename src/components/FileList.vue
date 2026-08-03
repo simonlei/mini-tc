@@ -458,6 +458,30 @@ function onMouseUp(e) {
   }
 }
 
+// Emit a "delete" event for the current selection (or the active row when
+// nothing is explicitly selected). Shared by the Delete key and Cmd/Ctrl+Backspace.
+function deleteSelected() {
+  const list = displayedEntries.value;
+  const targets = getSelectedEntries();
+  if (targets.length === 0 && activeIndex.value >= 0) {
+    const e0 = list[activeIndex.value];
+    if (e0) targets.push(e0);
+  }
+  if (targets.length === 0) return;
+
+  // Preserve focus on a neighbour for the single-delete case.
+  let pendingName = null;
+  if (targets.length === 1) {
+    const idx = list.indexOf(targets[0]);
+    if (idx >= 0) {
+      if (idx < list.length - 1) pendingName = list[idx + 1].name;
+      else if (idx > 0) pendingName = list[idx - 1].name;
+    }
+  }
+  if (pendingName) pendingSelectName.value = pendingName;
+  emit("delete", targets);
+}
+
 function onKeydown(e) {
   // If focus is inside the search input, let it handle keys itself.
   if (e.target && e.target.tagName === "INPUT") return;
@@ -477,8 +501,16 @@ function onKeydown(e) {
 
   const list = displayedEntries.value;
 
-  // Backspace navigates to parent — works even in empty directories
+  // Backspace navigates to parent — works even in empty directories.
+  // macOS has no dedicated forward-Delete key, so Cmd+Backspace is the
+  // conventional "delete" gesture there; we also accept Ctrl+Backspace for
+  // parity on Windows/Linux. A bare Backspace (no modifier) still goes up a level.
   if (e.key === "Backspace") {
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      deleteSelected();
+      return;
+    }
     e.preventDefault();
     emit("navigate-parent");
     return;
@@ -559,24 +591,7 @@ function onKeydown(e) {
     }
   } else if (e.key === "Delete") {
     e.preventDefault();
-    const targets = getSelectedEntries();
-    if (targets.length === 0 && activeIndex.value >= 0) {
-      const e0 = list[activeIndex.value];
-      if (e0) targets.push(e0);
-    }
-    if (targets.length === 0) return;
-
-    // Preserve focus on a neighbour for the single-delete case.
-    let pendingName = null;
-    if (targets.length === 1) {
-      const idx = list.indexOf(targets[0]);
-      if (idx >= 0) {
-        if (idx < list.length - 1) pendingName = list[idx + 1].name;
-        else if (idx > 0) pendingName = list[idx - 1].name;
-      }
-    }
-    if (pendingName) pendingSelectName.value = pendingName;
-    emit("delete", targets);
+    deleteSelected();
   }
 }
 
