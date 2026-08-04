@@ -149,8 +149,9 @@ jobs:
           echo "Uploaded portable binary: $ASSET"
 
   # 所有平台更新通道双推到腾讯云 COS：等 release 矩阵（Win/mac/Linux）全部完成后，
-  # 从 GitHub Release 拉取已聚合的 latest.json + 各平台更新包，改写全部平台 URL 为 COS，
+  # 从 GitHub Release 按 latest.json 实际引用拉取更新包，改写全部平台 URL 为 COS，
   # 再整体上传，使国内用户（无论 Windows/macOS/Linux）均走 CDN 更新。
+  # 依赖均为 ubuntu-22.04 runner 预装：gh、jq、aws（CLI v2），无需 pip/额外安装。
   sync-cos:
     needs: release
     permissions:
@@ -158,23 +159,39 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download release assets from GitHub
+        # 按 latest.json 实际引用的文件名逐个下载，而非写死后缀。
+        # 原因：createUpdaterArtifacts:true 时 Tauri 2.x 是「直接对安装器签名」，
+        # 产物是 .exe/.msi/.app.tar.gz/.AppImage 等本体 + .sig，并不生成
+        # *.nsis.zip / *.wix.zip（旧假设会导致 gh release download 匹配为空而失败）。
+        # 只信清单引用，即可兼容当前形态与将来若改出 zip 打包形态。
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          mkdir -p cos-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "latest.json" --dir cos-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.tar.gz" --dir cos-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.nsis.zip" --dir cos-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.wix.zip" --dir cos-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.sig" --dir cos-assets
+          mkdir -p cos-assets && cd cos-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "latest.json"
+          mapfile -t ASSETS < <(jq -r '.platforms[].url | split("/") | .[-1]' latest.json | awk '!s[$0]++')
+          for f in "${ASSETS[@]}"; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$f"
+            echo "downloaded: $f"
+          done
 
       - name: Rewrite latest.json → COS CDN (all platforms)
+        # 用 jq 把每个 platform 的 URL 改写为 <UPDATER_CDN_BASE>/<filename>，
+        # 其余字段（signature 等）保持不变。jq 与 python3 均为 runner 预装，
+        # 这里选 jq 内联，避免为这一步单独维护 Python 脚本。
         env:
           UPDATER_CDN_BASE: ${{ secrets.UPDATER_CDN_BASE }}
-        run: python scripts/rewrite_latest.py cos-assets/latest.json
+        run: |
+          cd cos-assets
+          jq --arg base "${UPDATER_CDN_BASE%/}" \
+             '.platforms |= map_values(.url = ($base + "/" + (.url | split("/") | .[-1])))' \
+             latest.json > .tmp && mv .tmp latest.json
+          echo "Rewrote latest.json URLs to $UPDATER_CDN_BASE"
 
       - name: Sync updater artifacts to Tencent COS
+        # runner 预装 AWS CLI v2，直接用 aws s3 sync 对接腾讯云 COS（S3 兼容），
+        # 无需 pip 安装。
         env:
           COS_BUCKET: ${{ secrets.COS_BUCKET }}
           COS_REGION: ${{ secrets.COS_REGION }}
@@ -182,7 +199,6 @@ jobs:
           COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
           UPDATER_CDN_BASE: ${{ secrets.UPDATER_CDN_BASE }}
         run: |
-          python -m pip install awscli --quiet
           aws configure set aws_access_key_id "$COS_SECRET_ID"
           aws configure set aws_secret_access_key "$COS_SECRET_KEY"
           aws configure set region "$COS_REGION"
