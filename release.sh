@@ -6,9 +6,9 @@
 #
 # 做的事:
 #   1. 校验版本号格式 (vX.Y.Z)
-#   2. 前置检查：工作区干净、标签不存在、github 远程存在
+#   2. 前置检查：工作区干净、github 远程存在
 #   3. 推送 main 到 github 远程
-#   4. 创建并推送 vX.Y.Z 标签 (触发 Release workflow)
+#   4. 若标签已存在则先删除（本地+远端），再创建并推送 vX.Y.Z 标签 (触发 Release workflow)
 #
 # 版本号由 CI 根据 tag 自动注入（见 .github/workflows/release.yml 的
 # Bump version from tag 步骤 + scripts/bump_version.js），本地不改源码。
@@ -38,11 +38,6 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   exit 1
 fi
 
-if git rev-parse "$TAG" >/dev/null 2>&1; then
-  echo "ERROR: 标签 $TAG 已存在"
-  exit 1
-fi
-
 REMOTE="github"
 if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   echo "ERROR: 未找到名为 '$REMOTE' 的远程，请检查 git remote -v"
@@ -55,6 +50,17 @@ echo "==> 推送 main 到 $REMOTE"
 git push "$REMOTE" main
 
 echo "==> 创建并推送标签 $TAG"
+# 若标签已存在（本地或远端）则先删除，便于重发同一版本。
+# 注意：删除 git 标签不会删除已关联的 GitHub Release，tauri-action 会复用
+# 该 Release 并以 --clobber 覆盖同名资产。
+if git rev-parse "$TAG" >/dev/null 2>&1; then
+  echo "    本地标签 $TAG 已存在，删除"
+  git tag -d "$TAG"
+fi
+if git ls-remote --tags "$REMOTE" "refs/tags/$TAG" | grep -q .; then
+  echo "    远端标签 $TAG 已存在，删除"
+  git push "$REMOTE" --delete "$TAG"
+fi
 git tag "$TAG"
 git push "$REMOTE" "$TAG"
 
