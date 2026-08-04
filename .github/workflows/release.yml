@@ -192,6 +192,9 @@ jobs:
       - name: Sync updater artifacts to Tencent COS
         # runner 预装 AWS CLI v2，直接用 aws s3 sync 对接腾讯云 COS（S3 兼容），
         # 无需 pip 安装。
+        # 寻址方式必须用 virtual-hosted-style：COS 对该 bucket 禁用 path-style
+        # （否则报 PathStyleDomainForbidden），请求会落到
+        # https://<bucket>.cos.<region>.myqcloud.com/...。
         env:
           COS_BUCKET: ${{ secrets.COS_BUCKET }}
           COS_REGION: ${{ secrets.COS_REGION }}
@@ -202,7 +205,7 @@ jobs:
           aws configure set aws_access_key_id "$COS_SECRET_ID"
           aws configure set aws_secret_access_key "$COS_SECRET_KEY"
           aws configure set region "$COS_REGION"
-          aws configure set s3.addressing_style path
+          aws configure set s3.addressing_style virtual
           EP="https://cos.$COS_REGION.myqcloud.com"
           aws s3 sync cos-assets "s3://$COS_BUCKET" --endpoint-url "$EP"
           echo "Synced all-platform updater artifacts to COS: $UPDATER_CDN_BASE"
