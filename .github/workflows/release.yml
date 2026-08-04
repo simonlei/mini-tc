@@ -93,6 +93,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Bump version from tag
+        # 根据发布标签注入版本号到 package.json / Cargo.toml / tauri.conf.json，
+        # 使 latest.json 的 version 字段与标签一致，更新器才能正确判断版本。
+        # 仅在 CI 构建时改写，不回写 git，源码版本号保持滞后无妨。
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          node scripts/bump_version.js "$VERSION"
+
       - name: Build and publish
         uses: tauri-apps/tauri-action@v0
         env:
