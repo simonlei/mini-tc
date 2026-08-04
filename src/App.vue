@@ -27,7 +27,7 @@
             <span class="check-mark"></span>
             <span>检查更新</span>
           </div>
-          <div class="menu-option" @click="helpMenuOpen = false">
+          <div class="menu-option" @click="showAbout(); helpMenuOpen = false">
             <span class="check-mark"></span>
             <span>关于 MiniTC</span>
           </div>
@@ -47,6 +47,18 @@
         <div class="update-dialog-actions">
           <button v-if="updateDialog.showDownload" class="btn-primary" @click="downloadUpdate">下载更新</button>
           <button class="btn-secondary" @click="updateDialog.visible = false">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- About dialog -->
+    <div class="update-dialog-overlay" v-if="aboutVisible" @click="aboutVisible = false">
+      <div class="update-dialog" @click.stop>
+        <h3>关于 MiniTC</h3>
+        <p>版本：v{{ appVersion }}</p>
+        <p class="about-desc">一款轻量级跨平台双栏文件管理器，灵感来源于 Total Commander。</p>
+        <div class="update-dialog-actions">
+          <button class="btn-secondary" @click="aboutVisible = false">关闭</button>
         </div>
       </div>
     </div>
@@ -174,6 +186,7 @@ import VideoPreview from "./components/VideoPreview.vue";
 import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -198,6 +211,16 @@ const updateDialog = ref({
 });
 
 let pendingUpdate = null;
+
+// ── About dialog ──
+const aboutVisible = ref(false);
+const appVersion = ref("0.1.0");
+
+function showAbout() {
+  aboutVisible.value = true;
+  // Fetch version from Tauri (resolves instantly, cached by the runtime).
+  getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
+}
 
 function toggleThemeMenu() {
   helpMenuOpen.value = false;
@@ -307,6 +330,7 @@ async function downloadUpdate() {
 onMounted(() => {
   initTheme();
   loadTextPreviewConfig();
+  getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
 });
 
 // Panel split ratio
