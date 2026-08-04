@@ -1,6 +1,6 @@
 name: Release
 
-# 构建 MiniTC 发布版本：三平台安装包 + Tauri 更新器签名 (latest.json)。
+# 构建 MiniTC 发布版本：Windows + macOS 安装包 + Tauri 更新器签名 (latest.json)。
 #
 # 触发：
 #   1. 推送 v* 标签 → 自动构建并发布 Release
@@ -47,9 +47,6 @@ jobs:
           - platform: macos-latest
             args: '--target x86_64-apple-darwin'
             rust_target: x86_64-apple-darwin
-          - platform: ubuntu-22.04
-            args: ''
-            rust_target: ''
           - platform: windows-latest
             args: ''
             rust_target: ''
@@ -75,20 +72,6 @@ jobs:
         with:
           workspaces: src-tauri -> target
           key: ${{ matrix.rust_target || 'host' }}
-
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libssl-dev \
-            libgtk-3-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libsoup-3.0-dev
 
       - name: Install frontend dependencies
         run: npm ci
@@ -148,9 +131,9 @@ jobs:
           gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
           echo "Uploaded portable binary: $ASSET"
 
-  # 所有平台更新通道双推到腾讯云 COS：等 release 矩阵（Win/mac/Linux）全部完成后，
+  # 所有平台更新通道双推到腾讯云 COS：等 release 矩阵（Win/mac）全部完成后，
   # 从 GitHub Release 按 latest.json 实际引用拉取更新包，改写全部平台 URL 为 COS，
-  # 再整体上传，使国内用户（无论 Windows/macOS/Linux）均走 CDN 更新。
+  # 再整体上传，使国内用户（无论 Windows/macOS）均走 CDN 更新。
   # 依赖均为 ubuntu-22.04 runner 预装：gh、jq、aws（CLI v2），无需 pip/额外安装。
   sync-cos:
     needs: release
@@ -195,6 +178,8 @@ jobs:
         # 寻址方式必须用 virtual-hosted-style：COS 对该 bucket 禁用 path-style
         # （否则报 PathStyleDomainForbidden），请求会落到
         # https://<bucket>.cos.<region>.myqcloud.com/...。
+        # 关闭 payload 签名：AWS CLI v2 对分片上传默认用 aws-chunked 流式签名，
+        # 不带 Content-Length 头，COS 严格要求该头会报 MissingContentLength。
         env:
           COS_BUCKET: ${{ secrets.COS_BUCKET }}
           COS_REGION: ${{ secrets.COS_REGION }}
@@ -206,6 +191,7 @@ jobs:
           aws configure set aws_secret_access_key "$COS_SECRET_KEY"
           aws configure set region "$COS_REGION"
           aws configure set s3.addressing_style virtual
+          aws configure set s3.payload_signing_enabled false
           EP="https://cos.$COS_REGION.myqcloud.com"
           aws s3 sync cos-assets "s3://$COS_BUCKET" --endpoint-url "$EP"
           echo "Synced all-platform updater artifacts to COS: $UPDATER_CDN_BASE"
