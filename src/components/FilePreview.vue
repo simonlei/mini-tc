@@ -58,6 +58,9 @@ const props = defineProps({
   filePath: { type: String, required: true },
   fileName: { type: String, required: true },
   fileBytes: { type: Number, default: 0 },
+  // When true, force a plain-text read even for non-built-in extensions
+  // (user-added "preview as text" extensions from ~/.minitc config).
+  asText: { type: Boolean, default: false },
 });
 
 defineEmits(["close"]);
@@ -163,9 +166,10 @@ async function loadPreview() {
     return;
   }
 
-  // Text (incl. JSON): use IPC to read content
+  // Text (incl. JSON): use IPC to read content. `asText` forces a text read
+  // for extensions the user opted into via the "按文本预览" action.
   try {
-    const result = await readFilePreview(props.filePath);
+    const result = await readFilePreview(props.filePath, props.asText);
     previewType.value = result.preview_type;
     previewContent.value = result.content;
     fileSize.value = formatSize(result.size);

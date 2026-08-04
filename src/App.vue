@@ -59,6 +59,7 @@
           :file-path="previewFilePath"
           :file-name="previewFileName"
           :file-bytes="previewFileBytes"
+          :as-text="previewAsText"
           @close="closePreview"
         />
         <VideoPreview
@@ -69,13 +70,12 @@
           @close="closePreview"
           @navigate-list="onNavigateList"
         />
-        <div
+        <UnsupportedPreview
           v-else-if="previewVisible && previewPanel === 'left' && previewKind === 'unsupported'"
-          class="preview-placeholder"
-        >
-          <div class="preview-placeholder-title">暂不支持预览该格式</div>
-          <div class="preview-placeholder-name" v-if="previewFileName">{{ previewFileName }}</div>
-        </div>
+          :file-name="previewFileName"
+          :is-dir="previewUnsupportedIsDir"
+          @preview-as-text="onPreviewAsText"
+        />
         <FilePanel
           v-show="!(previewVisible && previewPanel === 'left')"
           ref="leftPanel"
@@ -96,6 +96,7 @@
           :file-path="previewFilePath"
           :file-name="previewFileName"
           :file-bytes="previewFileBytes"
+          :as-text="previewAsText"
           @close="closePreview"
         />
         <VideoPreview
@@ -106,13 +107,12 @@
           @close="closePreview"
           @navigate-list="onNavigateList"
         />
-        <div
+        <UnsupportedPreview
           v-else-if="previewVisible && previewPanel === 'right' && previewKind === 'unsupported'"
-          class="preview-placeholder"
-        >
-          <div class="preview-placeholder-title">暂不支持预览该格式</div>
-          <div class="preview-placeholder-name" v-if="previewFileName">{{ previewFileName }}</div>
-        </div>
+          :file-name="previewFileName"
+          :is-dir="previewUnsupportedIsDir"
+          @preview-as-text="onPreviewAsText"
+        />
         <FilePanel
           v-show="!(previewVisible && previewPanel === 'right')"
           ref="rightPanel"
@@ -171,6 +171,7 @@ import { ref, watch, onMounted } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
+import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { listen } from "@tauri-apps/api/event";
 import { check } from "@tauri-apps/plugin-updater";
@@ -305,6 +306,7 @@ async function downloadUpdate() {
 
 onMounted(() => {
   initTheme();
+  loadTextPreviewConfig();
 });
 
 // Panel split ratio
@@ -339,6 +341,51 @@ function endDrag() {
 
 const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
+
+// Extensions the user has chosen to always preview as plain text (via the
+// "按文本预览" button on an unsupported file). Persisted to
+// ~/.minitc/text-preview-extensions.json so the choice sticks across restarts
+// and exempts those extensions from the "unsupported format" placeholder.
+const TEXT_PREVIEW_CONFIG = "text-preview-extensions";
+const textPreviewExtensions = ref([]);
+// Whether the current "unsupported" placeholder is for a directory (in which
+// case the "按文本预览" button is hidden — directories can't be text-previewed).
+const previewUnsupportedIsDir = ref(false);
+// Flag passed to FilePreview: force a plain-text read for the current file
+// (true only for user-added text-preview extensions).
+const previewAsText = ref(false);
+
+async function loadTextPreviewConfig() {
+  try {
+    const raw = await loadConfig(TEXT_PREVIEW_CONFIG);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        textPreviewExtensions.value = arr
+          .map((e) => String(e).toLowerCase())
+          .filter(Boolean);
+      }
+    }
+  } catch (e) {
+    console.error("Failed to load text-preview extensions:", e);
+  }
+}
+
+async function saveTextPreviewConfig() {
+  await saveConfig(TEXT_PREVIEW_CONFIG, JSON.stringify(textPreviewExtensions.value)).catch((e) =>
+    console.error("Failed to persist text-preview extensions:", e)
+  );
+}
+
+// True when the extension can be previewed at all (built-in OR user-added text).
+function isPreviewableExt(ext) {
+  return PREVIEWABLE_EXTENSIONS.includes(ext) || textPreviewExtensions.value.includes(ext);
+}
+
+// True only for user-added text-preview extensions (forces a text read).
+function isTextPreviewExt(ext) {
+  return textPreviewExtensions.value.includes(ext);
+}
 
 const previewVisible = ref(false);
 const previewPanel = ref(""); // which panel shows the preview
@@ -612,13 +659,16 @@ function showToast(text, type = "info") {
 }
 
 // Show a normal (image/text) preview on the opposite panel.
-async function showFilePreview(entry, path) {
+// `asText = true` forces a plain-text read (used for user-added text-preview
+// extensions that aren't built-in text types).
+async function showFilePreview(entry, path, asText = false) {
   const fullPath = await joinPath(path, entry.name);
   previewPanel.value = activePanel.value === "left" ? "right" : "left";
   previewKind.value = "file";
   previewFilePath.value = fullPath;
   previewFileName.value = entry.name;
   previewFileBytes.value = entry.size;
+  previewAsText.value = asText;
   previewVisible.value = true;
 }
 
@@ -627,7 +677,26 @@ function showUnsupportedPreview(entry) {
   previewPanel.value = activePanel.value === "left" ? "right" : "left";
   previewKind.value = "unsupported";
   previewFileName.value = entry.name;
+  previewUnsupportedIsDir.value = !!entry.is_dir;
   previewVisible.value = true;
+}
+
+// User clicked "按文本预览" on an unsupported file: remember this extension as
+// a text-preview extension (persisted) and immediately show it as text.
+async function onPreviewAsText() {
+  const name = previewFileName.value;
+  // No-extension files yield ""; we store that as a sentinel so ALL
+  // extension-less files are later previewed as text.
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  if (!textPreviewExtensions.value.includes(ext)) {
+    textPreviewExtensions.value = [...textPreviewExtensions.value, ext];
+    await saveTextPreviewConfig();
+  }
+  const panel = getActivePanelRef();
+  const entry = panel?.selectedEntry;
+  const path = panel?.currentPath;
+  if (!entry || !path) return;
+  await showFilePreview(entry, path, true);
 }
 
 async function togglePreview() {
@@ -654,12 +723,12 @@ async function togglePreview() {
     return;
   }
 
-  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) {
+  if (!isPreviewableExt(ext)) {
     showUnsupportedPreview(entry);
     return;
   }
 
-  await showFilePreview(entry, path);
+  await showFilePreview(entry, path, isTextPreviewExt(ext));
 }
 
 function closePreview() {
@@ -669,6 +738,8 @@ function closePreview() {
   previewFilePath.value = "";
   previewFileName.value = "";
   previewFileBytes.value = 0;
+  previewAsText.value = false;
+  previewUnsupportedIsDir.value = false;
 }
 
 // Auto-update preview when the active panel's selection changes
@@ -702,7 +773,7 @@ watch(
       }
       return;
     }
-    if (!PREVIEWABLE_EXTENSIONS.includes(ext)) {
+    if (!isPreviewableExt(ext)) {
       showUnsupportedPreview(entry);
       return;
     }
@@ -711,7 +782,7 @@ watch(
     const path = panel?.currentPath;
     if (!path) return;
 
-    await showFilePreview(entry, path);
+    await showFilePreview(entry, path, isTextPreviewExt(ext));
   }
 );
 
@@ -742,7 +813,7 @@ watch(activePanel, async () => {
     }
     return;
   }
-  if (!PREVIEWABLE_EXTENSIONS.includes(ext)) {
+  if (!isPreviewableExt(ext)) {
     showUnsupportedPreview(entry);
     return;
   }
@@ -750,7 +821,7 @@ watch(activePanel, async () => {
   const path = panel?.currentPath;
   if (!path) return;
 
-  await showFilePreview(entry, path);
+  await showFilePreview(entry, path, isTextPreviewExt(ext));
 });
 
 // Keyboard shortcuts

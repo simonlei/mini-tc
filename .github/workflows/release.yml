@@ -10,6 +10,14 @@ name: Release
 #   TAURI_SIGNING_PRIVATE_KEY          # src-tauri/keys/mini-tc.key 的文件内容（base64 字符串）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD # 生成密钥时设置的密码（生成脚本用 mini-tc-updater）
 #
+#  国内镜像（腾讯云 COS）：将 Windows 更新通道（latest.json + NSIS 更新包）双推到 COS，供国内用户走 CDN 更新。
+#   UPDATER_CDN_BASE  # 更新通道根地址，例如 https://minitc-125xxxx.cos.ap-guangzhou.myqcloud.com
+#                      （须与 tauri.conf.json 的 plugins.updater.endpoints 前缀一致）
+#   COS_BUCKET        # COS bucket 名称
+#   COS_REGION        # COS 地域，例如 ap-guangzhou
+#   COS_SECRET_ID     # 腾讯云 API 密钥 ID
+#   COS_SECRET_KEY    # 腾讯云 API 密钥 Key
+#
 # 可选（macOS 代码签名/公证；不配置则 ad-hoc 签名，产物可用但触发 Gatekeeper 提示）：
 #   配置后需在下方 env 加回：APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
 #                       以及：APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
@@ -129,3 +137,46 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
           echo "Uploaded portable binary: $ASSET"
+
+  # 所有平台更新通道双推到腾讯云 COS：等 release 矩阵（Win/mac/Linux）全部完成后，
+  # 从 GitHub Release 拉取已聚合的 latest.json + 各平台更新包，改写全部平台 URL 为 COS，
+  # 再整体上传，使国内用户（无论 Windows/macOS/Linux）均走 CDN 更新。
+  sync-cos:
+    needs: release
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download release assets from GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p cos-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "latest.json" --dir cos-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.tar.gz" --dir cos-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.nsis.zip" --dir cos-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.wix.zip" --dir cos-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.sig" --dir cos-assets
+
+      - name: Rewrite latest.json → COS CDN (all platforms)
+        env:
+          UPDATER_CDN_BASE: ${{ secrets.UPDATER_CDN_BASE }}
+        run: python scripts/rewrite_latest.py cos-assets/latest.json
+
+      - name: Sync updater artifacts to Tencent COS
+        env:
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
+          COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+          UPDATER_CDN_BASE: ${{ secrets.UPDATER_CDN_BASE }}
+        run: |
+          python -m pip install awscli --quiet
+          aws configure set aws_access_key_id "$COS_SECRET_ID"
+          aws configure set aws_secret_access_key "$COS_SECRET_KEY"
+          aws configure set region "$COS_REGION"
+          aws configure set s3.addressing_style path
+          EP="https://cos.$COS_REGION.myqcloud.com"
+          aws s3 sync cos-assets "s3://$COS_BUCKET" --endpoint-url "$EP"
+          echo "Synced all-platform updater artifacts to COS: $UPDATER_CDN_BASE"

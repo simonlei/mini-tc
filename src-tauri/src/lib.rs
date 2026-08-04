@@ -324,8 +324,13 @@ const LOG_TAIL_LIMIT: u64 = 512 * 1024; // 512 KB shown when a .log is oversized
 
 /// Read a text file for preview (txt/md/json). JSON is returned as raw text;
 /// Images are loaded directly by the frontend via convertFileSrc (asset protocol).
+///
+/// `as_text` lets the frontend force a text read for extensions the user has
+/// explicitly opted into via the "按文本预览" action (persisted in
+/// `~/.minitc/text-preview-extensions.json`). This is used for file types that
+/// are not in `TEXT_EXTENSIONS` but the user knows are plain text.
 #[tauri::command]
-fn read_file_preview(path: String) -> Result<FilePreview, String> {
+fn read_file_preview(path: String, as_text: bool) -> Result<FilePreview, String> {
     let file_path = Path::new(&path);
     if !file_path.exists() {
         return Err(format!("File does not exist: {}", path));
@@ -342,7 +347,11 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
         .map(|e| e.to_string_lossy().to_uppercase())
         .unwrap_or_default();
 
-    if TEXT_EXTENSIONS.contains(&extension.as_str()) {
+    // A known text extension always reads as text. The frontend may also force
+    // a text read (`as_text`) for user-allowed extensions that aren't built in.
+    let force_text = TEXT_EXTENSIONS.contains(&extension.as_str()) || as_text;
+
+    if force_text {
         if size > MAX_TEXT_SIZE {
             if extension == "LOG" {
                 // Tail large logs instead of failing: seek to the last
@@ -379,8 +388,12 @@ fn read_file_preview(path: String) -> Result<FilePreview, String> {
                 MAX_TEXT_SIZE / 1024 / 1024
             ));
         }
-        let content =
-            fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+        // The user explicitly asked to preview this as text (or it's a built-in
+        // text extension), so be lenient about encoding: read the raw bytes and
+        // decode with replacement characters instead of failing on non-UTF-8
+        // input (binary file, legacy GBK/Shift-JIS encoding, etc.).
+        let bytes = fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+        let content = String::from_utf8_lossy(&bytes).to_string();
         Ok(FilePreview {
             preview_type: "text".to_string(),
             content,

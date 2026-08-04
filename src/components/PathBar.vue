@@ -1,7 +1,8 @@
 <template>
   <div class="path-bar">
-    <!-- Drive selector -->
+    <!-- Drive selector (Windows only — macOS/Linux have a single root "/") -->
     <select
+      v-if="showDriveSelector"
       class="drive-select"
       :value="currentDrive"
       @change="onDriveChange($event.target.value)"
@@ -106,12 +107,16 @@ const segments = computed(() => {
         segs.push({ label: p, path: acc });
       }
     } else {
-      // Relative / POSIX-style path
-      const sep = raw.includes("\\") ? "\\" : "/";
+      // Relative / POSIX-style path (macOS/Linux: /Users/simon/…)
+      const sep = "/";
+      // Absolute POSIX path starts with "/" — show root as first crumb.
+      if (raw.startsWith("/")) {
+        segs.push({ label: "/", path: "/" });
+      }
       let acc = "";
-      const parts = raw.split(/[\\/]/).filter(Boolean);
+      const parts = raw.split("/").filter(Boolean);
       for (const p of parts) {
-        acc += (acc ? sep : "") + p;
+        acc += sep + p;
         segs.push({ label: p, path: acc });
       }
     }
@@ -128,6 +133,12 @@ watch(
   (newPath) => {
     if (!editing.value) displayValue.value = newPath;
   }
+);
+
+// Only show the drive-letter dropdown on Windows. On macOS/Linux the backend
+// returns ["/"], so there's nothing to switch between — hide it entirely.
+const showDriveSelector = computed(() =>
+  props.drives.some((d) => /^[A-Za-z]:\\?$/.test(d))
 );
 
 const currentDrive = computed(() => {
