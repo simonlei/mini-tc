@@ -18,18 +18,60 @@
       <div
         v-if="!editing"
         class="breadcrumb"
+        ref="breadcrumbRef"
+        :class="{ expanded }"
         :title="path"
         @dblclick="startEdit"
       >
-        <template v-for="(seg, i) in segments" :key="i">
-          <span class="sep" v-if="i > 0">›</span>
-          <span
-            class="crumb"
-            :class="{ current: i === segments.length - 1 }"
-            @click.stop="onCrumbClick(seg.path)"
-            @dblclick.stop
-          >{{ seg.label }}</span>
-        </template>
+        <div class="crumbs-row" :class="{ collapsed }">
+          <!-- Collapsed: first › … › last (middle hidden behind ellipsis) -->
+          <template v-if="collapsed && segments.length > 2">
+            <span
+              class="crumb"
+              :title="segments[0].label"
+              @click.stop="onCrumbClick(segments[0].path)"
+            >{{ segments[0].label }}</span>
+            <span class="sep">›</span>
+            <button
+              class="crumb-ellipsis"
+              :title="expanded ? '收起中间目录' : '展开中间目录'"
+              @click.stop="expanded = !expanded"
+            >…</button>
+            <span class="sep">›</span>
+            <span
+              class="crumb current"
+              :title="segments[segments.length - 1].label"
+              @click.stop="onCrumbClick(segments[segments.length - 1].path)"
+            >{{ segments[segments.length - 1].label }}</span>
+          </template>
+
+          <!-- Expanded / short: full breadcrumb -->
+          <template v-else>
+            <button
+              v-if="needsCollapse && expanded"
+              class="crumb-ellipsis"
+              title="收起中间目录"
+              @click.stop="expanded = false"
+            >‹</button>
+            <template v-for="(seg, i) in segments" :key="i">
+              <span class="sep" v-if="i > 0">›</span>
+              <span
+                class="crumb"
+                :class="{ current: i === segments.length - 1, middle: i !== 0 && i !== segments.length - 1 }"
+                :title="seg.label"
+                @click.stop="onCrumbClick(seg.path)"
+                @dblclick.stop
+              >{{ seg.label }}</span>
+            </template>
+          </template>
+        </div>
+
+        <!-- Hidden measurement proxy: full path width, used to detect overflow -->
+        <div class="crumbs-measure" ref="measureRef" aria-hidden="true">
+          <span v-for="(seg, i) in segments" :key="i">
+            <span class="m-sep" v-if="i > 0">›</span><span class="m-crumb">{{ seg.label }}</span>
+          </span>
+        </div>
       </div>
 
       <!-- Edit mode (only when explicitly requested) -->
@@ -57,7 +99,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick } from "vue";
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import { pathExists, expandPath } from "../api.js";
 
 const props = defineProps({
@@ -72,6 +114,17 @@ const editing = ref(false);
 const invalid = ref(false);
 const copied = ref(false);
 const displayValue = ref(props.path);
+
+// ── Breadcrumb overflow handling ──
+// Long paths are collapsed (first › … › last) to avoid a horizontal scrollbar.
+// `needsCollapse` is measured against a hidden full-width proxy; `expanded`
+// is the user's temporary "show everything" toggle.
+const breadcrumbRef = ref(null);
+const measureRef = ref(null);
+const needsCollapse = ref(false);
+const expanded = ref(false);
+
+const collapsed = computed(() => needsCollapse.value && !expanded.value);
 
 // ── Breadcrumb parsing ──
 // Split the (already-expanded) path into clickable segments. Each segment maps
@@ -132,8 +185,61 @@ watch(
   () => props.path,
   (newPath) => {
     if (!editing.value) displayValue.value = newPath;
+    // Reset the expand toggle and re-measure on navigation.
+    expanded.value = false;
+    nextTick(measure);
   }
 );
+
+// Measure the full (un-collapsed) breadcrumb width against the visible
+// container. The hidden `.crumbs-measure` proxy holds every segment, so its
+// offsetWidth reflects the natural width regardless of the collapsed state.
+function measure() {
+  const container = breadcrumbRef.value;
+  const proxy = measureRef.value;
+  if (!container || !proxy) return;
+  // +4px tolerance for border/padding rounding
+  needsCollapse.value = proxy.offsetWidth > container.clientWidth + 4;
+}
+
+let resizeObserver = null;
+let winResizeHandler = null;
+let rafPending = false;
+
+// Re-measure on resize, debounced via rAF to avoid layout thrash during a
+// continuous window drag.
+function scheduleMeasure() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    measure();
+  });
+}
+
+onMounted(() => {
+  measure();
+  if (typeof ResizeObserver !== "undefined" && breadcrumbRef.value) {
+    resizeObserver = new ResizeObserver(() => scheduleMeasure());
+    resizeObserver.observe(breadcrumbRef.value);
+  }
+  // Always also listen for window resize. In some webview/embedding setups a
+  // flex child's ResizeObserver does not fire reliably on host-window resize,
+  // so this guarantees the breadcrumb re-measures and reflows with the window.
+  winResizeHandler = () => scheduleMeasure();
+  window.addEventListener("resize", winResizeHandler);
+});
+
+onBeforeUnmount(() => {
+  if (resizeObserver) {
+    resizeObserver.disconnect();
+    resizeObserver = null;
+  }
+  if (winResizeHandler) {
+    window.removeEventListener("resize", winResizeHandler);
+    winResizeHandler = null;
+  }
+});
 
 // Only show the drive-letter dropdown on Windows. On macOS/Linux the backend
 // returns ["/"], so there's nothing to switch between — hide it entirely.
@@ -291,11 +397,11 @@ async function copyPath() {
 }
 
 .breadcrumb {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 2px;
   padding: 2px 8px;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -304,18 +410,19 @@ async function copyPath() {
   font-family: "Consolas", "Cascadia Code", monospace;
   font-size: 12px;
   white-space: nowrap;
-  overflow-x: auto;
+  overflow: hidden;
   cursor: text;
-  scrollbar-width: thin;
 }
 
-.breadcrumb::-webkit-scrollbar {
-  height: 6px;
-}
-
-.breadcrumb::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
+/* The breadcrumb never scrolls horizontally — overflow is always clipped.
+   Expanding the "…" reveals the middle segments inline (each individually
+   truncated with an ellipsis) instead of enabling a scrollbar. */
+.crumbs-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
 }
 
 .crumb {
@@ -324,6 +431,39 @@ async function copyPath() {
   padding: 0 2px;
   border-radius: 2px;
   user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+  min-width: 0;
+  /* Size to content (flex-basis auto) and never grow, so segments pack left at
+     their natural character width instead of stretching to equal widths. Shrink
+     is still allowed so long segments truncate with their own ellipsis. */
+  flex: 0 1 auto;
+}
+
+.crumb.current {
+  color: var(--text);
+  font-weight: 600;
+  cursor: default;
+  flex-shrink: 0;
+}
+
+/* The drive letter / root should never shrink or get truncated. */
+.crumb:first-child {
+  flex-shrink: 0;
+}
+
+/* In collapsed mode, lock the first and current segments to their natural
+   width so the drive letter (e.g. D:\) stays tiny and the long current folder
+   is never pushed off-screen. In expanded/full mode every segment is
+   content-sized (flex: 0 1 auto) and packed left, so a path like
+   "C:\Users\simon\WorkBuddy\" shows four narrow, character-length segments with
+   the spare space left-aligned on the right instead of being stretched to equal
+   widths. */
+.crumbs-row.collapsed .crumb:first-child,
+.crumbs-row.collapsed .crumb.current {
+  flex: 0 0 auto;
 }
 
 .crumb:hover {
@@ -332,21 +472,56 @@ async function copyPath() {
   text-decoration: underline;
 }
 
-.crumb.current {
-  color: var(--text);
-  font-weight: 600;
-  cursor: default;
-}
-
 .crumb.current:hover {
   background: transparent;
   text-decoration: none;
+}
+
+.crumb-ellipsis {
+  flex: 0 0 auto;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+  font-family: inherit;
+  border-radius: 2px;
+}
+
+.crumb-ellipsis:hover {
+  color: var(--text);
+  background: var(--hover);
 }
 
 .sep {
   color: var(--text-dim);
   opacity: 0.6;
   user-select: none;
+  flex: 0 0 auto;
+}
+
+/* Hidden proxy used only to measure the full natural width of the path */
+.crumbs-measure {
+  position: absolute;
+  left: 0;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
+  white-space: nowrap;
+  font-family: "Consolas", "Cascadia Code", monospace;
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+.crumbs-measure .m-crumb {
+  padding: 0 2px;
+}
+
+.crumbs-measure .m-sep {
+  padding: 0 2px;
+  opacity: 0.6;
 }
 
 .path-input-wrapper {
