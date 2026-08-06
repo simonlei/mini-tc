@@ -81,6 +81,7 @@
           :file-bytes="previewFileBytes"
           @close="closePreview"
           @navigate-list="onNavigateList"
+          @open-next="playNextVideo"
         />
         <UnsupportedPreview
           v-else-if="previewVisible && previewPanel === 'left' && previewKind === 'unsupported'"
@@ -118,6 +119,7 @@
           :file-bytes="previewFileBytes"
           @close="closePreview"
           @navigate-list="onNavigateList"
+          @open-next="playNextVideo"
         />
         <UnsupportedPreview
           v-else-if="previewVisible && previewPanel === 'right' && previewKind === 'unsupported'"
@@ -429,6 +431,16 @@ function openVideo(payload) {
   previewFileName.value = payload.name;
   previewFileBytes.value = payload.bytes || 0;
   previewVisible.value = true;
+}
+
+// Autoplay the next video in the SAME preview panel (triggered by VideoPreview's
+// `open-next` on `ended`). Unlike openVideo this keeps previewPanel unchanged,
+// so the next clip loads in place; VideoPreview's `watch(filePath)` reloads it.
+function playNextVideo(payload) {
+  if (!previewVisible.value || previewKind.value !== "video") return;
+  previewFilePath.value = payload.path;
+  previewFileName.value = payload.name;
+  previewFileBytes.value = payload.bytes || 0;
 }
 
 // Switch to another video within the SAME preview panel (↑/↓ navigation in VideoPreview).
