@@ -129,7 +129,7 @@ const props = defineProps({
   fileName: { type: String, required: true },
   fileBytes: { type: Number, default: 0 },
 });
-const emit = defineEmits(["close", "open-video", "navigate-list"]);
+const emit = defineEmits(["close", "open-video", "navigate-list", "open-next"]);
 
 // ── Persisted player configuration ──
 // Speed / volume / mute are remembered across ALL video previews. The config is
@@ -280,7 +280,45 @@ function onLoadedMetadata() {
 // Persist player config (speed / volume / mute) whenever any of them changes.
 watch([volume, muted, rate], savePlayerConfig);
 function onTimeUpdate() { if (videoEl.value) videoTime.value = videoEl.value.currentTime; }
-function onEnded() { playing.value = false; }
+// All video containers the player can hand off to (native webview OR external
+// player). Used to find "the next video" in the same directory on autoplay.
+const VIDEO_OK = [...NATIVE_OK, ...EXTERNAL_ONLY];
+
+// Autoplay the next video in the SAME directory (by current sort order) when
+// the current one ends. Emits `open-next` with the next video's path/name/bytes
+// so the parent can keep playing in the same preview panel; if there is no next
+// video, playback simply stops (no loop).
+async function onEnded() {
+  playing.value = false;
+  // Only native-or-external-capable videos participate; skip if the current
+  // file isn't actually in the playable set (defensive — onEnded only fires for
+  // a real <video> element).
+  if (!VIDEO_OK.includes(ext.value)) return;
+  try {
+    const dir = await getParentDir(props.filePath);
+    if (!dir) return;
+    const list = (await listDirectory(dir)).entries;
+    // Mirror FileList's ordering: directories always first, then name asc.
+    const sorted = [...list].sort((a, b) => {
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    });
+    const videos = sorted.filter(
+      (e) => !e.is_dir && VIDEO_OK.includes((e.name.split(".").pop() || "").toLowerCase())
+    );
+    const idx = videos.findIndex((e) => e.name === props.fileName);
+    if (idx < 0 || idx >= videos.length - 1) return; // last video → stop
+    const next = videos[idx + 1];
+    const nextPath = await joinPath(dir, next.name);
+    emit("open-next", {
+      path: nextPath,
+      name: next.name,
+      bytes: next.size || 0,
+    });
+  } catch (err) {
+    console.error("autoplay next video failed:", err);
+  }
+}
 function onError() {
   // Native-capable container but actual codec/stream failed to decode.
   externalFallback.value = true;
