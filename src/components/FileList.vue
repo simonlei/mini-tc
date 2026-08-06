@@ -667,7 +667,30 @@ function getFileIcon(ext) {
   return icons[ext] || "📄";
 }
 
-defineExpose({ moveSelection, selectAll, clearSelection });
+// Restore a multi-selection by entry names after a directory re-list (e.g. a
+// background refresh). Names no longer present in the list (deleted externally)
+// are silently dropped. Restores `activeIndex` to the first matched row so the
+// keyboard caret and metadata stay consistent. Used by FilePanel.refresh() to
+// keep the user's selection across a window focus regain.
+function restoreByNames(names) {
+  if (!names || !names.length) return;
+  const set = new Set(names);
+  const newSel = new Set();
+  let firstIdx = -1;
+  displayedEntries.value.forEach((e, i) => {
+    if (set.has(e.name)) {
+      newSel.add(i);
+      if (firstIdx === -1) firstIdx = i;
+    }
+  });
+  if (newSel.size === 0) return;
+  selectedIndices.value = newSel;
+  activeIndex.value = firstIdx;
+  anchorIndex.value = firstIdx;
+  emitSelection();
+}
+
+defineExpose({ moveSelection, selectAll, clearSelection, restoreByNames });
 </script>
 
 <style scoped>

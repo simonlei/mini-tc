@@ -364,12 +364,21 @@ async function navigateParent() {
   }
 }
 
-function refresh() {
+async function refresh() {
   if (activeTab.value) {
+    // Snapshot the current selection (by name) so we can restore it after the
+    // reload. This keeps the user's selection intact across a window focus
+    // regain (App.vue's `tauri://focus` → refresh) instead of silently
+    // clearing it whenever the entries reference is replaced.
+    const keepNames = selectedEntries.value.map((e) => e.name);
     // Force a real reload by dropping the cached entry first.
     const id = activeTab.value.id;
     if (tabCache.value[id]) delete tabCache.value[id];
-    loadDirectory(activeTab.value.path, id);
+    await loadDirectory(activeTab.value.path, id);
+    // loadDirectory has now replaced `entries`; the file list reset its
+    // selection. Re-apply the saved names (those still present; external
+    // deletions are dropped automatically).
+    if (keepNames.length) fileListRef.value?.restoreByNames?.(keepNames);
   }
 }
 
