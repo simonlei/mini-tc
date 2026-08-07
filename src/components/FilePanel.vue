@@ -81,6 +81,33 @@ const ARCHIVE_EXTENSIONS = [
   "cab", "iso", "wim", "jar", "apk", "deb", "rpm", "arj", "z", "lzh", "ace",
 ];
 
+// Split-volume archive suffixes used by 7-Zip / WinRAR, e.g. `foo.7z.001`,
+// `foo.zip.001`, `foo.rar.part1`. These are individual parts of a multi-file
+// archive and must be treated as archives (the first part is enough to extract).
+const ARCHIVE_VOLUME_SUFFIXES = [
+  "001", "002", "003", "004", "005", "006", "007", "008", "009",
+  "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09",
+];
+const ARCHIVE_VOLUME_PART_RE = /^part\d+$/i;
+
+// Decide whether a file name (not just its last extension) points at an archive
+// we can extract. Handles both plain archives (`foo.zip`) and split volumes
+// (`foo.7z.001`, `foo.rar.part1`) whose last segment is a numeric volume index.
+function isArchiveName(name) {
+  const lower = name.toLowerCase();
+  const lastDot = lower.lastIndexOf(".");
+  if (lastDot === -1) return false;
+  const lastExt = lower.slice(lastDot + 1);
+  if (ARCHIVE_EXTENSIONS.includes(lastExt)) return true;
+  if (lastExt === "exe") return true; // self-extracting archive
+  const isVolumePart =
+    ARCHIVE_VOLUME_SUFFIXES.includes(lastExt) || ARCHIVE_VOLUME_PART_RE.test(lastExt);
+  if (!isVolumePart) return false;
+  const prevDot = lower.lastIndexOf(".", lastDot - 1);
+  const prevExt = prevDot === -1 ? "" : lower.slice(prevDot + 1, lastDot);
+  return ARCHIVE_EXTENSIONS.includes(prevExt);
+}
+
 const props = defineProps({
   isActive: { type: Boolean, default: false },
   panelId: { type: String, required: true },
@@ -499,22 +526,16 @@ function buildMenuItems(entry) {
   }
   items.push({ label: "复制路径", action: "copy-path" });
 
-  const ext = (entry.extension || "").toLowerCase();
-  if (ARCHIVE_EXTENSIONS.includes(ext)) {
+  if (isArchiveName(entry.name)) {
     items.push({ separator: true });
     if (archiveTools.value.length === 0) {
       items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
     } else {
-      const stem = entry.name.replace(/\.[^.]+$/, "");
+      // Extraction always goes through the 7-Zip GUI, which prompts for a
+      // password on encrypted archives and lets the user pick the destination.
       for (const tool of archiveTools.value) {
         items.push({
-          label: `用 ${tool.name} 解压到当前文件夹`,
-          action: "extract",
-          tool,
-          mode: "here",
-        });
-        items.push({
-          label: `用 ${tool.name} 解压到 "${stem}"`,
+          label: `用 ${tool.name} 解压`,
           action: "extract",
           tool,
           mode: "to_folder",
@@ -588,8 +609,14 @@ async function doExtract(entry, tool, mode) {
   try {
     const res = await extractArchive(fullArchive, path, tool.exe, tool.syntax, mode);
     if (res && res.success) {
-      showToast(res.message, "success");
-      refresh();
+      if (tool.syntax === "7z-gui") {
+        // The 7-Zip GUI extracts asynchronously in its own window (and prompts
+        // for a password when needed); don't refresh immediately.
+        showToast(res.message, "success");
+      } else {
+        showToast(res.message, "success");
+        refresh();
+      }
     } else {
       showToast("解压失败", "error");
     }

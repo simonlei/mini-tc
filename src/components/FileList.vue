@@ -67,7 +67,7 @@
       >
         <div class="col-name">
           <span class="file-icon" :class="entry.is_dir ? 'folder-icon' : 'file-icon-' + entry.extension.toLowerCase()">
-            {{ entry.is_dir ? "📁" : getFileIcon(entry.extension) }}
+            {{ entry.is_dir ? "📁" : getFileIcon(entry.name) }}
           </span>
           <span class="file-name">{{ entry.name }}</span>
         </div>
@@ -611,7 +611,34 @@ function formatDate(ts) {
   return date + " " + time;
 }
 
-function getFileIcon(ext) {
+const ARCHIVE_EXTENSIONS = [
+  "zip", "rar", "7z", "gz", "tar", "tgz", "bz2", "xz", "zst", "lz4",
+  "cab", "iso", "wim", "jar", "apk", "deb", "rpm", "arj", "z", "lzh", "ace",
+];
+const ARCHIVE_VOLUME_SUFFIXES = [
+  "001", "002", "003", "004", "005", "006", "007", "008", "009",
+  "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09",
+];
+
+// Whether a file name is an archive, including split-volume parts like
+// `foo.7z.001` / `foo.rar.part1` whose last segment is a numeric volume index.
+function isArchiveName(name) {
+  const lower = name.toLowerCase();
+  const lastDot = lower.lastIndexOf(".");
+  if (lastDot === -1) return false;
+  const lastExt = lower.slice(lastDot + 1);
+  if (ARCHIVE_EXTENSIONS.includes(lastExt)) return true;
+  if (lastExt === "exe") return true; // self-extracting archive
+  const isVolumePart = ARCHIVE_VOLUME_SUFFIXES.includes(lastExt) || /^part\d+$/i.test(lastExt);
+  if (!isVolumePart) return false;
+  const prevDot = lower.lastIndexOf(".", lastDot - 1);
+  const prevExt = prevDot === -1 ? "" : lower.slice(prevDot + 1, lastDot);
+  return ARCHIVE_EXTENSIONS.includes(prevExt);
+}
+
+function getFileIcon(name) {
+  if (isArchiveName(name)) return "🗜️";
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "";
   const icons = {
     TXT: "📄",
     MD: "📝",
@@ -622,10 +649,6 @@ function getFileIcon(ext) {
     XLSX: "📗",
     PPT: "📙",
     PPTX: "📙",
-    ZIP: "🗜️",
-    RAR: "🗜️",
-    "7Z": "🗜️",
-    GZ: "🗜️",
     EXE: "⚙️",
     MSI: "⚙️",
     JS: "📜",

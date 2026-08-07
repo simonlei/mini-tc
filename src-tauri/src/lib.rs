@@ -1438,24 +1438,36 @@ fn get_archive_tools() -> Vec<ArchiveTool> {
             candidates.push((p, "scan-winrar".to_string()));
         }
 
-        // De-duplicate by path and classify each survivor.
+        // De-duplicate by path. We only register the 7-Zip GUI helper
+        // (7zG.exe) — extraction is always done through its interactive window
+        // (which prompts for a password on encrypted archives), so the headless
+        // CLI `7z` is no longer used.
         let mut seen = std::collections::HashSet::new();
         for (path, id) in candidates {
             if !seen.insert(path.clone()) {
                 continue;
             }
             let lower = path.to_lowercase();
-            let (name, syntax) = if lower.contains("winrar") || lower.contains("unrar") {
-                ("WinRAR".to_string(), "winrar".to_string())
-            } else {
-                ("7-Zip".to_string(), "7z".to_string())
-            };
-            tools.push(ArchiveTool {
-                id,
-                name,
-                exe: path,
-                syntax,
-            });
+            // Only 7-Zip family (7z.exe / 7za.exe) gets a GUI extractor; skip
+            // WinRAR / unrar command-line candidates.
+            if lower.contains("winrar") || lower.contains("unrar") {
+                continue;
+            }
+            let gui = std::path::Path::new(&path)
+                .parent()
+                .map(|p| p.join("7zG.exe"))
+                .filter(|p| p.exists());
+            if let Some(gui) = gui {
+                let gui = gui.to_string_lossy().into_owned();
+                if seen.insert(gui.clone()) {
+                    tools.push(ArchiveTool {
+                        id: format!("{}-gui", id),
+                        name: "7-Zip".to_string(),
+                        exe: gui,
+                        syntax: "7z-gui".to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -1520,10 +1532,35 @@ fn extract_archive(
 
     // Resolve the final extraction target directory.
     let target = if mode == "to_folder" {
-        let stem = archive_path
+        let mut stem = archive_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "archive".to_string());
+        // Split-volume archives like `aaa.7z.001` / `aaa.rar.part1` have a
+        // numeric/`.partN` suffix as their last extension; strip it once more so
+        // the destination folder becomes `aaa` instead of `aaa.7z`.
+        let last_ext = archive_path
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let is_volume = {
+            let is_numeric = !last_ext.is_empty()
+                && last_ext.chars().all(|c| c.is_ascii_digit())
+                && last_ext.len() <= 3;
+            let is_z = last_ext.len() >= 2
+                && last_ext.starts_with('z')
+                && last_ext[1..].chars().all(|c| c.is_ascii_digit())
+                && last_ext.len() <= 3;
+            let is_part = last_ext.len() > 4
+                && last_ext.starts_with("part")
+                && last_ext[4..].chars().all(|c| c.is_ascii_digit());
+            is_numeric || is_z || is_part
+        };
+        if is_volume {
+            if let Some(s) = Path::new(&stem).file_stem() {
+                stem = s.to_string_lossy().to_string();
+            }
+        }
         target_base.join(stem)
     } else {
         target_base.to_path_buf()
@@ -1555,6 +1592,24 @@ fn extract_archive(
                 .arg(&archive)
                 .arg(format!("-o{}", target_str))
                 .arg("-y");
+        }
+    }
+
+    // The GUI branch (7zG.exe) launches the interactive 7-Zip window and
+    // returns immediately — it prompts for a password on encrypted archives.
+    // We therefore spawn it without waiting for completion or checking the
+    // exit code, and report success so the user gets the GUI feedback instead.
+    if syntax == "7z-gui" {
+        match cmd.spawn() {
+            Ok(_) => {
+                return Ok(ExtractResult {
+                    success: true,
+                    message: format!("已调用 7-Zip 图形界面解压到: {}", target_str),
+                });
+            }
+            Err(e) => {
+                return Err(format!("无法启动 7-Zip GUI: {}", e));
+            }
         }
     }
 
