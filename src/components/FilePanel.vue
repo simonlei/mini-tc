@@ -38,6 +38,7 @@
       @calc-dir-size="calcDirSize"
       @delete="onDelete"
       @open="onOpen"
+      @rename="onRename"
       @ctx-menu="onCtxMenu"
       @pending-select-resolved="pendingSelectName = null"
     />
@@ -71,7 +72,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -80,6 +81,33 @@ const ARCHIVE_EXTENSIONS = [
   "zip", "rar", "7z", "gz", "tar", "tgz", "bz2", "xz", "zst", "lz4",
   "cab", "iso", "wim", "jar", "apk", "deb", "rpm", "arj", "z", "lzh", "ace",
 ];
+
+// Split-volume archive suffixes used by 7-Zip / WinRAR, e.g. `foo.7z.001`,
+// `foo.zip.001`, `foo.rar.part1`. These are individual parts of a multi-file
+// archive and must be treated as archives (the first part is enough to extract).
+const ARCHIVE_VOLUME_SUFFIXES = [
+  "001", "002", "003", "004", "005", "006", "007", "008", "009",
+  "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09",
+];
+const ARCHIVE_VOLUME_PART_RE = /^part\d+$/i;
+
+// Decide whether a file name (not just its last extension) points at an archive
+// we can extract. Handles both plain archives (`foo.zip`) and split volumes
+// (`foo.7z.001`, `foo.rar.part1`) whose last segment is a numeric volume index.
+function isArchiveName(name) {
+  const lower = name.toLowerCase();
+  const lastDot = lower.lastIndexOf(".");
+  if (lastDot === -1) return false;
+  const lastExt = lower.slice(lastDot + 1);
+  if (ARCHIVE_EXTENSIONS.includes(lastExt)) return true;
+  if (lastExt === "exe") return true; // self-extracting archive
+  const isVolumePart =
+    ARCHIVE_VOLUME_SUFFIXES.includes(lastExt) || ARCHIVE_VOLUME_PART_RE.test(lastExt);
+  if (!isVolumePart) return false;
+  const prevDot = lower.lastIndexOf(".", lastDot - 1);
+  const prevExt = prevDot === -1 ? "" : lower.slice(prevDot + 1, lastDot);
+  return ARCHIVE_EXTENSIONS.includes(prevExt);
+}
 
 const props = defineProps({
   isActive: { type: Boolean, default: false },
@@ -366,11 +394,14 @@ async function navigateParent() {
 
 async function refresh() {
   if (activeTab.value) {
+    // A pending selection (e.g. set by rename/delete/parent-navigation) takes
+    // priority over the current selection snapshot.
+    const pending = pendingSelectName.value;
     // Snapshot the current selection (by name) so we can restore it after the
     // reload. This keeps the user's selection intact across a window focus
     // regain (App.vue's `tauri://focus` → refresh) instead of silently
     // clearing it whenever the entries reference is replaced.
-    const keepNames = selectedEntries.value.map((e) => e.name);
+    const keepNames = pending ? [] : selectedEntries.value.map((e) => e.name);
     // Force a real reload by dropping the cached entry first.
     const id = activeTab.value.id;
     if (tabCache.value[id]) delete tabCache.value[id];
@@ -378,7 +409,12 @@ async function refresh() {
     // loadDirectory has now replaced `entries`; the file list reset its
     // selection. Re-apply the saved names (those still present; external
     // deletions are dropped automatically).
-    if (keepNames.length) fileListRef.value?.restoreByNames?.(keepNames);
+    if (pending) {
+      pendingSelectName.value = null;
+      fileListRef.value?.restoreByNames?.([pending]);
+    } else if (keepNames.length) {
+      fileListRef.value?.restoreByNames?.(keepNames);
+    }
   }
 }
 
@@ -453,6 +489,23 @@ async function onDelete(targets) {
   dirSizes.value = next;
 }
 
+// ── Rename ──
+
+async function onRename(entry, newName) {
+  if (!activeTab.value) return;
+  const oldPath = await joinPath(activeTab.value.path, entry.name);
+  try {
+    await renameFile(oldPath, newName);
+    // Reload the listing, then re-select the renamed entry by its new name so
+    // the selection/caret stays on it (matching Explorer).
+    pendingSelectName.value = newName;
+    await refresh();
+  } catch (e) {
+    error.value = String(e);
+    showToast("重命名失败：" + String(e), "error");
+  }
+}
+
 // ── Open file ──
 
 const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
@@ -497,30 +550,39 @@ function buildMenuItems(entry) {
   } else {
     items.push({ label: "打开", action: "open" });
   }
+  items.push({ label: "重命名", action: "rename" });
   items.push({ label: "复制路径", action: "copy-path" });
 
-  const ext = (entry.extension || "").toLowerCase();
-  if (ARCHIVE_EXTENSIONS.includes(ext)) {
+  if (isArchiveName(entry.name)) {
     items.push({ separator: true });
     if (archiveTools.value.length === 0) {
       items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
     } else {
-      const stem = entry.name.replace(/\.[^.]+$/, "");
+      // Extraction goes through each tool's GUI, which prompts for a password
+      // on encrypted archives and lets the user pick the destination. Only the
+      // GUI entries are listed (one per tool) to avoid duplicates.
       for (const tool of archiveTools.value) {
+        if (!tool.syntax.endsWith("-gui")) continue;
         items.push({
-          label: `用 ${tool.name} 解压到当前文件夹`,
-          action: "extract",
-          tool,
-          mode: "here",
-        });
-        items.push({
-          label: `用 ${tool.name} 解压到 "${stem}"`,
+          label: `用 ${tool.name} 解压`,
           action: "extract",
           tool,
           mode: "to_folder",
         });
       }
     }
+  }
+
+  // "Add to archive" works for any plain file or directory (including the
+  // currently multi-selected set, when the right-clicked row is part of it).
+  items.push({ separator: true });
+  const compressTools = archiveTools.value.filter((t) =>
+    ["7z-gui", "7z-cli", "7z", "winrar-gui", "winrar"].includes(t.syntax)
+  );
+  if (compressTools.length === 0) {
+    items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
+  } else {
+    items.push({ label: "添加到压缩包", action: "add-to-archive" });
   }
   return items;
 }
@@ -574,9 +636,62 @@ async function handleCtxSelect(item) {
     case "refresh":
       refresh();
       break;
+    case "rename":
+      fileListRef.value?.startRenameByEntry?.(entry);
+      break;
     case "extract":
       await doExtract(entry, item.tool, item.mode);
       break;
+    case "add-to-archive":
+      await doAddToArchive();
+      break;
+  }
+}
+
+// Compress the current selection (or the right-clicked entry) into a single
+// archive named after the current folder, using the first available CLI tool.
+async function doAddToArchive() {
+  const path = activeTab.value?.path;
+  if (!path) return;
+
+  // The set to compress: the full multi-selection when it's non-empty (the
+  // right-clicked row is part of it), otherwise just this entry.
+  let targets = selectedEntries.value;
+  if (!targets || targets.length === 0) {
+    if (!entry) return;
+    targets = [entry];
+  }
+
+  const compressTools = archiveTools.value.filter((t) =>
+    ["7z-gui", "7z-cli", "7z", "winrar-gui", "winrar"].includes(t.syntax)
+  );
+  if (compressTools.length === 0) {
+    showToast("未检测到 7-Zip 等压缩工具，无法压缩", "error");
+    return;
+  }
+  const tool = compressTools[0];
+  const isGui = tool.syntax === "7z-gui" || tool.syntax === "winrar-gui";
+
+  // Archive name = current folder name (matches Explorer's "Compressed folder").
+  const folderName = path.split(/[\\/]/).filter(Boolean).pop() || "archive";
+  const sources = [];
+  for (const t of targets) {
+    sources.push(await joinPath(path, t.name));
+  }
+
+  try {
+    const res = await addToArchive(sources, path, folderName, tool.exe, tool.syntax);
+    if (res && res.success) {
+      showToast(res.message, "success");
+      // GUI tools build the archive asynchronously in their own window (and
+      // may prompt for a password), so don't refresh immediately. CLI tools
+      // finish synchronously, so refresh to reveal the new archive.
+      if (!isGui) refresh();
+    } else {
+      showToast("压缩失败", "error");
+    }
+  } catch (e) {
+    showToast("压缩失败：\n" + String(e), "error");
   }
 }
 
@@ -588,8 +703,14 @@ async function doExtract(entry, tool, mode) {
   try {
     const res = await extractArchive(fullArchive, path, tool.exe, tool.syntax, mode);
     if (res && res.success) {
-      showToast(res.message, "success");
-      refresh();
+      if (tool.syntax === "7z-gui") {
+        // The 7-Zip GUI extracts asynchronously in its own window (and prompts
+        // for a password when needed); don't refresh immediately.
+        showToast(res.message, "success");
+      } else {
+        showToast(res.message, "success");
+        refresh();
+      }
     } else {
       showToast("解压失败", "error");
     }

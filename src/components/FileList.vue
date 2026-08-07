@@ -67,9 +67,20 @@
       >
         <div class="col-name">
           <span class="file-icon" :class="entry.is_dir ? 'folder-icon' : 'file-icon-' + entry.extension.toLowerCase()">
-            {{ entry.is_dir ? "📁" : getFileIcon(entry.extension) }}
+            {{ entry.is_dir ? "📁" : getFileIcon(entry.name) }}
           </span>
-          <span class="file-name">{{ entry.name }}</span>
+          <input
+            v-if="renamingIndex === index"
+            :ref="setRenameInput"
+            class="rename-input"
+            v-model="renameValue"
+            @keydown.stop="onRenameKeydown"
+            @compositionstart="onCompositionStart"
+            @blur="onRenameBlur"
+            @click.stop
+            @dblclick.stop
+          />
+          <span v-else class="file-name">{{ entry.name }}</span>
         </div>
         <div class="col-size">
           <template v-if="entry.is_dir">
@@ -106,7 +117,7 @@ const props = defineProps({
   cutNames: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -127,6 +138,22 @@ const pendingSelectName = ref(null);
 const searchQuery = ref("");
 const isSearching = ref(false);
 const searchInput = ref(null);
+
+// ── Inline rename state ──
+// renamingIndex: the index (into displayedEntries) currently being renamed;
+//                -1 means not renaming. When multiple rows are selected, F2
+//                targets the LAST selected one (matching Explorer behaviour).
+// renameValue:   the editable text bound to the inline input.
+const renamingIndex = ref(-1);
+const renameValue = ref("");
+const renameInput = ref(null);
+
+// Function ref for the inline rename <input> (rendered inside a v-for, where a
+// plain string ref would be ambiguous). Vue calls this with the mounted DOM
+// node on render and with null on unmount; we keep the live node in renameInput.
+function setRenameInput(el) {
+  renameInput.value = el;
+}
 
 // Reset selection when entries change, unless we have a pending selection from delete or parent navigation.
 // flush: "post" so the DOM has already re-rendered the new rows before we scrollIntoView.
@@ -458,6 +485,97 @@ function onMouseUp(e) {
   }
 }
 
+// Enter inline rename mode for a given row index. Prefills the input with the
+// current name and (for files) selects the base name excluding the extension,
+// matching Explorer's default selection. Called by F2 (last-selected row) and
+// optionally by the context menu.
+async function startRename(index) {
+  if (index === undefined || index < 0) return;
+  const entry = displayedEntries.value[index];
+  if (!entry) return;
+  renamingIndex.value = index;
+  renameValue.value = entry.name;
+  await nextTick();
+  const el = renameInput.value;
+  if (el) {
+    el.focus();
+    // Select the base name (without extension) for a file; select all for a dir.
+    if (!entry.is_dir && entry.name.includes(".")) {
+      const dot = entry.name.lastIndexOf(".");
+      el.setSelectionRange(0, dot);
+    } else {
+      el.setSelectionRange(0, entry.name.length);
+    }
+  }
+}
+
+// Which index to rename when F2 is pressed: the last selected row if multiple
+// are selected, otherwise the active row. Returns -1 if nothing is focusable.
+function targetRenameIndex() {
+  if (selectedIndices.value.size > 0) {
+    // last clicked = the max index among the selection set
+    let last = -1;
+    for (const i of selectedIndices.value) if (i > last) last = i;
+    return last;
+  }
+  return activeIndex.value;
+}
+
+// Locate a row by its entry object (used by the right-click "rename" menu item)
+// and enter inline rename. Falls back to the active row when not found.
+async function startRenameByEntry(entry) {
+  if (!entry) return;
+  const idx = displayedEntries.value.findIndex((e) => e === entry);
+  startRename(idx >= 0 ? idx : targetRenameIndex());
+}
+
+// Keydown inside the rename input: Enter commits, Esc cancels. IME composition
+// is respected so confirming a Chinese candidate doesn't commit prematurely.
+function onRenameKeydown(e) {
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    commitRename();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    cancelRename();
+  }
+}
+
+// Commit the inline rename: emit a "rename" event with the old entry + new name
+// (the parent panel performs the actual IO and refreshes). Cancels on empty /
+// unchanged input.
+function commitRename() {
+  const idx = renamingIndex.value;
+  if (idx < 0) return;
+  const entry = displayedEntries.value[idx];
+  const newName = renameValue.value.trim();
+  renamingIndex.value = -1;
+  renameValue.value = "";
+  // Return keyboard focus to the list so the renamed row (which the parent
+  // re-selects by its new name after refresh) stays keyboard-active.
+  nextTick(() => listContainer.value?.focus());
+  if (!entry || newName === "" || newName === entry.name) return;
+  emit("rename", entry, newName);
+}
+
+function cancelRename() {
+  renamingIndex.value = -1;
+  renameValue.value = "";
+  // Esc cancels: drop the edit and hand focus back to the list.
+  nextTick(() => listContainer.value?.focus());
+}
+
+// Clicking away (blur) from the rename input commits, just like Enter — unless
+// the blur was caused by Esc (which already reset state) or an active IME
+// composition (which would commit a half-typed candidate). When committing
+// would be a no-op (empty / unchanged), we simply drop the edit state.
+function onRenameBlur(e) {
+  if (renamingIndex.value < 0) return; // already cancelled (e.g. via Esc)
+  if (e && e.isComposing) return;
+  commitRename();
+}
+
 // Emit a "delete" event for the current selection (or the active row when
 // nothing is explicitly selected). Shared by the Delete key and Cmd/Ctrl+Backspace.
 function deleteSelected() {
@@ -592,6 +710,11 @@ function onKeydown(e) {
   } else if (e.key === "Delete") {
     e.preventDefault();
     deleteSelected();
+  } else if (e.key === "F2") {
+    // Inline rename the last-selected row (or active row when only one/none).
+    e.preventDefault();
+    const idx = targetRenameIndex();
+    if (idx >= 0) startRename(idx);
   }
 }
 
@@ -611,7 +734,34 @@ function formatDate(ts) {
   return date + " " + time;
 }
 
-function getFileIcon(ext) {
+const ARCHIVE_EXTENSIONS = [
+  "zip", "rar", "7z", "gz", "tar", "tgz", "bz2", "xz", "zst", "lz4",
+  "cab", "iso", "wim", "jar", "apk", "deb", "rpm", "arj", "z", "lzh", "ace",
+];
+const ARCHIVE_VOLUME_SUFFIXES = [
+  "001", "002", "003", "004", "005", "006", "007", "008", "009",
+  "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09",
+];
+
+// Whether a file name is an archive, including split-volume parts like
+// `foo.7z.001` / `foo.rar.part1` whose last segment is a numeric volume index.
+function isArchiveName(name) {
+  const lower = name.toLowerCase();
+  const lastDot = lower.lastIndexOf(".");
+  if (lastDot === -1) return false;
+  const lastExt = lower.slice(lastDot + 1);
+  if (ARCHIVE_EXTENSIONS.includes(lastExt)) return true;
+  if (lastExt === "exe") return true; // self-extracting archive
+  const isVolumePart = ARCHIVE_VOLUME_SUFFIXES.includes(lastExt) || /^part\d+$/i.test(lastExt);
+  if (!isVolumePart) return false;
+  const prevDot = lower.lastIndexOf(".", lastDot - 1);
+  const prevExt = prevDot === -1 ? "" : lower.slice(prevDot + 1, lastDot);
+  return ARCHIVE_EXTENSIONS.includes(prevExt);
+}
+
+function getFileIcon(name) {
+  if (isArchiveName(name)) return "🗜️";
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "";
   const icons = {
     TXT: "📄",
     MD: "📝",
@@ -622,10 +772,6 @@ function getFileIcon(ext) {
     XLSX: "📗",
     PPT: "📙",
     PPTX: "📙",
-    ZIP: "🗜️",
-    RAR: "🗜️",
-    "7Z": "🗜️",
-    GZ: "🗜️",
     EXE: "⚙️",
     MSI: "⚙️",
     JS: "📜",
@@ -690,7 +836,7 @@ function restoreByNames(names) {
   emitSelection();
 }
 
-defineExpose({ moveSelection, selectAll, clearSelection, restoreByNames });
+defineExpose({ moveSelection, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry });
 </script>
 
 <style scoped>
@@ -860,6 +1006,20 @@ defineExpose({ moveSelection, selectAll, clearSelection, restoreByNames });
 .file-name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Inline rename input: replaces the file name span while editing. */
+.rename-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 0 2px;
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
 }
 
 .parent-row {

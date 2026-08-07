@@ -419,6 +419,33 @@ fn delete_to_trash(path: String) -> Result<(), String> {
     trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))
 }
 
+/// Rename a file or directory. `old_path` is the full source path, `new_name`
+/// is the bare new file name (no directory). The new path is `old_path`'s
+/// parent joined with `new_name`. Refuses to overwrite an existing target.
+#[tauri::command]
+fn rename_file(old_path: String, new_name: String) -> Result<(), String> {
+    let old = Path::new(&old_path);
+    if !old.exists() {
+        return Err(format!("Path does not exist: {}", old_path));
+    }
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("New name cannot be empty".to_string());
+    }
+    // Disallow path separators / parent-dir traversal in a bare name.
+    if new_name.contains('/') || new_name.contains('\\') || new_name == "." || new_name == ".." {
+        return Err(format!("Invalid name: {}", new_name));
+    }
+    let parent = old
+        .parent()
+        .ok_or_else(|| format!("Cannot determine parent of: {}", old_path))?;
+    let new_path = parent.join(new_name);
+    if new_path.exists() {
+        return Err(format!("Target already exists: {}", new_path.display()));
+    }
+    fs::rename(old, &new_path).map_err(|e| format!("Failed to rename: {}", e))
+}
+
 /// Payload streamed to the frontend during a copy/move so it can render a
 /// progress bar. `copied_bytes` / `total_bytes` drive the bar; `current_name`
 /// shows which file is currently being copied.
@@ -1438,24 +1465,72 @@ fn get_archive_tools() -> Vec<ArchiveTool> {
             candidates.push((p, "scan-winrar".to_string()));
         }
 
-        // De-duplicate by path and classify each survivor.
+        // De-duplicate by path. For every tool we register a GUI entry that the
+        // frontend uses BOTH for extraction (interactive window, prompts for a
+        // password on encrypted archives) AND for the "add to archive" (compress)
+        // action — it pops the tool's "Add to archive" dialog pre-filled with the
+        // selected sources. 7-Zip additionally exposes its headless CLI (7z.exe)
+        // as a silent-compression fallback.
         let mut seen = std::collections::HashSet::new();
         for (path, id) in candidates {
             if !seen.insert(path.clone()) {
                 continue;
             }
             let lower = path.to_lowercase();
-            let (name, syntax) = if lower.contains("winrar") || lower.contains("unrar") {
-                ("WinRAR".to_string(), "winrar".to_string())
+            let is_winrar = lower.contains("winrar");
+            let is_unrar = lower.contains("unrar");
+            // `unrar.exe` is a command-line extractor only (no GUI add dialog);
+            // skip it — WinRAR.exe already covers the GUI use case.
+            if is_unrar {
+                continue;
+            }
+
+            let (display_name, gui_syntax) = if is_winrar {
+                ("WinRAR".to_string(), "winrar-gui".to_string())
             } else {
-                ("7-Zip".to_string(), "7z".to_string())
+                ("7-Zip".to_string(), "7z-gui".to_string())
             };
-            tools.push(ArchiveTool {
-                id,
-                name,
-                exe: path,
-                syntax,
-            });
+
+            // The GUI binary.
+            // - 7-Zip: use 7zG.exe (the GUI helper). Crucially, when launched
+            //   with `7zG.exe a <archive> <files> -ad`, the `-ad` switch makes
+            //   it pop the interactive "Add to archive" dialog pre-filled with
+            //   the archive name and sources, waiting for the user — exactly
+            //   the Explorer-like experience. (Without `-ad` 7zG runs the `a`
+            //   command silently; `7zFM.exe a` only opens the file manager.)
+            // - WinRAR: the candidate path (WinRAR.exe) is already the GUI and
+            //   `WinRAR.exe a <archive> <files>` pops its own add dialog.
+            let gui_exe = if is_winrar {
+                path.clone()
+            } else {
+                std::path::Path::new(&path)
+                    .parent()
+                    .map(|p| p.join("7zG.exe"))
+                    .filter(|p| p.exists())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone())
+            };
+            if seen.insert(gui_exe.clone()) {
+                tools.push(ArchiveTool {
+                    id: format!("{}-gui", id),
+                    name: display_name.clone(),
+                    exe: gui_exe,
+                    syntax: gui_syntax,
+                });
+            }
+
+            // 7-Zip CLI (7z.exe / 7za.exe) as a silent-compression fallback.
+            if !is_winrar {
+                // `path` is already the CLI binary itself.
+                if seen.insert(path.clone()) {
+                    tools.push(ArchiveTool {
+                        id: format!("{}-cli", id),
+                        name: display_name,
+                        exe: path.clone(),
+                        syntax: "7z-cli".to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -1520,10 +1595,35 @@ fn extract_archive(
 
     // Resolve the final extraction target directory.
     let target = if mode == "to_folder" {
-        let stem = archive_path
+        let mut stem = archive_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "archive".to_string());
+        // Split-volume archives like `aaa.7z.001` / `aaa.rar.part1` have a
+        // numeric/`.partN` suffix as their last extension; strip it once more so
+        // the destination folder becomes `aaa` instead of `aaa.7z`.
+        let last_ext = archive_path
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let is_volume = {
+            let is_numeric = !last_ext.is_empty()
+                && last_ext.chars().all(|c| c.is_ascii_digit())
+                && last_ext.len() <= 3;
+            let is_z = last_ext.len() >= 2
+                && last_ext.starts_with('z')
+                && last_ext[1..].chars().all(|c| c.is_ascii_digit())
+                && last_ext.len() <= 3;
+            let is_part = last_ext.len() > 4
+                && last_ext.starts_with("part")
+                && last_ext[4..].chars().all(|c| c.is_ascii_digit());
+            is_numeric || is_z || is_part
+        };
+        if is_volume {
+            if let Some(s) = Path::new(&stem).file_stem() {
+                stem = s.to_string_lossy().to_string();
+            }
+        }
         target_base.join(stem)
     } else {
         target_base.to_path_buf()
@@ -1548,13 +1648,37 @@ fn extract_archive(
             cmd.arg("x").arg(&archive).arg(t);
         }
         _ => {
-            // Default / "7z": `7z x <archive> -o<target> -y`
+            // Default / "7z": `7z x <archive> -o<target> [-y]`
             // The `-o` switch is concatenated with the path (no space) so it
-            // survives paths containing spaces as a single argument.
+            // survives paths containing spaces as a single argument. The `-y`
+            // (auto-confirm) flag is omitted for GUI tools so 7zFM pops its
+            // interactive window and lets the user set the password / target.
             cmd.arg("x")
                 .arg(&archive)
-                .arg(format!("-o{}", target_str))
-                .arg("-y");
+                .arg(format!("-o{}", target_str));
+            if !syntax.ends_with("-gui") {
+                cmd.arg("-y");
+            }
+        }
+    }
+
+    // The GUI branch launches the tool's interactive window and returns
+    // immediately — it prompts for a password / destination on encrypted or
+    // multi-target archives. Both 7-Zip (`7z-gui`) and WinRAR (`winrar-gui`)
+    // use this path; the extraction arguments were already built above per
+    // syntax. We spawn without waiting or checking the exit code.
+    if syntax == "7z-gui" || syntax == "winrar-gui" {
+        let gui_name = if syntax == "winrar-gui" { "WinRAR" } else { "7-Zip" };
+        match cmd.spawn() {
+            Ok(_) => {
+                return Ok(ExtractResult {
+                    success: true,
+                    message: format!("已调用 {} 图形界面解压到: {}", gui_name, target_str),
+                });
+            }
+            Err(e) => {
+                return Err(format!("无法启动压缩软件 GUI: {}", e));
+            }
         }
     }
 
@@ -1583,6 +1707,136 @@ fn extract_archive(
     }
 }
 
+/// Result returned by `add_to_archive`.
+#[derive(Serialize)]
+pub struct AddResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Add the given `sources` (files and/or directories) into a single archive
+/// named `archive_name`, placed inside `base_dir`.
+///
+/// The archive name is normally derived from the current folder
+/// (e.g. `currrent_dir.zip`) so that selecting several items in the file
+/// manager produces one bundle named after the folder they live in — matching
+/// Explorer's "Compressed (zipped) folder" behaviour.
+///
+/// `tool_exe` + `syntax` come from `get_archive_tools`. GUI tools
+/// (`7z-gui` / `winrar-gui`) open their interactive "Add to archive" dialog
+/// pre-filled with the selected sources so the user can configure options;
+/// CLI tools (`7z-cli` / `7z` / `winrar`) compress silently.
+#[tauri::command]
+fn add_to_archive(
+    sources: Vec<String>,
+    base_dir: String,
+    archive_name: String,
+    tool_exe: String,
+    syntax: String,
+) -> Result<AddResult, String> {
+    if sources.is_empty() {
+        return Err("没有选中任何文件".to_string());
+    }
+    let base = Path::new(&base_dir);
+    if !base.is_dir() {
+        return Err(format!("目标目录无效: {}", base_dir));
+    }
+
+    // Build the full archive path inside base_dir. Ensure the extension so the
+    // resulting file is recognised as a zip.
+    let mut name = archive_name.clone();
+    if !name.to_lowercase().ends_with(".zip") {
+        name.push_str(".zip");
+    }
+    let archive_path = base.join(&name);
+    let archive_str = archive_path.to_string_lossy().to_string();
+
+    let mut cmd = std::process::Command::new(&tool_exe);
+    // All tools use the `a` (add) command. The archive path is always passed
+    // so the GUI pre-fills the destination name; the trailing switch differs
+    // per tool: GUI tools must NOT use `-y` (it would skip the dialog) and
+    // 7-Zip's GUI additionally needs `-ad` to pop the "Add to archive" dialog
+    // instead of running silently.
+    let is_gui = syntax == "7z-gui" || syntax == "winrar-gui";
+    match syntax.as_str() {
+        "winrar" | "winrar-gui" => {
+            // WinRAR `a` = add to archive; the destination must end with a
+            // separator when it doesn't exist yet so WinRAR treats it as a
+            // directory + name rather than a directory to read from.
+            let mut a = archive_str.clone();
+            if !a.ends_with('\\') && !a.ends_with('/') {
+                a.push(std::path::MAIN_SEPARATOR);
+            }
+            cmd.arg("a").arg(a);
+        }
+        _ => {
+            // 7z / 7z-cli / 7z-gui: `7z a <archive> <src...>`
+            cmd.arg("a").arg(&archive_str);
+        }
+    }
+    for s in &sources {
+        cmd.arg(s);
+    }
+    if is_gui {
+        if syntax == "7z-gui" {
+            // `-ad` = disable archive-name parsing, which makes 7zG pop the
+            // interactive "Add to archive" dialog (pre-filled with the name and
+            // sources) instead of silently creating the archive.
+            cmd.arg("-ad");
+        }
+        // WinRAR's GUI `a` already shows its add dialog; no extra switch.
+    } else {
+        cmd.arg("-y"); // CLI: auto-confirm, run silently.
+    }
+
+    // Set the working directory to base_dir so relative behaviour is sane and
+    // the spawn doesn't write into Tauri's watched source tree.
+    cmd.current_dir(base);
+
+    // GUI tools (7zG.exe / WinRAR.exe) pop the interactive "Add to archive"
+    // dialog pre-filled with the selected sources, letting the user set the
+    // name, format, password and compression level themselves — exactly like
+    // Explorer's right-click. We spawn them without waiting or checking the
+    // exit code, since the archive is built asynchronously in their own window.
+    if is_gui {
+        match cmd.spawn() {
+            Ok(_) => {
+                return Ok(AddResult {
+                    success: true,
+                    message: format!("已打开压缩软件界面，请在弹窗中确认压缩包: {}", archive_str),
+                });
+            }
+            Err(e) => {
+                return Err(format!("无法启动压缩软件界面: {}", e));
+            }
+        }
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("compression tool launch failed: {}", e))?;
+
+    if output.status.success() {
+        Ok(AddResult {
+            success: true,
+            message: format!("已创建压缩包: {}", archive_str),
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let detail = (stderr + &stdout).trim().to_string();
+        Err(format!(
+            "压缩失败 ({}):\n{}",
+            output.status,
+            if detail.is_empty() {
+                "未知错误（工具无输出）"
+            } else {
+                &detail
+            }
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1599,6 +1853,7 @@ pub fn run() {
             read_file_preview,
             get_dir_size,
             delete_to_trash,
+            rename_file,
             open_file,
             copy_items,
             move_items,
@@ -1609,6 +1864,7 @@ pub fn run() {
             clear_clipboard,
             get_archive_tools,
             extract_archive,
+            add_to_archive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

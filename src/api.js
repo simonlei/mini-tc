@@ -43,6 +43,12 @@ export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
 
+// Rename a file or directory. `oldPath` is the full source path; `newName` is
+// the bare new file name (no directory component).
+export async function renameFile(oldPath, newName) {
+  return invoke("rename_file", { oldPath, newName });
+}
+
 export async function openFile(path) {
   return invoke("open_file", { path });
 }
@@ -109,5 +115,19 @@ export async function extractArchive(archive, targetDir, toolExe, syntax, mode) 
     toolExe,
     syntax,
     mode,
+  });
+}
+
+/// Add the given `sources` (files / directories) into a single archive named
+/// `archiveName` inside `baseDir`, using the external tool `toolExe` + `syntax`
+/// (from `getArchiveTools`). Only CLI tools (syntax "7z-cli" / "7z" / "winrar")
+/// are valid here.
+export async function addToArchive(sources, baseDir, archiveName, toolExe, syntax) {
+  return invoke("add_to_archive", {
+    sources,
+    baseDir,
+    archiveName,
+    toolExe,
+    syntax,
   });
 }
