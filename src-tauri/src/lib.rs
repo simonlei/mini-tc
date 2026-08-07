@@ -419,6 +419,33 @@ fn delete_to_trash(path: String) -> Result<(), String> {
     trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))
 }
 
+/// Rename a file or directory. `old_path` is the full source path, `new_name`
+/// is the bare new file name (no directory). The new path is `old_path`'s
+/// parent joined with `new_name`. Refuses to overwrite an existing target.
+#[tauri::command]
+fn rename_file(old_path: String, new_name: String) -> Result<(), String> {
+    let old = Path::new(&old_path);
+    if !old.exists() {
+        return Err(format!("Path does not exist: {}", old_path));
+    }
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("New name cannot be empty".to_string());
+    }
+    // Disallow path separators / parent-dir traversal in a bare name.
+    if new_name.contains('/') || new_name.contains('\\') || new_name == "." || new_name == ".." {
+        return Err(format!("Invalid name: {}", new_name));
+    }
+    let parent = old
+        .parent()
+        .ok_or_else(|| format!("Cannot determine parent of: {}", old_path))?;
+    let new_path = parent.join(new_name);
+    if new_path.exists() {
+        return Err(format!("Target already exists: {}", new_path.display()));
+    }
+    fs::rename(old, &new_path).map_err(|e| format!("Failed to rename: {}", e))
+}
+
 /// Payload streamed to the frontend during a copy/move so it can render a
 /// progress bar. `copied_bytes` / `total_bytes` drive the bar; `current_name`
 /// shows which file is currently being copied.
@@ -1826,6 +1853,7 @@ pub fn run() {
             read_file_preview,
             get_dir_size,
             delete_to_trash,
+            rename_file,
             open_file,
             copy_items,
             move_items,

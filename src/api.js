@@ -43,6 +43,12 @@ export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
 
+// Rename a file or directory. `oldPath` is the full source path; `newName` is
+// the bare new file name (no directory component).
+export async function renameFile(oldPath, newName) {
+  return invoke("rename_file", { oldPath, newName });
+}
+
 export async function openFile(path) {
   return invoke("open_file", { path });
 }

@@ -38,6 +38,7 @@
       @calc-dir-size="calcDirSize"
       @delete="onDelete"
       @open="onOpen"
+      @rename="onRename"
       @ctx-menu="onCtxMenu"
       @pending-select-resolved="pendingSelectName = null"
     />
@@ -71,7 +72,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -393,11 +394,14 @@ async function navigateParent() {
 
 async function refresh() {
   if (activeTab.value) {
+    // A pending selection (e.g. set by rename/delete/parent-navigation) takes
+    // priority over the current selection snapshot.
+    const pending = pendingSelectName.value;
     // Snapshot the current selection (by name) so we can restore it after the
     // reload. This keeps the user's selection intact across a window focus
     // regain (App.vue's `tauri://focus` → refresh) instead of silently
     // clearing it whenever the entries reference is replaced.
-    const keepNames = selectedEntries.value.map((e) => e.name);
+    const keepNames = pending ? [] : selectedEntries.value.map((e) => e.name);
     // Force a real reload by dropping the cached entry first.
     const id = activeTab.value.id;
     if (tabCache.value[id]) delete tabCache.value[id];
@@ -405,7 +409,12 @@ async function refresh() {
     // loadDirectory has now replaced `entries`; the file list reset its
     // selection. Re-apply the saved names (those still present; external
     // deletions are dropped automatically).
-    if (keepNames.length) fileListRef.value?.restoreByNames?.(keepNames);
+    if (pending) {
+      pendingSelectName.value = null;
+      fileListRef.value?.restoreByNames?.([pending]);
+    } else if (keepNames.length) {
+      fileListRef.value?.restoreByNames?.(keepNames);
+    }
   }
 }
 
@@ -480,6 +489,23 @@ async function onDelete(targets) {
   dirSizes.value = next;
 }
 
+// ── Rename ──
+
+async function onRename(entry, newName) {
+  if (!activeTab.value) return;
+  const oldPath = await joinPath(activeTab.value.path, entry.name);
+  try {
+    await renameFile(oldPath, newName);
+    // Reload the listing, then re-select the renamed entry by its new name so
+    // the selection/caret stays on it (matching Explorer).
+    pendingSelectName.value = newName;
+    await refresh();
+  } catch (e) {
+    error.value = String(e);
+    showToast("重命名失败：" + String(e), "error");
+  }
+}
+
 // ── Open file ──
 
 const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
@@ -524,6 +550,7 @@ function buildMenuItems(entry) {
   } else {
     items.push({ label: "打开", action: "open" });
   }
+  items.push({ label: "重命名", action: "rename" });
   items.push({ label: "复制路径", action: "copy-path" });
 
   if (isArchiveName(entry.name)) {
@@ -608,6 +635,9 @@ async function handleCtxSelect(item) {
     }
     case "refresh":
       refresh();
+      break;
+    case "rename":
+      fileListRef.value?.startRenameByEntry?.(entry);
       break;
     case "extract":
       await doExtract(entry, item.tool, item.mode);
