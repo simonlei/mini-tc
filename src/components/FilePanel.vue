@@ -71,7 +71,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -531,9 +531,11 @@ function buildMenuItems(entry) {
     if (archiveTools.value.length === 0) {
       items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
     } else {
-      // Extraction always goes through the 7-Zip GUI, which prompts for a
-      // password on encrypted archives and lets the user pick the destination.
+      // Extraction goes through each tool's GUI, which prompts for a password
+      // on encrypted archives and lets the user pick the destination. Only the
+      // GUI entries are listed (one per tool) to avoid duplicates.
       for (const tool of archiveTools.value) {
+        if (!tool.syntax.endsWith("-gui")) continue;
         items.push({
           label: `用 ${tool.name} 解压`,
           action: "extract",
@@ -542,6 +544,18 @@ function buildMenuItems(entry) {
         });
       }
     }
+  }
+
+  // "Add to archive" works for any plain file or directory (including the
+  // currently multi-selected set, when the right-clicked row is part of it).
+  items.push({ separator: true });
+  const compressTools = archiveTools.value.filter((t) =>
+    ["7z-gui", "7z-cli", "7z", "winrar-gui", "winrar"].includes(t.syntax)
+  );
+  if (compressTools.length === 0) {
+    items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
+  } else {
+    items.push({ label: "添加到压缩包", action: "add-to-archive" });
   }
   return items;
 }
@@ -598,6 +612,56 @@ async function handleCtxSelect(item) {
     case "extract":
       await doExtract(entry, item.tool, item.mode);
       break;
+    case "add-to-archive":
+      await doAddToArchive();
+      break;
+  }
+}
+
+// Compress the current selection (or the right-clicked entry) into a single
+// archive named after the current folder, using the first available CLI tool.
+async function doAddToArchive() {
+  const path = activeTab.value?.path;
+  if (!path) return;
+
+  // The set to compress: the full multi-selection when it's non-empty (the
+  // right-clicked row is part of it), otherwise just this entry.
+  let targets = selectedEntries.value;
+  if (!targets || targets.length === 0) {
+    if (!entry) return;
+    targets = [entry];
+  }
+
+  const compressTools = archiveTools.value.filter((t) =>
+    ["7z-gui", "7z-cli", "7z", "winrar-gui", "winrar"].includes(t.syntax)
+  );
+  if (compressTools.length === 0) {
+    showToast("未检测到 7-Zip 等压缩工具，无法压缩", "error");
+    return;
+  }
+  const tool = compressTools[0];
+  const isGui = tool.syntax === "7z-gui" || tool.syntax === "winrar-gui";
+
+  // Archive name = current folder name (matches Explorer's "Compressed folder").
+  const folderName = path.split(/[\\/]/).filter(Boolean).pop() || "archive";
+  const sources = [];
+  for (const t of targets) {
+    sources.push(await joinPath(path, t.name));
+  }
+
+  try {
+    const res = await addToArchive(sources, path, folderName, tool.exe, tool.syntax);
+    if (res && res.success) {
+      showToast(res.message, "success");
+      // GUI tools build the archive asynchronously in their own window (and
+      // may prompt for a password), so don't refresh immediately. CLI tools
+      // finish synchronously, so refresh to reveal the new archive.
+      if (!isGui) refresh();
+    } else {
+      showToast("压缩失败", "error");
+    }
+  } catch (e) {
+    showToast("压缩失败：\n" + String(e), "error");
   }
 }
 

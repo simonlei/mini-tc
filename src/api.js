@@ -111,3 +111,17 @@ export async function extractArchive(archive, targetDir, toolExe, syntax, mode) 
     mode,
   });
 }
+
+/// Add the given `sources` (files / directories) into a single archive named
+/// `archiveName` inside `baseDir`, using the external tool `toolExe` + `syntax`
+/// (from `getArchiveTools`). Only CLI tools (syntax "7z-cli" / "7z" / "winrar")
+/// are valid here.
+export async function addToArchive(sources, baseDir, archiveName, toolExe, syntax) {
+  return invoke("add_to_archive", {
+    sources,
+    baseDir,
+    archiveName,
+    toolExe,
+    syntax,
+  });
+}
