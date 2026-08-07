@@ -29,6 +29,27 @@
       <img :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
     </div>
 
+    <!-- PDF preview -->
+    <div class="preview-body pdf-body" v-else-if="previewType === 'pdf'">
+      <iframe
+        v-if="pdfSupported && !pdfLoadError"
+        ref="pdfFrameRef"
+        :key="props.filePath"
+        :src="previewContent"
+        class="preview-pdf-frame"
+        title="PDF 预览"
+        @error="onPdfError"
+      ></iframe>
+      <div class="preview-placeholder error" v-else-if="pdfLoadError">
+        <span class="placeholder-icon">⚠️</span>
+        <span>无法加载 PDF，文件可能已损坏或不存在</span>
+      </div>
+      <div class="preview-placeholder" v-else>
+        <span class="placeholder-icon">📕</span>
+        <span>当前平台不支持内联预览 PDF，请使用系统程序打开查看</span>
+      </div>
+    </div>
+
     <!-- Text / JSON preview -->
     <div class="preview-body text-body" v-else-if="previewType === 'text' || previewType === 'json' || previewType === 'log'">
       <div class="json-warn" v-if="jsonWarn">{{ jsonWarn }}</div>
@@ -77,8 +98,24 @@ const imageInfo = ref("");
 const jsonWarn = ref("");
 const copyAllDone = ref(false);
 
+// PDF 加载失败标记（仅影响 PDF 渲染区，不冲击 header/footer 正常展示）
+const pdfLoadError = ref(false);
+// PDF iframe DOM 引用（供 App.vue 的 Ctrl+C 判定按 class 识别，也便于未来扩展）
+const pdfFrameRef = ref(null);
+
+// 平台检测：判断当前 WebView 是否支持内联 PDF 渲染。
+// 项目未安装 @tauri-apps/plugin-os（后端无 tauri-plugin-os），按约束不新增依赖，
+// 采用 UA 启发式：Windows WebView2（含 Edg/）内置 PDF 查看器，支持 iframe 内联；
+// macOS WKWebView（AppleWebKit 但无 Chrome/Edg）不支持内联 PDF，走降级提示。
+const pdfSupported = computed(() => {
+  const ua = navigator.userAgent || '';
+  const isWebKitOnly = /AppleWebKit/.test(ua) && !/Chrome|Edg/.test(ua);
+  return !isWebKitOnly;
+});
+
 const headerIcon = computed(() => {
   if (previewType.value === "image") return "🖼️";
+  if (previewType.value === "pdf") return "📕";
   if (previewType.value === "json") return "🔧";
   if (previewType.value === "log") return "📜";
   if (previewType.value === "text") return "📄";
@@ -87,6 +124,7 @@ const headerIcon = computed(() => {
 
 const typeLabel = computed(() => {
   if (previewType.value === "image") return "IMAGE";
+  if (previewType.value === "pdf") return "PDF";
   if (previewType.value === "json") return "JSON";
   if (previewType.value === "log") return "LOG";
   if (previewType.value === "text") return "TEXT";
@@ -114,6 +152,11 @@ function onImageLoad(e) {
 function onImageError() {
   error.value = "无法加载图片，文件可能已损坏";
   previewType.value = "";
+}
+
+// PDF iframe 加载失败时设置局部错误标记（不使用组件级 error，以保留 header/footer 展示）
+function onPdfError() {
+  pdfLoadError.value = true;
 }
 
 // Copy the entire preview text to the OS clipboard (for the "复制全部" button).
@@ -154,12 +197,23 @@ async function loadPreview() {
   lineCount.value = null;
   imageInfo.value = "";
   jsonWarn.value = "";
+  pdfLoadError.value = false;
 
   const ext = getExtension(props.fileName);
 
   // Image: use convertFileSrc to load directly via asset protocol (bypasses IPC entirely)
   if (IMAGE_EXTENSIONS.includes(ext)) {
     previewType.value = "image";
+    previewContent.value = convertFileSrc(props.filePath);
+    fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
+    loading.value = false;
+    return;
+  }
+
+  // PDF: 同图片一样用 convertFileSrc 直连本地文件，不经过 IPC 文本读取。
+  // 依赖系统 WebView 内置 PDF 查看器（Windows WebView2 支持；macOS WKWebView 不支持，走降级提示）。
+  if (ext === "pdf") {
+    previewType.value = "pdf";
     previewContent.value = convertFileSrc(props.filePath);
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
     loading.value = false;
@@ -326,6 +380,18 @@ watch(
   object-fit: contain;
   margin: auto;
   border-radius: 2px;
+}
+
+/* PDF preview */
+.pdf-body {
+  background: var(--bg);
+}
+
+.preview-pdf-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
 }
 
 /* Text preview */

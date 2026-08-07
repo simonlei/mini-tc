@@ -365,7 +365,7 @@ function endDrag() {
 
 // ── File Preview (Ctrl+Q) ──
 
-const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "pdf", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
 
 // Extensions the user has chosen to always preview as plain text (via the
@@ -483,6 +483,17 @@ function hasPreviewTextSelection() {
   if (!node) return false;
   const el = node.nodeType === 3 ? node.parentElement : node;
   return !!(el && el.closest && el.closest(".preview-text"));
+}
+
+// 判断当前焦点是否落在 PDF 预览的 <iframe> 上（跨源 iframe 无法读取内部选区，
+// 但浏览器会将 iframe 元素本身设为 activeElement，据此放行原生 Ctrl+C）。
+// 双重校验：class 名 + src 以 asset:// 开头，增强判定抗干扰性。
+function isPdfIframeFocused() {
+  const el = document.activeElement;
+  if (!el || el.tagName !== "IFRAME") return false;
+  if (!el.classList.contains("preview-pdf-frame")) return false;
+  const src = el.getAttribute("src") || "";
+  return src.startsWith("asset://");
 }
 
 function setClipboard(operation) {
@@ -906,6 +917,9 @@ onMounted(() => {
         // copy that text natively instead of treating it as a file clipboard op
         // (file-list selection → copy file; preview text selection → copy text).
         if (hasPreviewTextSelection()) return;
+        // PDF 预览聚焦时放行 Ctrl+C（复制 PDF 内文本），交由 WebView 原生处理。
+        // Ctrl+X 不放行（PDF 只读，无剪切内容语义，仍按文件剪切逻辑处理）。
+        if ((e.key === "c" || e.key === "C") && isPdfIframeFocused()) return;
       }
       if (e.key === "c" || e.key === "C") {
         e.preventDefault();
