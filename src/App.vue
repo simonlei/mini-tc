@@ -33,6 +33,9 @@
           </div>
         </div>
       </div>
+      <div class="menu-item" @click="openSettings">
+        <span>设置</span>
+      </div>
       <span class="update-status" v-if="updateStatus">{{ updateStatus }}</span>
     </div>
 
@@ -62,6 +65,15 @@
         </div>
       </div>
     </div>
+
+    <!-- Settings dialog -->
+    <SettingsDialog
+      v-if="settingsVisible"
+      :extensions="textPreviewExtensions"
+      :builtins="BUILTIN_TEXT_EXTENSIONS"
+      @close="onSettingsClose"
+      @save="onSettingsSave"
+    />
 
     <!-- Main content: two panels with a draggable separator -->
     <div class="main-content">
@@ -186,6 +198,7 @@ import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
 import UnsupportedPreview from "./components/UnsupportedPreview.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -204,6 +217,27 @@ const currentTheme = ref("neon");
 const themeMenuOpen = ref(false);
 const helpMenuOpen = ref(false);
 const updateStatus = ref("");
+
+// ── Settings dialog ──
+const settingsVisible = ref(false);
+
+function openSettings() {
+  helpMenuOpen.value = false;
+  themeMenuOpen.value = false;
+  settingsVisible.value = true;
+}
+
+function onSettingsSave(exts) {
+  textPreviewExtensions.value = [
+    ...new Set(exts.map((e) => String(e).toLowerCase()).filter(Boolean)),
+  ];
+  settingsVisible.value = false;
+  saveTextPreviewConfig();
+}
+
+function onSettingsClose() {
+  settingsVisible.value = false;
+}
 
 const updateDialog = ref({
   visible: false,
@@ -365,40 +399,70 @@ function endDrag() {
 
 // ── File Preview (Ctrl+Q) ──
 
-const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const PREVIEWABLE_EXTENSIONS = ["pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
 
-// Extensions the user has chosen to always preview as plain text (via the
-// "按文本预览" button on an unsupported file). Persisted to
-// ~/.minitc/text-preview-extensions.json so the choice sticks across restarts
-// and exempts those extensions from the "unsupported format" placeholder.
+// Built-in plain-text formats. These are deliberately NOT part of
+// PREVIEWABLE_EXTENSIONS — whether they are previewed as text is governed
+// entirely by the user-editable `textPreviewExtensions` set below (which
+// defaults to these). That lets the Settings dialog toggle even built-in text
+// types on/off without special-casing them.
+const BUILTIN_TEXT_EXTENSIONS = ["txt", "md", "json", "log"];
+
+// Extensions the user wants previewed as plain text. Defaults to the built-ins
+// above; can be extended (and individual entries disabled) from the Settings
+// dialog, and is persisted to ~/.minitc/text-preview-extensions.json. The
+// "按文本预览" button on an unsupported file also adds to this set.
 const TEXT_PREVIEW_CONFIG = "text-preview-extensions";
-const textPreviewExtensions = ref([]);
+const textPreviewExtensions = ref([...BUILTIN_TEXT_EXTENSIONS]);
 // Whether the current "unsupported" placeholder is for a directory (in which
 // case the "按文本预览" button is hidden — directories can't be text-previewed).
 const previewUnsupportedIsDir = ref(false);
 // Flag passed to FilePreview: force a plain-text read for the current file
-// (true only for user-added text-preview extensions).
+// when its extension is in the user-editable `textPreviewExtensions` set.
 const previewAsText = ref(false);
 
 async function loadTextPreviewConfig() {
   try {
     const raw = await loadConfig(TEXT_PREVIEW_CONFIG);
     if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        textPreviewExtensions.value = arr
-          .map((e) => String(e).toLowerCase())
-          .filter(Boolean);
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        // Legacy delta format (user-added only) — merge with built-ins so they
+        // stay enabled, then migrate to the object format on next save.
+        textPreviewExtensions.value = [
+          ...new Set([
+            ...BUILTIN_TEXT_EXTENSIONS,
+            ...parsed.map((e) => String(e).toLowerCase()).filter(Boolean),
+          ]),
+        ];
+      } else if (parsed && typeof parsed === "object") {
+        // Current format: { ext: bool }. Respect disabled built-ins.
+        const arr = [];
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v) arr.push(String(k).toLowerCase());
+        }
+        textPreviewExtensions.value = arr;
       }
     }
   } catch (e) {
     console.error("Failed to load text-preview extensions:", e);
+    // Keep built-in defaults on failure.
+    textPreviewExtensions.value = [...BUILTIN_TEXT_EXTENSIONS];
   }
 }
 
 async function saveTextPreviewConfig() {
-  await saveConfig(TEXT_PREVIEW_CONFIG, JSON.stringify(textPreviewExtensions.value)).catch((e) =>
+  // Persist as an object { ext: bool } so a disabled built-in stays disabled
+  // across restarts (a bare array can't represent "off").
+  const obj = {};
+  for (const b of BUILTIN_TEXT_EXTENSIONS) {
+    obj[b] = textPreviewExtensions.value.includes(b);
+  }
+  for (const e of textPreviewExtensions.value) {
+    if (!BUILTIN_TEXT_EXTENSIONS.includes(e)) obj[e] = true;
+  }
+  await saveConfig(TEXT_PREVIEW_CONFIG, JSON.stringify(obj)).catch((e) =>
     console.error("Failed to persist text-preview extensions:", e)
   );
 }
