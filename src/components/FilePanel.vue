@@ -755,6 +755,7 @@ defineExpose({
   currentPath: computed(() => activeTab.value?.path || ""),
   refresh,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
+  selectName: (name) => fileListRef.value?.selectName(name),
   selectAll: () => fileListRef.value?.selectAll(),
   clearSelection: () => fileListRef.value?.clearSelection(),
   setCutNames,

@@ -441,6 +441,11 @@ function playNextVideo(payload) {
   previewFilePath.value = payload.path;
   previewFileName.value = payload.name;
   previewFileBytes.value = payload.bytes || 0;
+  // Move the file-list selection in the SOURCE panel (the one opposite the
+  // preview) to the next clip, so the highlighted row follows what's playing.
+  const source = previewPanel.value === "left" ? "right" : "left";
+  const panel = source === "left" ? leftPanel.value : rightPanel.value;
+  panel?.selectName?.(payload.name);
 }
 
 // Switch to another video within the SAME preview panel (↑/↓ navigation in VideoPreview).

@@ -189,6 +189,11 @@ const resH = ref(0);
 const showCtrls = ref(true);
 let ctrlsTimer = null;
 
+// Set when the current clip ended and we're auto-advancing to the next one, so
+// that loadVideo() actually starts playback (instead of stopping on a paused
+// frame). Cleared once the next clip's metadata has loaded (or on error).
+const pendingAutoplay = ref(false);
+
 // ── Up / Down navigation is delegated to the file list (App handles it) ──
 
 // ── Subtitles ──
@@ -275,6 +280,12 @@ function onLoadedMetadata() {
   v.volume = volume.value;
   v.muted = muted.value;
   v.playbackRate = rate.value;
+  // Autoplay the next clip if we're advancing from a finished one. The new
+  // source has just loaded, so playback is safe to start now.
+  if (pendingAutoplay.value) {
+    pendingAutoplay.value = false;
+    v.play().catch(() => {});
+  }
 }
 
 // Persist player config (speed / volume / mute) whenever any of them changes.
@@ -310,6 +321,8 @@ async function onEnded() {
     if (idx < 0 || idx >= videos.length - 1) return; // last video → stop
     const next = videos[idx + 1];
     const nextPath = await joinPath(dir, next.name);
+    // Flag the upcoming reload to auto-start playback once the new source is ready.
+    pendingAutoplay.value = true;
     emit("open-next", {
       path: nextPath,
       name: next.name,
@@ -321,6 +334,7 @@ async function onEnded() {
 }
 function onError() {
   // Native-capable container but actual codec/stream failed to decode.
+  pendingAutoplay.value = false;
   externalFallback.value = true;
   if (canPlayNative.value) loadError.value = "当前编码格式 WebView 无法直接解码，请用系统播放器打开。";
 }
