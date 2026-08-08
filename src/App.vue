@@ -433,19 +433,27 @@ function openVideo(payload) {
   previewVisible.value = true;
 }
 
-// Autoplay the next video in the SAME preview panel (triggered by VideoPreview's
-// `open-next` on `ended`). Unlike openVideo this keeps previewPanel unchanged,
-// so the next clip loads in place; VideoPreview's `watch(filePath)` reloads it.
-function playNextVideo(payload) {
+// Autoplay the next video (triggered by VideoPreview's `open-next` on `ended`).
+// The "which clip is next" decision is delegated to the SOURCE panel's file list
+// via getNextVideoEntry(), so the autoplay order follows the list's CURRENT sort
+// (natural numeric name order / size / modified — whatever the user set) instead
+// of an independent directory re-sort in VideoPreview. The file-list highlight
+// moves to the next clip too, so it tracks what's playing.
+async function playNextVideo(payload) {
   if (!previewVisible.value || previewKind.value !== "video") return;
-  previewFilePath.value = payload.path;
-  previewFileName.value = payload.name;
-  previewFileBytes.value = payload.bytes || 0;
-  // Move the file-list selection in the SOURCE panel (the one opposite the
-  // preview) to the next clip, so the highlighted row follows what's playing.
   const source = previewPanel.value === "left" ? "right" : "left";
   const panel = source === "left" ? leftPanel.value : rightPanel.value;
-  panel?.selectName?.(payload.name);
+  const currentName = payload?.name;
+  if (!currentName) return;
+  const next = panel?.getNextVideoEntry?.(currentName);
+  if (!next) return; // last video in the list → stop, no loop
+  const dir = panel?.currentPath;
+  if (!dir) return;
+  const p = await joinPath(dir, next.name);
+  previewFilePath.value = p;
+  previewFileName.value = next.name;
+  previewFileBytes.value = next.size || 0;
+  panel?.selectName?.(next.name);
 }
 
 // Switch to another video within the SAME preview panel (↑/↓ navigation in VideoPreview).

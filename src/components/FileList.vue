@@ -389,6 +389,28 @@ function selectName(name) {
   }
 }
 
+// Video autoplay-next: given the name of the clip that just finished, return the
+// NEXT video entry in the list's CURRENT display order. This deliberately reads
+// `displayedEntries` (which already honours the user's active sort — including
+// natural numeric name ordering, size, modified — and the search filter) so the
+// autoplay order always matches what the user sees in the file list. Non-video
+// rows between clips are skipped. Returns null when there is no later video, so
+// playback stops instead of looping.
+const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
+
+function getNextVideoEntry(name) {
+  const list = displayedEntries.value;
+  const idx = list.findIndex((e) => e.name === name);
+  if (idx < 0) return null;
+  for (let i = idx + 1; i < list.length; i++) {
+    const e = list[i];
+    if (e.is_dir) continue;
+    const ext = e.name.includes(".") ? e.name.split(".").pop().toLowerCase() : "";
+    if (VIDEO_EXTS.includes(ext)) return e;
+  }
+  return null;
+}
+
 // Shift+Arrow: extend the selection continuously from the anchor.
 function extendSelection(delta) {
   const list = displayedEntries.value;
@@ -912,7 +934,7 @@ function restoreByNames(names) {
   emitSelection();
 }
 
-defineExpose({ moveSelection, selectName, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry });
+defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry });
 </script>
 
 <style scoped>

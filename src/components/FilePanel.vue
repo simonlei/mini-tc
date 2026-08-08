@@ -508,23 +508,15 @@ async function onRename(entry, newName) {
 
 // ── Open file ──
 
-const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
-
 async function onOpen(fileName) {
   if (!activeTab.value) return;
   const fullPath = await joinPath(activeTab.value.path, fileName);
-  const ext = fileName.split(".").pop()?.toLowerCase() || "";
 
-  // Route video files to the in-app video preview instead of the OS player.
-  if (VIDEO_EXTS.includes(ext)) {
-    emit("open-video", { path: fullPath, name: fileName, bytes: selectedEntry.value?.size || 0, panelId: props.panelId });
-    return;
-  }
-
-  console.log("[onOpen] fileName:", fileName, "fullPath:", fullPath);
+  // Double-clicking any file opens it with the OS default app/player. Videos
+  // are no exception — the in-app video preview is still reachable via Ctrl+Q
+  // (toggle preview), so we don't open it here on double-click.
   try {
     await openFile(fullPath);
-    console.log("[onOpen] openFile succeeded");
   } catch (e) {
     console.error("[onOpen] openFile failed:", e);
     error.value = String(e);
@@ -756,6 +748,7 @@ defineExpose({
   refresh,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
   selectName: (name) => fileListRef.value?.selectName(name),
+  getNextVideoEntry: (name) => fileListRef.value?.getNextVideoEntry(name),
   selectAll: () => fileListRef.value?.selectAll(),
   clearSelection: () => fileListRef.value?.clearSelection(),
   setCutNames,
