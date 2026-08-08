@@ -365,7 +365,7 @@ function endDrag() {
 
 // ── File Preview (Ctrl+Q) ──
 
-const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "pdf", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
 
 // Extensions the user has chosen to always preview as plain text (via the
@@ -487,7 +487,7 @@ function hasPreviewTextSelection() {
   let node = sel.anchorNode;
   if (!node) return false;
   const el = node.nodeType === 3 ? node.parentElement : node;
-  return !!(el && el.closest && el.closest(".preview-text"));
+  return !!(el && el.closest && (el.closest(".preview-text") || el.closest(".preview-doc")));
 }
 
 // 判断当前焦点是否落在 PDF 预览的 <iframe> 上（跨源 iframe 无法读取内部选区，
