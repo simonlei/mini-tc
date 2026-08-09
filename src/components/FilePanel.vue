@@ -72,7 +72,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deleteWithAdmin, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -470,23 +470,54 @@ async function onDelete(targets) {
   const list = Array.isArray(targets) ? targets : [targets];
   if (list.length === 0) return;
 
-  const names = list.map((e) => e.name);
+  const successNames = [];
+  const failed = [];        // trash failed → auto-retry with admin
+  const adminLaunched = []; // admin delete was accepted (UAC approved)
+
   for (const entry of list) {
     const fullPath = await joinPath(activeTab.value.path, entry.name);
     try {
       await deleteToTrash(fullPath);
+      successNames.push(entry.name);
     } catch (e) {
-      error.value = String(e);
+      failed.push({ entry, fullPath });
     }
   }
 
-  // Remove the deleted entries locally instead of full refresh, so FileList can
-  // restore selection. Multi-delete just clears the selection (handled by the
-  // entries watch in FileList); single-delete re-selects the next neighbour.
-  entries.value = entries.value.filter((e) => !names.includes(e.name));
-  const next = { ...dirSizes.value };
-  names.forEach((n) => delete next[n]);
-  dirSizes.value = next;
+  // Remove entries that were successfully deleted via trash.
+  if (successNames.length) {
+    const removed = new Set(successNames);
+    entries.value = entries.value.filter((e) => !removed.has(e.name));
+    const next = { ...dirSizes.value };
+    successNames.forEach((n) => delete next[n]);
+    dirSizes.value = next;
+  }
+
+  // For failed items: retry with admin elevation immediately. The UAC prompt
+  // serves as the user's confirmation — no need for an extra dialog.
+  if (failed.length === 0) return;
+
+  for (const f of failed) {
+    try {
+      await deleteWithAdmin(f.fullPath);
+      adminLaunched.push(f);
+    } catch (e) {
+      const m =
+        e && typeof e === "object" && e.message ? e.message : String(e);
+      showToast(`提权删除「${f.entry.name}」失败：${m}`, "error");
+    }
+  }
+
+  if (adminLaunched.length > 0) {
+    showToast(
+      adminLaunched.length === failed.length
+        ? `已发起 ${adminLaunched.length} 个项目管理员删除，请在 UAC 弹窗确认`
+        : `已发起 ${adminLaunched.length} 个项目管理员删除（${failed.length - adminLaunched.length} 个失败），请在 UAC 弹窗确认`,
+      "success"
+    );
+    // Elevated delete runs in its own process; delay-refresh to pick up results.
+    setTimeout(() => { refresh(); }, 2000);
+  }
 }
 
 // ── Rename ──
