@@ -8,7 +8,12 @@
       @change="onDriveChange($event.target.value)"
       title="Switch drive"
     >
-      <option v-for="d in drives" :key="d" :value="d">{{ driveLabel(d) }}</option>
+      <option
+        v-for="d in drives"
+        :key="d.name"
+        :value="d.name"
+        :title="driveTitle(d)"
+      >{{ driveOptionLabel(d) }}</option>
     </select>
 
     <button class="path-btn" @click="$emit('refresh')" title="Refresh">↻</button>
@@ -244,21 +249,48 @@ onBeforeUnmount(() => {
 // Only show the drive-letter dropdown on Windows. On macOS/Linux the backend
 // returns ["/"], so there's nothing to switch between — hide it entirely.
 const showDriveSelector = computed(() =>
-  props.drives.some((d) => /^[A-Za-z]:\\?$/.test(d))
+  props.drives.some((d) => /^[A-Za-z]:\\?$/.test(d.name))
 );
 
 const currentDrive = computed(() => {
   if (!props.path) return "";
   const p = props.path.replace(/[\\/:]/g, "").toLowerCase();
   for (const d of props.drives) {
-    if (p.startsWith(d.replace(/[\\/:]/g, "").toLowerCase())) return d;
+    if (p.startsWith(d.name.replace(/[\\/:]/g, "").toLowerCase())) return d.name;
   }
   return "";
 });
 
 function driveLabel(d) {
   // On Windows, strip trailing backslash for display
-  return d.replace(/[\\/:]+$/, "");
+  return d.name.replace(/[\\/:]+$/, "");
+}
+
+// Human-readable byte size (mirrors formatting used elsewhere in the app).
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let i = 0;
+  let v = bytes;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
+}
+
+// Compact label shown inside the dropdown for each drive: letter + free space.
+function driveOptionLabel(d) {
+  const letter = driveLabel(d);
+  if (!d.free_bytes) return letter;
+  return `${letter}  ·  ${formatBytes(d.free_bytes)}`;
+}
+
+// Tooltip with both free and total capacity for a drive.
+function driveTitle(d) {
+  const letter = driveLabel(d);
+  if (!d.free_bytes && !d.total_bytes) return letter;
+  return `${letter}：${formatBytes(d.free_bytes)} 可用 · ${formatBytes(d.total_bytes)} 总容量`;
 }
 
 // ── Navigation ──
@@ -367,7 +399,8 @@ async function copyPath() {
   border-radius: 3px;
   outline: none;
   cursor: pointer;
-  min-width: 48px;
+  min-width: 132px;
+  max-width: 200px;
 }
 
 .drive-select:focus {

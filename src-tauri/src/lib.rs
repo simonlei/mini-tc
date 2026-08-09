@@ -26,6 +26,20 @@ extern "system" {
     ) -> u32;
 }
 
+/// Query free/total bytes for a volume (used by `list_drives` to report disk
+/// capacity). `lpFreeBytesAvailableToCaller` already accounts for per-user
+/// quota, so it's the right number to show as "free space".
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetDiskFreeSpaceExW(
+        lpDirectoryName: *const u16,
+        lpFreeBytesAvailableToCaller: *mut u64,
+        lpTotalNumberOfBytes: *mut u64,
+        lpTotalNumberOfFreeBytes: *mut u64,
+    ) -> i32;
+}
+
 /// A single file/folder entry returned to the frontend.
 #[derive(Serialize)]
 pub struct FileEntry {
@@ -44,6 +58,15 @@ pub struct FileEntry {
 pub struct DirectoryListing {
     pub entries: Vec<FileEntry>,
     pub has_parent: bool,
+}
+
+/// A drive/volume exposed in the drive selector, paired with its capacity so
+/// the frontend can show how much free space is left on each disk.
+#[derive(Serialize)]
+pub struct DriveInfo {
+    pub name: String,     // e.g. "C:\\" (or "/" on Unix)
+    pub free_bytes: u64,  // space available to the caller (bytes)
+    pub total_bytes: u64, // total capacity (bytes)
 }
 
 /// Convert a system time to milliseconds since UNIX_EPOCH.
@@ -168,9 +191,12 @@ fn get_parent_dir(path: String) -> Result<String, String> {
     }
 }
 
-/// On Windows, list available drive letters (e.g. "C:\\"). On other platforms, return root "/".
+/// On Windows, return available drive letters (e.g. "C:\\") together with their
+/// free and total space so the frontend can display remaining capacity. On
+/// other platforms, return root "/" (space left as 0 — the drive selector is
+/// hidden there anyway).
 #[tauri::command]
-fn list_drives() -> Result<Vec<String>, String> {
+fn list_drives() -> Result<Vec<DriveInfo>, String> {
     #[cfg(windows)]
     {
         let mut drives = Vec::new();
@@ -178,14 +204,51 @@ fn list_drives() -> Result<Vec<String>, String> {
         for &letter in letters.iter() {
             let drive = format!("{}:\\", letter as char);
             if Path::new(&drive).exists() {
-                drives.push(drive);
+                let (free, total) = drive_space(&drive);
+                drives.push(DriveInfo {
+                    name: drive,
+                    free_bytes: free,
+                    total_bytes: total,
+                });
             }
         }
         Ok(drives)
     }
     #[cfg(not(windows))]
     {
-        Ok(vec!["/".to_string()])
+        Ok(vec![DriveInfo {
+            name: "/".to_string(),
+            free_bytes: 0,
+            total_bytes: 0,
+        }])
+    }
+}
+
+/// Query free/total bytes for a Windows volume via `GetDiskFreeSpaceExW`.
+/// Returns (free, total); on any failure returns (0, 0) so the drive is still
+/// listed and the UI simply shows "—" for its space.
+#[cfg(windows)]
+fn drive_space(path: &str) -> (u64, u64) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free: u64 = 0;
+    let mut total: u64 = 0;
+    let mut _total_free: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free as *mut u64,
+            &mut total as *mut u64,
+            &mut _total_free as *mut u64,
+        )
+    };
+    if ok != 0 {
+        (free, total)
+    } else {
+        (0, 0)
     }
 }
 
