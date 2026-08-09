@@ -108,6 +108,7 @@
           :is-active="activePanel === 'left' && !(previewVisible && previewPanel === 'left')"
           @activate="onPanelActivate('left')"
           @open-video="openVideo"
+          @deleted="onPanelDeleted"
         />
       </div>
 
@@ -146,6 +147,7 @@
           :is-active="activePanel === 'right' && !(previewVisible && previewPanel === 'right')"
           @activate="onPanelActivate('right')"
           @open-video="openVideo"
+          @deleted="onPanelDeleted"
         />
       </div>
     </div>
@@ -864,6 +866,17 @@ function closePreview() {
   previewFileBytes.value = 0;
   previewAsText.value = false;
   previewUnsupportedIsDir.value = false;
+}
+
+// When entries are deleted in a panel, check whether the whole directory got
+// emptied. The preview always shows a file from the OPPOSITE panel (the source
+// panel), so if that source panel is now empty there is nothing left to
+// preview — exit the preview state. Triggered by FilePanel's `deleted` event.
+function onPanelDeleted({ panelId, remainingCount }) {
+  if (!previewVisible.value) return;
+  const source = previewPanel.value === "left" ? "right" : "left";
+  if (panelId !== source) return;
+  if (remainingCount === 0) closePreview();
 }
 
 // Auto-update preview when the active panel's selection changes

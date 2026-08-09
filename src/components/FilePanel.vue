@@ -114,7 +114,7 @@ const props = defineProps({
   panelId: { type: String, required: true },
 });
 
-const emit = defineEmits(["activate", "open-video"]);
+const emit = defineEmits(["activate", "open-video", "deleted"]);
 
 // Config name → ~/.minitc/tabs-<panelId>.json (unified cross-run store).
 const STORAGE_KEY = `tabs-${props.panelId}`;
@@ -493,6 +493,9 @@ async function onDelete(targets) {
     dirSizes.value = next;
   }
 
+  // 通知父组件删除结果（含本面板剩余条目数），供「预览中删光目录 → 自动退出预览」联动。
+  emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
+
   // For failed items: retry with admin elevation immediately. The UAC prompt
   // serves as the user's confirmation — no need for an extra dialog.
   if (failed.length === 0) return;
@@ -515,8 +518,14 @@ async function onDelete(targets) {
         : `已发起 ${adminLaunched.length} 个项目管理员删除（${failed.length - adminLaunched.length} 个失败），请在 UAC 弹窗确认`,
       "success"
     );
-    // Elevated delete runs in its own process; delay-refresh to pick up results.
-    setTimeout(() => { refresh(); }, 2000);
+    // Elevated delete runs in its own process; delay-refresh to pick up results,
+    // then re-check empty state so the preview can exit if the whole directory
+    // is now gone.
+    setTimeout(() => {
+      refresh().then(() => {
+        emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
+      });
+    }, 2000);
   }
 }
 
