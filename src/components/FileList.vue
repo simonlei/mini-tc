@@ -858,7 +858,6 @@ function isArchiveName(name) {
 }
 
 function getFileIcon(name) {
-  if (isArchiveName(name)) return "🗜️";
   const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "";
   const icons = {
     TXT: "📄",
@@ -908,7 +907,13 @@ function getFileIcon(name) {
     TS: "🎬",
     VOB: "🎬",
   };
-  return icons[ext] || "📄";
+  // Known explicit icons win over the generic archive glyph, so an ordinary
+  // program (.exe / .msi) shows a gear instead of a zip icon. Self-extracting
+  // .exe archives are rare, so we don't paint every .exe as a zip — only
+  // genuinely archive-like names fall back to 🗜️.
+  if (icons[ext]) return icons[ext];
+  if (isArchiveName(name)) return "🗜️";
+  return "📄";
 }
 
 // Restore a multi-selection by entry names after a directory re-list (e.g. a
