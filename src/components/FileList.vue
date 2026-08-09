@@ -799,12 +799,6 @@ function onKeydown(e) {
         emit("calc-dir-size", entry.name);
       }
     }
-  } else if (e.key === "Escape") {
-    // Cancel the current selection (when not searching).
-    if (!isSearching.value) {
-      e.preventDefault();
-      clearSelection();
-    }
   } else if (e.key === "Delete") {
     e.preventDefault();
     deleteSelected();
@@ -939,7 +933,14 @@ function restoreByNames(names) {
   emitSelection();
 }
 
-defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry });
+// Shift keyboard focus onto the list container so arrow-key navigation works
+// immediately (e.g. right after a preview closes and the list regains
+// visibility). The container is the `tabindex="0"` .file-list div.
+function focusList() {
+  nextTick(() => { listContainer.value?.focus(); });
+}
+
+defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList });
 </script>
 
 <style scoped>

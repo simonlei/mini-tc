@@ -195,7 +195,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from "vue";
+import { ref, watch, onMounted, nextTick } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
@@ -858,6 +858,12 @@ async function togglePreview() {
 }
 
 function closePreview() {
+  // Remember which panel sourced the preview (the opposite of where the preview
+  // was shown) and the name of the file that was being previewed, so we can
+  // restore the file-list selection to it after closing.
+  const sourcePanel = previewPanel.value === "left" ? "right" : "left";
+  const fileName = previewFileName.value;
+
   previewVisible.value = false;
   previewPanel.value = "";
   previewKind.value = "";
@@ -866,6 +872,23 @@ function closePreview() {
   previewFileBytes.value = 0;
   previewAsText.value = false;
   previewUnsupportedIsDir.value = false;
+
+  // After leaving preview, make the SOURCE file list (the panel where the
+  // previewed file lives — always the visible one, since the preview occupies
+  // the opposite panel) re-select that file. Without this the list can be left
+  // with no selection after Esc / Ctrl+Q. `restoreByNames` only (re)applies a
+  // selection when the name is still present and never clears an existing one,
+  // so it's safe even if the file list was reloaded during preview.
+  if (fileName) {
+    const panel = sourcePanel === "left" ? leftPanel.value : rightPanel.value;
+    // Bring the source panel to the foreground so the re-selected file is the
+    // focal list the user sees after the preview closes.
+    activePanel.value = sourcePanel;
+    nextTick(() => {
+      panel?.restoreByNames?.([fileName]);
+      panel?.focusList?.();
+    });
+  }
 }
 
 // When entries are deleted in a panel, check whether the whole directory got
@@ -974,6 +997,24 @@ onMounted(() => {
     rightPanel.value?.clearCut?.();
   });
   document.addEventListener("keydown", (e) => {
+    // Esc: close the current preview (image / text / pdf / video / unsupported)
+    // and return the source file list to the file that was just previewed. When
+    // no preview is open, this is a no-op — Esc no longer cancels selection on
+    // the file grid, so we only act while a preview is visible.
+    // If focus is inside a text input (the source panel's filename filter or
+    // address bar, which stay interactive during preview), let that input handle
+    // Esc on its own (e.g. cancel the filter) instead of closing the preview.
+    if (e.key === "Escape" && previewVisible.value) {
+      const t = e.target;
+      const inEditable =
+        t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      if (!inEditable) {
+        e.preventDefault();
+        closePreview();
+        return;
+      }
+    }
+
     // Ctrl+Q: Toggle file preview
     if (e.key === "q" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();

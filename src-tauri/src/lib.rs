@@ -26,9 +26,9 @@ extern "system" {
     ) -> u32;
 }
 
-/// Query free/total bytes for a volume (used by `list_drives` to report disk
-/// capacity). `lpFreeBytesAvailableToCaller` already accounts for per-user
-/// quota, so it's the right number to show as "free space".
+// Query free/total bytes for a volume (used by `list_drives` to report disk
+// capacity). `lpFreeBytesAvailableToCaller` already accounts for per-user
+// quota, so it's the right number to show as "free space".
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {

@@ -56,7 +56,7 @@
     <!-- Panel status bar -->
     <div class="panel-status">
       <span>{{ entries.length }} items</span>
-      <span v-if="selectedEntries.length">{{ selectedEntries.length }} selected</span>
+      <span v-if="selectedEntries.length">{{ selectedEntries.length }} selected · {{ formatBytes(selectedSize) }}</span>
       <span v-if="selectedEntry">{{ selectedEntry.name }}</span>
       <span v-if="loading" class="loading-text">Loading...</span>
     </div>
@@ -437,6 +437,20 @@ function onSelect(entries, active) {
   selectedEntry.value = active || null;
 }
 
+// Total size of selected *files* only — directories contribute 0 (their sizes
+// are not enumerated and the user asked to ignore folder sizes).
+const selectedSize = computed(() =>
+  selectedEntries.value.reduce((sum, e) => sum + (e.is_dir ? 0 : (e.size || 0)), 0)
+);
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const v = bytes / Math.pow(1024, i);
+  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
+}
+
 // Mark the given entry names as "cut" (pending move) so FileList can ghost them.
 function setCutNames(names) {
   cutNames.value = names || [];
@@ -791,6 +805,8 @@ defineExpose({
   getNextVideoEntry: (name) => fileListRef.value?.getNextVideoEntry(name),
   selectAll: () => fileListRef.value?.selectAll(),
   clearSelection: () => fileListRef.value?.clearSelection(),
+  restoreByNames: (names) => fileListRef.value?.restoreByNames(names),
+  focusList: () => fileListRef.value?.focusList(),
   setCutNames,
   clearCut,
 });
