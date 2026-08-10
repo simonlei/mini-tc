@@ -496,6 +496,11 @@ function openVideo(payload) {
   previewFilePath.value = payload.path;
   previewFileName.value = payload.name;
   previewFileBytes.value = payload.bytes || 0;
+  // Reset flags owned by the file/unsupported previews — openVideo is now also
+  // reached by a direct kind switch from those previews, and they must not leak
+  // into the video preview.
+  previewAsText.value = false;
+  previewUnsupportedIsDir.value = false;
   previewVisible.value = true;
 }
 
@@ -928,7 +933,13 @@ watch(
         previewFileName.value = entry.name;
         previewFileBytes.value = entry.size;
       } else {
-        closePreview();
+        // Switching from an image/text/unsupported preview to a video: call
+        // openVideo() directly — do NOT closePreview() first. closePreview()
+        // restores the previously previewed file's selection in the source
+        // panel via a nextTick, which re-fires this watch and clobbers the
+        // just-opened video preview (the old image snaps back). The preview
+        // panel is always the opposite of the source panel, so openVideo keeps
+        // it on the same side and we only need to swap the kind.
         openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
       }
       return;
@@ -968,7 +979,9 @@ watch(activePanel, async () => {
       previewFileName.value = entry.name;
       previewFileBytes.value = entry.size;
     } else {
-      closePreview();
+      // Switch from image/text/unsupported to video without closePreview()
+      // (see the selection-watch branch for why — closePreview's nextTick
+      // re-selects the old file and clobbers the new video preview).
       openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
     }
     return;
