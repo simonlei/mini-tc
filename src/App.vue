@@ -993,6 +993,11 @@ onMounted(() => {
   listen("tauri://focus", () => {
     leftPanel.value?.refresh?.();
     rightPanel.value?.refresh?.();
+    // Refresh the drive free-space figures in both PathBar dropdowns too, so
+    // the remaining-capacity readouts stay current after the user has been
+    // doing work outside mini-tc (copying files, etc.).
+    leftPanel.value?.refreshDrives?.();
+    rightPanel.value?.refreshDrives?.();
     leftPanel.value?.clearCut?.();
     rightPanel.value?.clearCut?.();
   });

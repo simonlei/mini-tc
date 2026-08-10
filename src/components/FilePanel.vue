@@ -226,9 +226,7 @@ onMounted(async () => {
   // Drives are only needed for the PathBar dropdown; `list_directory` already
   // supplies `hasParent`, so we don't need this before the first listing. Load
   // it in the background so it never delays showing the file list.
-  listDrives()
-    .then((d) => { drives.value = d; })
-    .catch(() => { drives.value = []; });
+  refreshDrives();
 
   // Archive-extraction tools (7-Zip / WinRAR / unzip) are discovered lazily on
   // the first right-click (see ensureArchiveTools). Scanning the filesystem for
@@ -253,6 +251,18 @@ onMounted(async () => {
     createTab(homePath);
   }
 });
+
+// Reload the drive list (letter + free/total space shown in the PathBar
+// dropdown). Called on mount and whenever the window regains focus (via
+// App.vue's `tauri://focus` handler) so the free-space figures stay current
+// for both panels after the user has been doing work outside mini-tc.
+// Non-Windows hosts return no drive letters, so PathBar hides the selector
+// anyway; we just let the cheap call run and swallow failures.
+function refreshDrives() {
+  listDrives()
+    .then((d) => { drives.value = d; })
+    .catch(() => { /* keep last known drives on failure */ });
+}
 
 // Reload when active tab path changes. If this tab's listing is already cached
 // (e.g. it was background-preloaded, or we're returning to a previously visited
@@ -800,6 +810,7 @@ defineExpose({
   selectedEntries,
   currentPath: computed(() => activeTab.value?.path || ""),
   refresh,
+  refreshDrives,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
   selectName: (name) => fileListRef.value?.selectName(name),
   getNextVideoEntry: (name) => fileListRef.value?.getNextVideoEntry(name),
