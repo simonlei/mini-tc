@@ -36,3 +36,5 @@ src-tauri/keys/*.key
 scripts/release/out/
 scripts/cargo-check.log
 src-tauri/target-check/
+
+.agent

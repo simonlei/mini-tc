@@ -26,6 +26,20 @@ extern "system" {
     ) -> u32;
 }
 
+// Query free/total bytes for a volume (used by `list_drives` to report disk
+// capacity). `lpFreeBytesAvailableToCaller` already accounts for per-user
+// quota, so it's the right number to show as "free space".
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetDiskFreeSpaceExW(
+        lpDirectoryName: *const u16,
+        lpFreeBytesAvailableToCaller: *mut u64,
+        lpTotalNumberOfBytes: *mut u64,
+        lpTotalNumberOfFreeBytes: *mut u64,
+    ) -> i32;
+}
+
 /// A single file/folder entry returned to the frontend.
 #[derive(Serialize)]
 pub struct FileEntry {
@@ -44,6 +58,15 @@ pub struct FileEntry {
 pub struct DirectoryListing {
     pub entries: Vec<FileEntry>,
     pub has_parent: bool,
+}
+
+/// A drive/volume exposed in the drive selector, paired with its capacity so
+/// the frontend can show how much free space is left on each disk.
+#[derive(Serialize)]
+pub struct DriveInfo {
+    pub name: String,     // e.g. "C:\\" (or "/" on Unix)
+    pub free_bytes: u64,  // space available to the caller (bytes)
+    pub total_bytes: u64, // total capacity (bytes)
 }
 
 /// Convert a system time to milliseconds since UNIX_EPOCH.
@@ -168,9 +191,12 @@ fn get_parent_dir(path: String) -> Result<String, String> {
     }
 }
 
-/// On Windows, list available drive letters (e.g. "C:\\"). On other platforms, return root "/".
+/// On Windows, return available drive letters (e.g. "C:\\") together with their
+/// free and total space so the frontend can display remaining capacity. On
+/// other platforms, return root "/" (space left as 0 — the drive selector is
+/// hidden there anyway).
 #[tauri::command]
-fn list_drives() -> Result<Vec<String>, String> {
+fn list_drives() -> Result<Vec<DriveInfo>, String> {
     #[cfg(windows)]
     {
         let mut drives = Vec::new();
@@ -178,14 +204,51 @@ fn list_drives() -> Result<Vec<String>, String> {
         for &letter in letters.iter() {
             let drive = format!("{}:\\", letter as char);
             if Path::new(&drive).exists() {
-                drives.push(drive);
+                let (free, total) = drive_space(&drive);
+                drives.push(DriveInfo {
+                    name: drive,
+                    free_bytes: free,
+                    total_bytes: total,
+                });
             }
         }
         Ok(drives)
     }
     #[cfg(not(windows))]
     {
-        Ok(vec!["/".to_string()])
+        Ok(vec![DriveInfo {
+            name: "/".to_string(),
+            free_bytes: 0,
+            total_bytes: 0,
+        }])
+    }
+}
+
+/// Query free/total bytes for a Windows volume via `GetDiskFreeSpaceExW`.
+/// Returns (free, total); on any failure returns (0, 0) so the drive is still
+/// listed and the UI simply shows "—" for its space.
+#[cfg(windows)]
+fn drive_space(path: &str) -> (u64, u64) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free: u64 = 0;
+    let mut total: u64 = 0;
+    let mut _total_free: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free as *mut u64,
+            &mut total as *mut u64,
+            &mut _total_free as *mut u64,
+        )
+    };
+    if ok != 0 {
+        (free, total)
+    } else {
+        (0, 0)
     }
 }
 
@@ -409,14 +472,106 @@ fn read_file_preview(path: String, as_text: bool) -> Result<FilePreview, String>
     }
 }
 
+/// Structured delete error returned to the frontend so it can tell permission
+/// failures apart from other errors and offer an "elevated retry" path.
+#[derive(Serialize)]
+pub struct DeleteError {
+    pub kind: String, // "permission_denied" | "not_found" | "other"
+    pub message: String,
+}
+
 /// Move a file or directory to the system recycle bin (trash).
+/// Returns a structured `DeleteError` on failure. Any `trash` failure (other
+/// than the path not existing) is reported as `permission_denied` so the
+/// frontend can offer to retry with administrator privileges (see
+/// `delete_with_admin`). The `trash` crate's error messages vary wildly across
+/// OS versions and locales, so distinguishing the underlying cause is
+/// unreliable — we let the frontend always offer the elevated retry path.
 #[tauri::command]
-fn delete_to_trash(path: String) -> Result<(), String> {
+fn delete_to_trash(path: String) -> Result<(), DeleteError> {
     let p = Path::new(&path);
     if !p.exists() {
-        return Err(format!("Path does not exist: {}", path));
+        return Err(DeleteError {
+            kind: "not_found".to_string(),
+            message: format!("路径不存在: {}", path),
+        });
     }
-    trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))
+    if let Err(e) = trash::delete(p) {
+        let msg = format!("{}", e);
+        return Err(DeleteError {
+            kind: "permission_denied".to_string(),
+            message: format!("删除失败: {}", msg),
+        });
+    }
+    Ok(())
+}
+
+/// Delete a path with administrator privileges (Windows only). Uses
+/// ShellExecuteW with the "runas" verb to spawn an elevated PowerShell that
+/// runs `Remove-Item -Recurse -Force`, bypassing the recycle bin (an elevated
+/// delete cannot reliably use the per-user recycle bin). The OS shows the UAC
+/// prompt; this command returns immediately after the elevated process is
+/// launched — it does NOT wait for completion — so the frontend should
+/// delay-refresh the listing to pick up the result.
+#[tauri::command]
+fn delete_with_admin(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在: {}", path));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        // Escape single quotes for PowerShell's single-quoted string literal so
+        // paths containing quotes / special characters survive intact.
+        let escaped = path.replace('\'', "''");
+        let script = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue",
+            escaped
+        );
+        // -Command takes a double-quoted string; the path is single-quoted
+        // inside, so paths with spaces are handled as a single argument.
+        let params = format!("-NoProfile -WindowStyle Hidden -Command \"{}\"", script);
+
+        let wide_verb: Vec<u16> = "runas\0".encode_utf16().collect();
+        let wide_file: Vec<u16> = std::ffi::OsStr::new("powershell.exe")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let wide_params: Vec<u16> = std::ffi::OsStr::new(&params)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let result = unsafe {
+            ShellExecuteW(
+                0,
+                wide_verb.as_ptr(),
+                wide_file.as_ptr(),
+                wide_params.as_ptr(),
+                std::ptr::null(),
+                0, // SW_HIDE — keep the PowerShell window invisible
+            )
+        };
+        // ShellExecuteW returns HINSTANCE > 32 on success. A value <= 32 means
+        // the launch failed — most commonly 1223 (ERROR_CANCELLED) when the
+        // user declines the UAC prompt.
+        if result as usize <= 32 {
+            if result as i32 == 1223 {
+                return Err("用户取消了管理员权限请求".to_string());
+            }
+            return Err(format!("提权删除启动失败 (code={})", result));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        Err("管理员权限删除仅支持 Windows".to_string())
+    }
 }
 
 /// Rename a file or directory. `old_path` is the full source path, `new_name`
@@ -1853,6 +2008,7 @@ pub fn run() {
             read_file_preview,
             get_dir_size,
             delete_to_trash,
+            delete_with_admin,
             rename_file,
             open_file,
             copy_items,

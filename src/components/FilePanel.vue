@@ -56,7 +56,7 @@
     <!-- Panel status bar -->
     <div class="panel-status">
       <span>{{ entries.length }} items</span>
-      <span v-if="selectedEntries.length">{{ selectedEntries.length }} selected</span>
+      <span v-if="selectedEntries.length">{{ selectedEntries.length }} selected · {{ formatBytes(selectedSize) }}</span>
       <span v-if="selectedEntry">{{ selectedEntry.name }}</span>
       <span v-if="loading" class="loading-text">Loading...</span>
     </div>
@@ -72,7 +72,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deleteWithAdmin, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -114,7 +114,7 @@ const props = defineProps({
   panelId: { type: String, required: true },
 });
 
-const emit = defineEmits(["activate", "open-video"]);
+const emit = defineEmits(["activate", "open-video", "deleted"]);
 
 // Config name → ~/.minitc/tabs-<panelId>.json (unified cross-run store).
 const STORAGE_KEY = `tabs-${props.panelId}`;
@@ -437,6 +437,20 @@ function onSelect(entries, active) {
   selectedEntry.value = active || null;
 }
 
+// Total size of selected *files* only — directories contribute 0 (their sizes
+// are not enumerated and the user asked to ignore folder sizes).
+const selectedSize = computed(() =>
+  selectedEntries.value.reduce((sum, e) => sum + (e.is_dir ? 0 : (e.size || 0)), 0)
+);
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const v = bytes / Math.pow(1024, i);
+  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
+}
+
 // Mark the given entry names as "cut" (pending move) so FileList can ghost them.
 function setCutNames(names) {
   cutNames.value = names || [];
@@ -470,23 +484,63 @@ async function onDelete(targets) {
   const list = Array.isArray(targets) ? targets : [targets];
   if (list.length === 0) return;
 
-  const names = list.map((e) => e.name);
+  const successNames = [];
+  const failed = [];        // trash failed → auto-retry with admin
+  const adminLaunched = []; // admin delete was accepted (UAC approved)
+
   for (const entry of list) {
     const fullPath = await joinPath(activeTab.value.path, entry.name);
     try {
       await deleteToTrash(fullPath);
+      successNames.push(entry.name);
     } catch (e) {
-      error.value = String(e);
+      failed.push({ entry, fullPath });
     }
   }
 
-  // Remove the deleted entries locally instead of full refresh, so FileList can
-  // restore selection. Multi-delete just clears the selection (handled by the
-  // entries watch in FileList); single-delete re-selects the next neighbour.
-  entries.value = entries.value.filter((e) => !names.includes(e.name));
-  const next = { ...dirSizes.value };
-  names.forEach((n) => delete next[n]);
-  dirSizes.value = next;
+  // Remove entries that were successfully deleted via trash.
+  if (successNames.length) {
+    const removed = new Set(successNames);
+    entries.value = entries.value.filter((e) => !removed.has(e.name));
+    const next = { ...dirSizes.value };
+    successNames.forEach((n) => delete next[n]);
+    dirSizes.value = next;
+  }
+
+  // 通知父组件删除结果（含本面板剩余条目数），供「预览中删光目录 → 自动退出预览」联动。
+  emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
+
+  // For failed items: retry with admin elevation immediately. The UAC prompt
+  // serves as the user's confirmation — no need for an extra dialog.
+  if (failed.length === 0) return;
+
+  for (const f of failed) {
+    try {
+      await deleteWithAdmin(f.fullPath);
+      adminLaunched.push(f);
+    } catch (e) {
+      const m =
+        e && typeof e === "object" && e.message ? e.message : String(e);
+      showToast(`提权删除「${f.entry.name}」失败：${m}`, "error");
+    }
+  }
+
+  if (adminLaunched.length > 0) {
+    showToast(
+      adminLaunched.length === failed.length
+        ? `已发起 ${adminLaunched.length} 个项目管理员删除，请在 UAC 弹窗确认`
+        : `已发起 ${adminLaunched.length} 个项目管理员删除（${failed.length - adminLaunched.length} 个失败），请在 UAC 弹窗确认`,
+      "success"
+    );
+    // Elevated delete runs in its own process; delay-refresh to pick up results,
+    // then re-check empty state so the preview can exit if the whole directory
+    // is now gone.
+    setTimeout(() => {
+      refresh().then(() => {
+        emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
+      });
+    }, 2000);
+  }
 }
 
 // ── Rename ──
@@ -508,23 +562,15 @@ async function onRename(entry, newName) {
 
 // ── Open file ──
 
-const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
-
 async function onOpen(fileName) {
   if (!activeTab.value) return;
   const fullPath = await joinPath(activeTab.value.path, fileName);
-  const ext = fileName.split(".").pop()?.toLowerCase() || "";
 
-  // Route video files to the in-app video preview instead of the OS player.
-  if (VIDEO_EXTS.includes(ext)) {
-    emit("open-video", { path: fullPath, name: fileName, bytes: selectedEntry.value?.size || 0, panelId: props.panelId });
-    return;
-  }
-
-  console.log("[onOpen] fileName:", fileName, "fullPath:", fullPath);
+  // Double-clicking any file opens it with the OS default app/player. Videos
+  // are no exception — the in-app video preview is still reachable via Ctrl+Q
+  // (toggle preview), so we don't open it here on double-click.
   try {
     await openFile(fullPath);
-    console.log("[onOpen] openFile succeeded");
   } catch (e) {
     console.error("[onOpen] openFile failed:", e);
     error.value = String(e);
@@ -755,8 +801,12 @@ defineExpose({
   currentPath: computed(() => activeTab.value?.path || ""),
   refresh,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
+  selectName: (name) => fileListRef.value?.selectName(name),
+  getNextVideoEntry: (name) => fileListRef.value?.getNextVideoEntry(name),
   selectAll: () => fileListRef.value?.selectAll(),
   clearSelection: () => fileListRef.value?.clearSelection(),
+  restoreByNames: (names) => fileListRef.value?.restoreByNames(names),
+  focusList: () => fileListRef.value?.focusList(),
   setCutNames,
   clearCut,
 });

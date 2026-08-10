@@ -189,6 +189,20 @@ const resH = ref(0);
 const showCtrls = ref(true);
 let ctrlsTimer = null;
 
+// Set when the current clip ended and we're auto-advancing to the next one, so
+// that loadVideo() actually starts playback (instead of stopping on a paused
+// frame). Cleared once the next clip's metadata has loaded (or on error).
+const pendingAutoplay = ref(false);
+
+// Detect "audio plays but no video frame is ever painted" — the classic
+// HEVC/H.265-in-WebView2 symptom: the browser can't decode the video track but
+// decodes audio, so you get sound on a black screen and NO `error` event. We
+// watch for the first presented video frame; if none appears shortly after
+// playback starts we fall back to the system player.
+let frameWatchTimer = null;
+let frameWatchRaf = 0;
+let frameReceived = false;
+
 // ── Up / Down navigation is delegated to the file list (App handles it) ──
 
 // ── Subtitles ──
@@ -236,7 +250,10 @@ function togglePlay() {
   if (v.paused) v.play().catch(() => {});
   else v.pause();
 }
-function onPlay() { playing.value = true; }
+function onPlay() {
+  playing.value = true;
+  startVideoFrameWatch();
+}
 function onPause() { playing.value = false; }
 function seekTo(val) {
   const v = videoEl.value;
@@ -275,6 +292,19 @@ function onLoadedMetadata() {
   v.volume = volume.value;
   v.muted = muted.value;
   v.playbackRate = rate.value;
+  // Some containers expose a video track in metadata but the browser can't
+  // decode it (e.g. HEVC/H.265 in WebView2). If there are no video dimensions
+  // at all, the video track is unusable → go straight to the system player.
+  if ((v.videoWidth || 0) === 0 || (v.videoHeight || 0) === 0) {
+    triggerVideoFallback("无法获取视频画面（视频轨可能未解码，常见于 H.265/HEVC），请用系统播放器打开。");
+    return;
+  }
+  // Autoplay the next clip if we're advancing from a finished one. The new
+  // source has just loaded, so playback is safe to start now.
+  if (pendingAutoplay.value) {
+    pendingAutoplay.value = false;
+    v.play().catch(() => {});
+  }
 }
 
 // Persist player config (speed / volume / mute) whenever any of them changes.
@@ -284,45 +314,83 @@ function onTimeUpdate() { if (videoEl.value) videoTime.value = videoEl.value.cur
 // player). Used to find "the next video" in the same directory on autoplay.
 const VIDEO_OK = [...NATIVE_OK, ...EXTERNAL_ONLY];
 
-// Autoplay the next video in the SAME directory (by current sort order) when
-// the current one ends. Emits `open-next` with the next video's path/name/bytes
-// so the parent can keep playing in the same preview panel; if there is no next
-// video, playback simply stops (no loop).
-async function onEnded() {
+// When the current clip ends, ask the parent to advance to the next video. We
+// do NOT re-list / re-sort the directory here — instead we hand the parent the
+// name of the clip that just finished, and App resolves the next entry from the
+// source panel's file list (getNextVideoEntry). That makes the autoplay order
+// follow the list's current sort (natural numeric name order, size, modified…),
+// so it always matches what the user sees. If there is no later video, the
+// parent simply stops (no loop).
+function onEnded() {
   playing.value = false;
-  // Only native-or-external-capable videos participate; skip if the current
-  // file isn't actually in the playable set (defensive — onEnded only fires for
-  // a real <video> element).
+  // Defensive: onEnded only fires for a real <video>, but guard anyway.
   if (!VIDEO_OK.includes(ext.value)) return;
-  try {
-    const dir = await getParentDir(props.filePath);
-    if (!dir) return;
-    const list = (await listDirectory(dir)).entries;
-    // Mirror FileList's ordering: directories always first, then name asc.
-    const sorted = [...list].sort((a, b) => {
-      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
-    });
-    const videos = sorted.filter(
-      (e) => !e.is_dir && VIDEO_OK.includes((e.name.split(".").pop() || "").toLowerCase())
-    );
-    const idx = videos.findIndex((e) => e.name === props.fileName);
-    if (idx < 0 || idx >= videos.length - 1) return; // last video → stop
-    const next = videos[idx + 1];
-    const nextPath = await joinPath(dir, next.name);
-    emit("open-next", {
-      path: nextPath,
-      name: next.name,
-      bytes: next.size || 0,
-    });
-  } catch (err) {
-    console.error("autoplay next video failed:", err);
-  }
+  // Flag the upcoming reload so loadVideo() actually starts playback once the
+  // new source is ready (instead of stopping on a paused frame).
+  pendingAutoplay.value = true;
+  emit("open-next", { name: props.fileName });
 }
 function onError() {
   // Native-capable container but actual codec/stream failed to decode.
+  pendingAutoplay.value = false;
   externalFallback.value = true;
   if (canPlayNative.value) loadError.value = "当前编码格式 WebView 无法直接解码，请用系统播放器打开。";
+}
+
+// Cancel any in-flight frame-paint watch.
+function cancelFrameWatch() {
+  if (frameWatchTimer) { clearTimeout(frameWatchTimer); frameWatchTimer = null; }
+  if (frameWatchRaf && videoEl.value && typeof videoEl.value.cancelVideoFrameCallback === "function") {
+    try { videoEl.value.cancelVideoFrameCallback(frameWatchRaf); } catch { /* ignore */ }
+  }
+  frameWatchRaf = 0;
+  frameReceived = false;
+}
+
+// Switch to the system-player fallback because the video track can't be shown.
+function triggerVideoFallback(msg) {
+  cancelFrameWatch();
+  pendingAutoplay.value = false;
+  externalFallback.value = true;
+  loadError.value = msg;
+}
+
+// After playback starts, confirm a real video frame is actually presented.
+// requestVideoFrameCallback fires once per painted frame; if the browser can't
+// decode the video track (audio still advances) it never fires. As a backstop
+// for environments without that API, sample the video onto a canvas after a
+// short delay and check whether any opaque frame was painted (an undecoded
+// video leaves the canvas fully transparent, whereas a real frame is opaque).
+function startVideoFrameWatch() {
+  cancelFrameWatch();
+  const v = videoEl.value;
+  if (!v) return;
+  if (typeof v.requestVideoFrameCallback === "function") {
+    frameReceived = false;
+    frameWatchRaf = v.requestVideoFrameCallback(() => { frameReceived = true; });
+  }
+  frameWatchTimer = setTimeout(() => {
+    const el = videoEl.value;
+    if (!el || externalFallback.value) return;
+    if (frameReceived) return;
+    let painted = false;
+    try {
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, el.videoWidth || 1);
+      c.height = Math.max(1, el.videoHeight || 1);
+      const ctx = c.getContext("2d");
+      ctx.drawImage(el, 0, 0, c.width, c.height);
+      const data = ctx.getImageData(0, 0, c.width, c.height).data;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i] !== 0) { painted = true; break; }
+      }
+    } catch { /* ignore */ }
+    // Only flag when playback is actually progressing (audio advanced) yet no
+    // frame was painted — that's the "sound but no picture" failure mode.
+    if (!painted && el.currentTime > 0.05) {
+      triggerVideoFallback("视频轨无法解码（常见为 H.265/HEVC），画面无法显示，请用系统播放器打开。");
+    }
+  }, 2000);
 }
 function onWheel(e) {
   const step = e.deltaY < 0 ? 0.05 : -0.05;
@@ -524,6 +592,7 @@ function showControlsTmp() {
 // Reload the video source (also re-detects subtitles). Up / Down navigation is
 // handled by the parent via the file list, not here.
 async function loadVideo() {
+  cancelFrameWatch();
   videoSrc.value = "";
   externalFallback.value = false;
   loadError.value = "";
@@ -566,6 +635,7 @@ watch(
 
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey, true);
+  cancelFrameWatch();
   if (videoEl.value) videoEl.value.pause();
   clearTimeout(ctrlsTimer);
 });

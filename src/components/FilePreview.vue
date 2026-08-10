@@ -29,16 +29,51 @@
       <img :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
     </div>
 
+    <!-- PDF preview -->
+    <div class="preview-body pdf-body" v-else-if="previewType === 'pdf'">
+      <iframe
+        v-if="pdfSupported && !pdfLoadError"
+        ref="pdfFrameRef"
+        :key="props.filePath"
+        :src="previewContent"
+        class="preview-pdf-frame"
+        title="PDF 预览"
+        @error="onPdfError"
+      ></iframe>
+      <div class="preview-placeholder error" v-else-if="pdfLoadError">
+        <span class="placeholder-icon">⚠️</span>
+        <span>无法加载 PDF，文件可能已损坏或不存在</span>
+      </div>
+      <div class="preview-placeholder" v-else>
+        <span class="placeholder-icon">📕</span>
+        <span>当前平台不支持内联预览 PDF，请使用系统程序打开查看</span>
+      </div>
+    </div>
+
     <!-- Text / JSON preview -->
     <div class="preview-body text-body" v-else-if="previewType === 'text' || previewType === 'json' || previewType === 'log'">
       <div class="json-warn" v-if="jsonWarn">{{ jsonWarn }}</div>
       <pre class="preview-text"><code>{{ previewContent }}</code></pre>
     </div>
 
+    <!-- Word (.docx) preview: rendered HTML from mammoth (v-html, sanitized) -->
+    <div class="preview-body doc-body" v-else-if="previewType === 'docx'">
+      <div class="preview-doc" v-html="previewContent"></div>
+    </div>
+
+    <!-- Legacy .doc: friendly notice to re-save as .docx -->
+    <div class="preview-body" v-else-if="previewType === 'doc'">
+      <div class="preview-placeholder">
+        <span class="placeholder-icon">📘</span>
+        <span>{{ docMessage }}</span>
+      </div>
+    </div>
+
     <!-- Footer -->
     <div class="preview-footer" v-if="!loading && !error">
       <span>{{ fileSize }}</span>
       <span v-if="(previewType === 'text' || previewType === 'log') && lineCount !== null">{{ lineCount }} lines</span>
+      <span v-if="previewType === 'docx' && charCount !== null">{{ charCount }} 字</span>
       <span v-if="previewType === 'image'">{{ imageInfo }}</span>
       <button
         class="copy-all-btn"
@@ -53,6 +88,11 @@
 import { ref, watch, computed } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
+// mammoth converts .docx (OOXML) into HTML. We import the self-contained
+// browser bundle (NOT the Node entry, which requires `fs`/`path` and would
+// break the Vite web build). The browser build is pure-JS (uses a browser
+// jszip) and works inside the Tauri webview.
+import mammoth from "mammoth/mammoth.browser.js";
 
 const props = defineProps({
   filePath: { type: String, required: true },
@@ -77,8 +117,29 @@ const imageInfo = ref("");
 const jsonWarn = ref("");
 const copyAllDone = ref(false);
 
+// Word-document preview state.
+const docMessage = ref(""); // friendly notice for unsupported legacy .doc
+const charCount = ref(null); // character count of the converted docx text
+
+// PDF 加载失败标记（仅影响 PDF 渲染区，不冲击 header/footer 正常展示）
+const pdfLoadError = ref(false);
+// PDF iframe DOM 引用（供 App.vue 的 Ctrl+C 判定按 class 识别，也便于未来扩展）
+const pdfFrameRef = ref(null);
+
+// 平台检测：判断当前 WebView 是否支持内联 PDF 渲染。
+// 项目未安装 @tauri-apps/plugin-os（后端无 tauri-plugin-os），按约束不新增依赖，
+// 采用 UA 启发式：Windows WebView2（含 Edg/）内置 PDF 查看器，支持 iframe 内联；
+// macOS WKWebView（AppleWebKit 但无 Chrome/Edg）不支持内联 PDF，走降级提示。
+const pdfSupported = computed(() => {
+  const ua = navigator.userAgent || '';
+  const isWebKitOnly = /AppleWebKit/.test(ua) && !/Chrome|Edg/.test(ua);
+  return !isWebKitOnly;
+});
+
 const headerIcon = computed(() => {
   if (previewType.value === "image") return "🖼️";
+  if (previewType.value === "pdf") return "📕";
+  if (previewType.value === "docx" || previewType.value === "doc") return "📘";
   if (previewType.value === "json") return "🔧";
   if (previewType.value === "log") return "📜";
   if (previewType.value === "text") return "📄";
@@ -87,6 +148,9 @@ const headerIcon = computed(() => {
 
 const typeLabel = computed(() => {
   if (previewType.value === "image") return "IMAGE";
+  if (previewType.value === "pdf") return "PDF";
+  if (previewType.value === "docx") return "DOCX";
+  if (previewType.value === "doc") return "DOC";
   if (previewType.value === "json") return "JSON";
   if (previewType.value === "log") return "LOG";
   if (previewType.value === "text") return "TEXT";
@@ -114,6 +178,11 @@ function onImageLoad(e) {
 function onImageError() {
   error.value = "无法加载图片，文件可能已损坏";
   previewType.value = "";
+}
+
+// PDF iframe 加载失败时设置局部错误标记（不使用组件级 error，以保留 header/footer 展示）
+function onPdfError() {
+  pdfLoadError.value = true;
 }
 
 // Copy the entire preview text to the OS clipboard (for the "复制全部" button).
@@ -146,6 +215,72 @@ async function copyAll() {
   if (ok) setTimeout(() => { copyAllDone.value = false; }, 1500);
 }
 
+// ── Word (.docx) preview ──
+// mammoth reads the raw OOXML and emits a limited, safe subset of HTML
+// (headings, paragraphs, lists, tables, bold/italic, hyperlinks, images).
+// Even so, we run a defensive sanitizer because the source is user-supplied
+// and parsed XML could carry <script>/on*=/javascript: payloads.
+const MAX_DOCX_BYTES = 25 * 1024 * 1024; // 25 MB cap (mammoth loads the whole file)
+
+// Strip anything that could execute or escape the preview: <script>/<style>/
+// <iframe>/<object>/<embed>/<link>/<meta>, all event-handler attributes, and
+// javascript: URLs in href/src. Returns sanitized HTML string.
+function sanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc
+    .querySelectorAll("script, style, iframe, object, embed, link, meta")
+    .forEach((el) => el.remove());
+  const walk = (node) => {
+    if (node.nodeType === 1) {
+      for (const attr of Array.from(node.attributes)) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value.trim().toLowerCase();
+        if (name.startsWith("on")) {
+          node.removeAttribute(attr.name);
+        } else if (
+          (name === "href" || name === "src") &&
+          value.startsWith("javascript:")
+        ) {
+          node.removeAttribute(attr.name);
+        }
+      }
+    }
+    node.childNodes.forEach(walk);
+  };
+  walk(doc.body);
+  return doc.body.innerHTML;
+}
+
+async function loadDocxPreview() {
+  docMessage.value = "";
+  // Guard against previewing huge documents (keeps the webview responsive).
+  if (props.fileBytes && props.fileBytes > MAX_DOCX_BYTES) {
+    error.value = `文件过大，无法预览（最大 ${MAX_DOCX_BYTES / 1024 / 1024} MB）`;
+    loading.value = false;
+    return;
+  }
+  try {
+    // Reuse the asset protocol (same mechanism as images/PDF): the webview
+    // fetches the local file bytes directly — no backend command needed.
+    const url = convertFileSrc(props.filePath);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`无法读取文件 (HTTP ${resp.status})`);
+    const arrayBuffer = await resp.arrayBuffer();
+    const result = await mammoth.convertToHtml({ arrayBuffer });
+    const html = sanitizeHtml(result.value || "");
+    previewContent.value = html;
+    previewType.value = "docx";
+    fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
+    // Character count of the visible text (proxy for 字数; works for CJK too).
+    const text = html.replace(/<[^>]+>/g, " ").replace(/\s/g, "");
+    charCount.value = text.length;
+  } catch (e) {
+    error.value = `无法预览此 Word 文档：${String(e)}\n（若为 .doc 旧格式，请另存为 .docx 后再预览）`;
+  } finally {
+    loading.value = false;
+  }
+}
+
 async function loadPreview() {
   loading.value = true;
   error.value = "";
@@ -154,6 +289,9 @@ async function loadPreview() {
   lineCount.value = null;
   imageInfo.value = "";
   jsonWarn.value = "";
+  pdfLoadError.value = false;
+  docMessage.value = "";
+  charCount.value = null;
 
   const ext = getExtension(props.fileName);
 
@@ -161,6 +299,33 @@ async function loadPreview() {
   if (IMAGE_EXTENSIONS.includes(ext)) {
     previewType.value = "image";
     previewContent.value = convertFileSrc(props.filePath);
+    fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
+    loading.value = false;
+    return;
+  }
+
+  // PDF: 同图片一样用 convertFileSrc 直连本地文件，不经过 IPC 文本读取。
+  // 依赖系统 WebView 内置 PDF 查看器（Windows WebView2 支持；macOS WKWebView 不支持，走降级提示）。
+  if (ext === "pdf") {
+    previewType.value = "pdf";
+    previewContent.value = convertFileSrc(props.filePath);
+    fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
+    loading.value = false;
+    return;
+  }
+
+  // Word documents: .docx is OOXML (zip + xml) — convert to HTML in the
+  // frontend via mammoth (reads file bytes through the asset protocol, no
+  // backend change). .doc is the legacy binary format mammoth can't read, so
+  // we show a friendly prompt to re-save as .docx instead of failing silently.
+  if (ext === "docx") {
+    await loadDocxPreview();
+    return;
+  }
+  if (ext === "doc") {
+    previewType.value = "doc";
+    docMessage.value =
+      "不支持预览旧版 .doc 格式（二进制 OLE）。请用 Word / WPS 另存为 .docx 后再预览。";
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
     loading.value = false;
     return;
@@ -326,6 +491,84 @@ watch(
   object-fit: contain;
   margin: auto;
   border-radius: 2px;
+}
+
+/* PDF preview */
+.pdf-body {
+  background: var(--bg);
+}
+
+.preview-pdf-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
+/* Word (.docx) preview */
+.doc-body {
+  overflow: auto;
+  background: var(--bg);
+  display: block;
+}
+
+.preview-doc {
+  padding: 14px 20px;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.7;
+  word-break: break-word;
+  user-select: text;
+}
+
+.preview-doc :deep(h1) {
+  font-size: 1.5em;
+  font-weight: 700;
+  margin: 0.6em 0 0.3em;
+}
+.preview-doc :deep(h2) {
+  font-size: 1.3em;
+  font-weight: 700;
+  margin: 0.6em 0 0.3em;
+}
+.preview-doc :deep(h3) {
+  font-size: 1.15em;
+  font-weight: 600;
+  margin: 0.5em 0 0.3em;
+}
+.preview-doc :deep(p) {
+  margin: 0 0 0.6em;
+}
+.preview-doc :deep(ul),
+.preview-doc :deep(ol) {
+  padding-left: 1.5em;
+  margin: 0 0 0.6em;
+}
+.preview-doc :deep(li) {
+  margin: 0.15em 0;
+}
+.preview-doc :deep(table) {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+}
+.preview-doc :deep(td),
+.preview-doc :deep(th) {
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  vertical-align: top;
+}
+.preview-doc :deep(a) {
+  color: var(--accent);
+}
+.preview-doc :deep(img) {
+  max-width: 100%;
+  height: auto;
+}
+.preview-doc :deep(blockquote) {
+  margin: 0.6em 0;
+  padding-left: 0.8em;
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
 }
 
 /* Text preview */

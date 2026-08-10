@@ -43,6 +43,15 @@ export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
 
+/// Delete a path with administrator privileges (Windows only). Uses an
+/// elevated PowerShell (ShellExecuteW "runas") to run Remove-Item -Recurse
+/// -Force, bypassing the recycle bin. Returns immediately after the elevated
+/// process is launched — the frontend should delay-refresh to pick up the
+/// result. Rejects with a string message on failure (e.g. user declined UAC).
+export async function deleteWithAdmin(path) {
+  return invoke("delete_with_admin", { path });
+}
+
 // Rename a file or directory. `oldPath` is the full source path; `newName` is
 // the bare new file name (no directory component).
 export async function renameFile(oldPath, newName) {

@@ -33,6 +33,9 @@
           </div>
         </div>
       </div>
+      <div class="menu-item" @click="openSettings">
+        <span>设置</span>
+      </div>
       <span class="update-status" v-if="updateStatus">{{ updateStatus }}</span>
     </div>
 
@@ -62,6 +65,15 @@
         </div>
       </div>
     </div>
+
+    <!-- Settings dialog -->
+    <SettingsDialog
+      v-if="settingsVisible"
+      :extensions="textPreviewExtensions"
+      :builtins="BUILTIN_TEXT_EXTENSIONS"
+      @close="onSettingsClose"
+      @save="onSettingsSave"
+    />
 
     <!-- Main content: two panels with a draggable separator -->
     <div class="main-content">
@@ -96,6 +108,7 @@
           :is-active="activePanel === 'left' && !(previewVisible && previewPanel === 'left')"
           @activate="onPanelActivate('left')"
           @open-video="openVideo"
+          @deleted="onPanelDeleted"
         />
       </div>
 
@@ -134,6 +147,7 @@
           :is-active="activePanel === 'right' && !(previewVisible && previewPanel === 'right')"
           @activate="onPanelActivate('right')"
           @open-video="openVideo"
+          @deleted="onPanelDeleted"
         />
       </div>
     </div>
@@ -181,11 +195,12 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from "vue";
+import { ref, watch, onMounted, nextTick } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
 import UnsupportedPreview from "./components/UnsupportedPreview.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -204,6 +219,27 @@ const currentTheme = ref("neon");
 const themeMenuOpen = ref(false);
 const helpMenuOpen = ref(false);
 const updateStatus = ref("");
+
+// ── Settings dialog ──
+const settingsVisible = ref(false);
+
+function openSettings() {
+  helpMenuOpen.value = false;
+  themeMenuOpen.value = false;
+  settingsVisible.value = true;
+}
+
+function onSettingsSave(exts) {
+  textPreviewExtensions.value = [
+    ...new Set(exts.map((e) => String(e).toLowerCase()).filter(Boolean)),
+  ];
+  settingsVisible.value = false;
+  saveTextPreviewConfig();
+}
+
+function onSettingsClose() {
+  settingsVisible.value = false;
+}
 
 const updateDialog = ref({
   visible: false,
@@ -365,40 +401,70 @@ function endDrag() {
 
 // ── File Preview (Ctrl+Q) ──
 
-const PREVIEWABLE_EXTENSIONS = ["txt", "md", "json", "log", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const PREVIEWABLE_EXTENSIONS = ["pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
 const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
 
-// Extensions the user has chosen to always preview as plain text (via the
-// "按文本预览" button on an unsupported file). Persisted to
-// ~/.minitc/text-preview-extensions.json so the choice sticks across restarts
-// and exempts those extensions from the "unsupported format" placeholder.
+// Built-in plain-text formats. These are deliberately NOT part of
+// PREVIEWABLE_EXTENSIONS — whether they are previewed as text is governed
+// entirely by the user-editable `textPreviewExtensions` set below (which
+// defaults to these). That lets the Settings dialog toggle even built-in text
+// types on/off without special-casing them.
+const BUILTIN_TEXT_EXTENSIONS = ["txt", "md", "json", "log"];
+
+// Extensions the user wants previewed as plain text. Defaults to the built-ins
+// above; can be extended (and individual entries disabled) from the Settings
+// dialog, and is persisted to ~/.minitc/text-preview-extensions.json. The
+// "按文本预览" button on an unsupported file also adds to this set.
 const TEXT_PREVIEW_CONFIG = "text-preview-extensions";
-const textPreviewExtensions = ref([]);
+const textPreviewExtensions = ref([...BUILTIN_TEXT_EXTENSIONS]);
 // Whether the current "unsupported" placeholder is for a directory (in which
 // case the "按文本预览" button is hidden — directories can't be text-previewed).
 const previewUnsupportedIsDir = ref(false);
 // Flag passed to FilePreview: force a plain-text read for the current file
-// (true only for user-added text-preview extensions).
+// when its extension is in the user-editable `textPreviewExtensions` set.
 const previewAsText = ref(false);
 
 async function loadTextPreviewConfig() {
   try {
     const raw = await loadConfig(TEXT_PREVIEW_CONFIG);
     if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        textPreviewExtensions.value = arr
-          .map((e) => String(e).toLowerCase())
-          .filter(Boolean);
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        // Legacy delta format (user-added only) — merge with built-ins so they
+        // stay enabled, then migrate to the object format on next save.
+        textPreviewExtensions.value = [
+          ...new Set([
+            ...BUILTIN_TEXT_EXTENSIONS,
+            ...parsed.map((e) => String(e).toLowerCase()).filter(Boolean),
+          ]),
+        ];
+      } else if (parsed && typeof parsed === "object") {
+        // Current format: { ext: bool }. Respect disabled built-ins.
+        const arr = [];
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v) arr.push(String(k).toLowerCase());
+        }
+        textPreviewExtensions.value = arr;
       }
     }
   } catch (e) {
     console.error("Failed to load text-preview extensions:", e);
+    // Keep built-in defaults on failure.
+    textPreviewExtensions.value = [...BUILTIN_TEXT_EXTENSIONS];
   }
 }
 
 async function saveTextPreviewConfig() {
-  await saveConfig(TEXT_PREVIEW_CONFIG, JSON.stringify(textPreviewExtensions.value)).catch((e) =>
+  // Persist as an object { ext: bool } so a disabled built-in stays disabled
+  // across restarts (a bare array can't represent "off").
+  const obj = {};
+  for (const b of BUILTIN_TEXT_EXTENSIONS) {
+    obj[b] = textPreviewExtensions.value.includes(b);
+  }
+  for (const e of textPreviewExtensions.value) {
+    if (!BUILTIN_TEXT_EXTENSIONS.includes(e)) obj[e] = true;
+  }
+  await saveConfig(TEXT_PREVIEW_CONFIG, JSON.stringify(obj)).catch((e) =>
     console.error("Failed to persist text-preview extensions:", e)
   );
 }
@@ -433,14 +499,27 @@ function openVideo(payload) {
   previewVisible.value = true;
 }
 
-// Autoplay the next video in the SAME preview panel (triggered by VideoPreview's
-// `open-next` on `ended`). Unlike openVideo this keeps previewPanel unchanged,
-// so the next clip loads in place; VideoPreview's `watch(filePath)` reloads it.
-function playNextVideo(payload) {
+// Autoplay the next video (triggered by VideoPreview's `open-next` on `ended`).
+// The "which clip is next" decision is delegated to the SOURCE panel's file list
+// via getNextVideoEntry(), so the autoplay order follows the list's CURRENT sort
+// (natural numeric name order / size / modified — whatever the user set) instead
+// of an independent directory re-sort in VideoPreview. The file-list highlight
+// moves to the next clip too, so it tracks what's playing.
+async function playNextVideo(payload) {
   if (!previewVisible.value || previewKind.value !== "video") return;
-  previewFilePath.value = payload.path;
-  previewFileName.value = payload.name;
-  previewFileBytes.value = payload.bytes || 0;
+  const source = previewPanel.value === "left" ? "right" : "left";
+  const panel = source === "left" ? leftPanel.value : rightPanel.value;
+  const currentName = payload?.name;
+  if (!currentName) return;
+  const next = panel?.getNextVideoEntry?.(currentName);
+  if (!next) return; // last video in the list → stop, no loop
+  const dir = panel?.currentPath;
+  if (!dir) return;
+  const p = await joinPath(dir, next.name);
+  previewFilePath.value = p;
+  previewFileName.value = next.name;
+  previewFileBytes.value = next.size || 0;
+  panel?.selectName?.(next.name);
 }
 
 // Switch to another video within the SAME preview panel (↑/↓ navigation in VideoPreview).
@@ -482,7 +561,18 @@ function hasPreviewTextSelection() {
   let node = sel.anchorNode;
   if (!node) return false;
   const el = node.nodeType === 3 ? node.parentElement : node;
-  return !!(el && el.closest && el.closest(".preview-text"));
+  return !!(el && el.closest && (el.closest(".preview-text") || el.closest(".preview-doc")));
+}
+
+// 判断当前焦点是否落在 PDF 预览的 <iframe> 上（跨源 iframe 无法读取内部选区，
+// 但浏览器会将 iframe 元素本身设为 activeElement，据此放行原生 Ctrl+C）。
+// 双重校验：class 名 + src 以 asset:// 开头，增强判定抗干扰性。
+function isPdfIframeFocused() {
+  const el = document.activeElement;
+  if (!el || el.tagName !== "IFRAME") return false;
+  if (!el.classList.contains("preview-pdf-frame")) return false;
+  const src = el.getAttribute("src") || "";
+  return src.startsWith("asset://");
 }
 
 function setClipboard(operation) {
@@ -768,6 +858,12 @@ async function togglePreview() {
 }
 
 function closePreview() {
+  // Remember which panel sourced the preview (the opposite of where the preview
+  // was shown) and the name of the file that was being previewed, so we can
+  // restore the file-list selection to it after closing.
+  const sourcePanel = previewPanel.value === "left" ? "right" : "left";
+  const fileName = previewFileName.value;
+
   previewVisible.value = false;
   previewPanel.value = "";
   previewKind.value = "";
@@ -776,6 +872,34 @@ function closePreview() {
   previewFileBytes.value = 0;
   previewAsText.value = false;
   previewUnsupportedIsDir.value = false;
+
+  // After leaving preview, make the SOURCE file list (the panel where the
+  // previewed file lives — always the visible one, since the preview occupies
+  // the opposite panel) re-select that file. Without this the list can be left
+  // with no selection after Esc / Ctrl+Q. `restoreByNames` only (re)applies a
+  // selection when the name is still present and never clears an existing one,
+  // so it's safe even if the file list was reloaded during preview.
+  if (fileName) {
+    const panel = sourcePanel === "left" ? leftPanel.value : rightPanel.value;
+    // Bring the source panel to the foreground so the re-selected file is the
+    // focal list the user sees after the preview closes.
+    activePanel.value = sourcePanel;
+    nextTick(() => {
+      panel?.restoreByNames?.([fileName]);
+      panel?.focusList?.();
+    });
+  }
+}
+
+// When entries are deleted in a panel, check whether the whole directory got
+// emptied. The preview always shows a file from the OPPOSITE panel (the source
+// panel), so if that source panel is now empty there is nothing left to
+// preview — exit the preview state. Triggered by FilePanel's `deleted` event.
+function onPanelDeleted({ panelId, remainingCount }) {
+  if (!previewVisible.value) return;
+  const source = previewPanel.value === "left" ? "right" : "left";
+  if (panelId !== source) return;
+  if (remainingCount === 0) closePreview();
 }
 
 // Auto-update preview when the active panel's selection changes
@@ -873,6 +997,24 @@ onMounted(() => {
     rightPanel.value?.clearCut?.();
   });
   document.addEventListener("keydown", (e) => {
+    // Esc: close the current preview (image / text / pdf / video / unsupported)
+    // and return the source file list to the file that was just previewed. When
+    // no preview is open, this is a no-op — Esc no longer cancels selection on
+    // the file grid, so we only act while a preview is visible.
+    // If focus is inside a text input (the source panel's filename filter or
+    // address bar, which stay interactive during preview), let that input handle
+    // Esc on its own (e.g. cancel the filter) instead of closing the preview.
+    if (e.key === "Escape" && previewVisible.value) {
+      const t = e.target;
+      const inEditable =
+        t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      if (!inEditable) {
+        e.preventDefault();
+        closePreview();
+        return;
+      }
+    }
+
     // Ctrl+Q: Toggle file preview
     if (e.key === "q" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
@@ -906,6 +1048,9 @@ onMounted(() => {
         // copy that text natively instead of treating it as a file clipboard op
         // (file-list selection → copy file; preview text selection → copy text).
         if (hasPreviewTextSelection()) return;
+        // PDF 预览聚焦时放行 Ctrl+C（复制 PDF 内文本），交由 WebView 原生处理。
+        // Ctrl+X 不放行（PDF 只读，无剪切内容语义，仍按文件剪切逻辑处理）。
+        if ((e.key === "c" || e.key === "C") && isPdfIframeFocused()) return;
       }
       if (e.key === "c" || e.key === "C") {
         e.preventDefault();

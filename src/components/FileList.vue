@@ -219,7 +219,11 @@ const sortedEntries = computed(() => {
 
     let cmp = 0;
     if (col === "name") {
-      cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+      // Natural sort: digit runs compare by numeric value (so "1a.jpg" <
+      // "2c.jpg" < "10b.jpg"), case/accent-insensitive via sensitivity:"base"
+      // (replaces the old toLowerCase()). The directory-first check above still
+      // runs first, so dirs keep sorting before files regardless of name order.
+      cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
     } else if (col === "size") {
       cmp = a.size - b.size;
       // For size sort, directories go first regardless
@@ -372,6 +376,41 @@ function moveSelection(delta) {
   scrollToRow(next);
 }
 
+// Select a specific entry by its file name (single-select, scroll into view).
+// Used by autoplay-next so the file-list highlight follows the clip now playing.
+function selectName(name) {
+  const idx = displayedEntries.value.findIndex((e) => e.name === name);
+  if (idx >= 0) {
+    selectRow(idx);
+    scrollToRow(idx);
+  } else {
+    activeIndex.value = -1;
+    emitSelection();
+  }
+}
+
+// Video autoplay-next: given the name of the clip that just finished, return the
+// NEXT video entry in the list's CURRENT display order. This deliberately reads
+// `displayedEntries` (which already honours the user's active sort — including
+// natural numeric name ordering, size, modified — and the search filter) so the
+// autoplay order always matches what the user sees in the file list. Non-video
+// rows between clips are skipped. Returns null when there is no later video, so
+// playback stops instead of looping.
+const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
+
+function getNextVideoEntry(name) {
+  const list = displayedEntries.value;
+  const idx = list.findIndex((e) => e.name === name);
+  if (idx < 0) return null;
+  for (let i = idx + 1; i < list.length; i++) {
+    const e = list[i];
+    if (e.is_dir) continue;
+    const ext = e.name.includes(".") ? e.name.split(".").pop().toLowerCase() : "";
+    if (VIDEO_EXTS.includes(ext)) return e;
+  }
+  return null;
+}
+
 // Shift+Arrow: extend the selection continuously from the anchor.
 function extendSelection(delta) {
   const list = displayedEntries.value;
@@ -392,6 +431,57 @@ function extendSelection(delta) {
   activeIndex.value = next;
   emitSelection();
   scrollToRow(next);
+}
+
+// Number of fully-visible rows in the scroll viewport — the step unit for
+// PageUp / PageDown. Measured from a real row so it stays correct if the row
+// height ever changes in CSS; falls back to 24px when the list is empty.
+function pageSize() {
+  const c = entriesContainer.value;
+  if (!c) return 1;
+  const row = c.querySelector(".file-row");
+  const rowH = row ? row.getBoundingClientRect().height : 0;
+  return Math.max(1, Math.floor(c.clientHeight / (rowH || 24)));
+}
+
+// Jump the active selection up/down by one viewport page. Clamped to the first
+// / last row (never wraps). Plain PageUp/PageDown only moves the caret.
+function movePage(delta) {
+  const list = displayedEntries.value;
+  if (list.length === 0) return;
+  if (activeIndex.value === -1) {
+    if (delta > 0) { selectRow(0); scrollToRow(0); }
+    return;
+  }
+  const step = pageSize() * (delta > 0 ? 1 : -1);
+  let next = activeIndex.value + step;
+  if (next < 0) next = 0;
+  if (next > list.length - 1) next = list.length - 1;
+  if (next === activeIndex.value) return;
+  selectRow(next);
+  scrollToRow(next, "nearest");
+}
+
+// Shift+PageUp / Shift+PageDown: extend the multi-selection by one page from
+// the anchor — mirrors Shift+Arrow but with the viewport page as the unit.
+function extendPage(delta) {
+  const list = displayedEntries.value;
+  if (list.length === 0) return;
+  if (activeIndex.value === -1) { selectRow(0); return; }
+  const step = pageSize() * (delta > 0 ? 1 : -1);
+  let next = activeIndex.value + step;
+  if (next < 0) next = 0;
+  if (next > list.length - 1) next = list.length - 1;
+  if (next === activeIndex.value) return;
+  if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value;
+  const a = Math.min(anchorIndex.value, next);
+  const b = Math.max(anchorIndex.value, next);
+  const set = new Set();
+  for (let i = a; i <= b; i++) set.add(i);
+  selectedIndices.value = set;
+  activeIndex.value = next;
+  emitSelection();
+  scrollToRow(next, "nearest");
 }
 
 function onDoubleClick(entry) {
@@ -651,6 +741,14 @@ function onKeydown(e) {
     e.preventDefault();
     if (e.shiftKey) extendSelection(-1);
     else moveSelection(-1);
+  } else if (e.key === "PageDown") {
+    e.preventDefault();
+    if (e.shiftKey) extendPage(1);
+    else movePage(1);
+  } else if (e.key === "PageUp") {
+    e.preventDefault();
+    if (e.shiftKey) extendPage(-1);
+    else movePage(-1);
   } else if (e.key === "Home") {
     e.preventDefault();
     if (e.shiftKey) {
@@ -700,12 +798,6 @@ function onKeydown(e) {
       if (entry && entry.is_dir) {
         emit("calc-dir-size", entry.name);
       }
-    }
-  } else if (e.key === "Escape") {
-    // Cancel the current selection (when not searching).
-    if (!isSearching.value) {
-      e.preventDefault();
-      clearSelection();
     }
   } else if (e.key === "Delete") {
     e.preventDefault();
@@ -760,7 +852,6 @@ function isArchiveName(name) {
 }
 
 function getFileIcon(name) {
-  if (isArchiveName(name)) return "🗜️";
   const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "";
   const icons = {
     TXT: "📄",
@@ -810,7 +901,13 @@ function getFileIcon(name) {
     TS: "🎬",
     VOB: "🎬",
   };
-  return icons[ext] || "📄";
+  // Known explicit icons win over the generic archive glyph, so an ordinary
+  // program (.exe / .msi) shows a gear instead of a zip icon. Self-extracting
+  // .exe archives are rare, so we don't paint every .exe as a zip — only
+  // genuinely archive-like names fall back to 🗜️.
+  if (icons[ext]) return icons[ext];
+  if (isArchiveName(name)) return "🗜️";
+  return "📄";
 }
 
 // Restore a multi-selection by entry names after a directory re-list (e.g. a
@@ -836,7 +933,14 @@ function restoreByNames(names) {
   emitSelection();
 }
 
-defineExpose({ moveSelection, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry });
+// Shift keyboard focus onto the list container so arrow-key navigation works
+// immediately (e.g. right after a preview closes and the list regains
+// visibility). The container is the `tabindex="0"` .file-list div.
+function focusList() {
+  nextTick(() => { listContainer.value?.focus(); });
+}
+
+defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList });
 </script>
 
 <style scoped>
