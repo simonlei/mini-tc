@@ -2,20 +2,32 @@
   <div class="app" @mousemove="onDrag" @mouseup="endDrag">
     <!-- Menu bar -->
     <div class="menu-bar">
-      <div class="menu-item" @click="toggleThemeMenu">
-        <span>视图</span>
+      <div class="menu-item" @click="toggleConfigMenu">
+        <span>配置</span>
         <span class="menu-arrow">▾</span>
-        <div class="menu-dropdown" v-if="themeMenuOpen" @click.stop>
-          <div class="menu-dropdown-label">主题风格</div>
-          <div
-            v-for="t in themes"
-            :key="t.key"
-            class="menu-option"
-            :class="{ checked: currentTheme === t.key }"
-            @click="setTheme(t.key); themeMenuOpen = false"
-          >
-            <span class="check-mark">{{ currentTheme === t.key ? '✓' : '' }}</span>
-            <span>{{ t.name }}</span>
+        <div class="menu-dropdown" v-if="configMenuOpen" @click.stop>
+          <div class="menu-option submenu-trigger"
+            @mouseenter="themeSubmenuOpen = true"
+            @mouseleave="themeSubmenuOpen = false">
+            <span class="check-mark"></span>
+            <span>主题风格</span>
+            <span class="submenu-arrow">▸</span>
+            <div class="submenu-dropdown" v-if="themeSubmenuOpen" @mouseenter="themeSubmenuOpen = true" @mouseleave="themeSubmenuOpen = false">
+              <div
+                v-for="t in themes"
+                :key="t.key"
+                class="menu-option"
+                :class="{ checked: currentTheme === t.key }"
+                @click="setTheme(t.key); themeSubmenuOpen = false; configMenuOpen = false">
+                <span class="check-mark">{{ currentTheme === t.key ? '✓' : '' }}</span>
+                <span>{{ t.name }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="menu-separator"></div>
+          <div class="menu-option" @click="openSettings(); configMenuOpen = false">
+            <span class="check-mark"></span>
+            <span>文件预览设置</span>
           </div>
         </div>
       </div>
@@ -33,14 +45,11 @@
           </div>
         </div>
       </div>
-      <div class="menu-item" @click="openSettings">
-        <span>设置</span>
-      </div>
       <span class="update-status" v-if="updateStatus">{{ updateStatus }}</span>
     </div>
 
     <!-- Click-outside overlay -->
-    <div v-if="themeMenuOpen || helpMenuOpen" class="menu-overlay" @click="themeMenuOpen = false; helpMenuOpen = false"></div>
+    <div v-if="configMenuOpen || helpMenuOpen" class="menu-overlay" @click="configMenuOpen = false; helpMenuOpen = false"></div>
 
     <!-- Update dialog -->
     <div class="update-dialog-overlay" v-if="updateDialog.visible" @click="updateDialog.visible = false">
@@ -216,7 +225,8 @@ const themes = [
   { key: "forest", name: "墨竹青翠", label: "墨竹" },
 ];
 const currentTheme = ref("neon");
-const themeMenuOpen = ref(false);
+const configMenuOpen = ref(false);
+const themeSubmenuOpen = ref(false);
 const helpMenuOpen = ref(false);
 const updateStatus = ref("");
 
@@ -225,7 +235,7 @@ const settingsVisible = ref(false);
 
 function openSettings() {
   helpMenuOpen.value = false;
-  themeMenuOpen.value = false;
+  configMenuOpen.value = false;
   settingsVisible.value = true;
 }
 
@@ -260,13 +270,13 @@ function showAbout() {
   getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
 }
 
-function toggleThemeMenu() {
+function toggleConfigMenu() {
   helpMenuOpen.value = false;
-  themeMenuOpen.value = !themeMenuOpen.value;
+  configMenuOpen.value = !configMenuOpen.value;
 }
 
 function toggleHelpMenu() {
-  themeMenuOpen.value = false;
+  configMenuOpen.value = false;
   helpMenuOpen.value = !helpMenuOpen.value;
 }
 
@@ -1155,14 +1165,6 @@ onMounted(() => {
   padding: 4px 0;
 }
 
-.menu-dropdown-label {
-  font-size: 10px;
-  color: var(--text-dim);
-  padding: 2px 10px 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
 .menu-option {
   display: flex;
   align-items: center;
@@ -1178,10 +1180,42 @@ onMounted(() => {
   color: #fff;
 }
 
+.menu-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--border);
+}
+
 .check-mark {
   width: 14px;
   font-size: 12px;
   text-align: center;
+  flex-shrink: 0;
+}
+
+/* ── Cascading sub-menu ── */
+
+.submenu-trigger {
+  position: relative;
+}
+
+.submenu-arrow {
+  margin-left: auto;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.submenu-dropdown {
+  position: absolute;
+  top: -4px;
+  left: 100%;
+  min-width: 140px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 101;
+  padding: 4px 0;
 }
 
 .menu-overlay {
