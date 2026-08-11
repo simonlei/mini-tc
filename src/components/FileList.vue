@@ -10,6 +10,10 @@
         Size
         <span class="sort-arrow" v-if="sortColumn === 'size'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
       </div>
+      <div class="col-type sortable" @click="$emit('sort', 'type')">
+        Type
+        <span class="sort-arrow" v-if="sortColumn === 'type'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+      </div>
       <div class="col-modified sortable" @click="$emit('sort', 'modified')">
         Modified
         <span class="sort-arrow" v-if="sortColumn === 'modified'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
@@ -47,6 +51,7 @@
       >
         <div class="col-name"><span class="file-icon folder-icon">📁</span>..</div>
         <div class="col-size"></div>
+        <div class="col-type"></div>
         <div class="col-modified"></div>
       </div>
 
@@ -90,6 +95,7 @@
           </template>
           <template v-else>{{ formatSize(entry.size) }}</template>
         </div>
+        <div class="col-type">{{ entry.is_dir ? "" : entry.extension }}</div>
         <div class="col-modified">{{ formatDate(entry.modified) }}</div>
       </div>
 
@@ -227,6 +233,9 @@ const sortedEntries = computed(() => {
     } else if (col === "size") {
       cmp = a.size - b.size;
       // For size sort, directories go first regardless
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    } else if (col === "type") {
+      cmp = a.extension.localeCompare(b.extension, undefined, { sensitivity: "base" });
       if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
     } else if (col === "modified") {
       cmp = a.modified - b.modified;
@@ -1048,6 +1057,10 @@ defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSel
 .col-size {
   width: 80px;
   text-align: right;
+}
+
+.col-type {
+  width: 60px;
 }
 
 .col-modified {
