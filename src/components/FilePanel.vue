@@ -142,6 +142,10 @@ const pendingSelectName = ref(null);
 // for inactive tabs after the active one loads.
 const tabCache = ref({});
 let preloaded = false;
+// Tracks in-flight `loadDirectory` calls keyed by `${tabId}:${path}` so two
+// watchers firing on the same tab switch (the path watcher + the active-tab
+// watcher) collapse into a single backend request.
+const inFlightLoads = new Set();
 
 // Discovered external extraction tools (filled on mount).
 const archiveTools = ref([]);
@@ -266,7 +270,8 @@ function refreshDrives() {
 
 // Reload when active tab path changes. If this tab's listing is already cached
 // (e.g. it was background-preloaded, or we're returning to a previously visited
-// tab), apply it instantly with no "Loading…" flash.
+// tab), apply it instantly with no "Loading…" flash, then refresh it in the
+// background so a tab switch never leaves a stale listing behind.
 watch(
   () => activeTab.value?.path,
   (newPath) => {
@@ -276,11 +281,33 @@ watch(
     if (cached && cached.path === newPath) {
       entries.value = cached.entries;
       hasParent.value = cached.hasParent;
+      // Silent background refresh: keep the cached listing on screen (no
+      // "Loading…" flash) while fetching the current contents.
+      loadDirectory(newPath, tab.id, { silent: true });
     } else {
       loadDirectory(newPath, tab.id);
     }
   }
 );
+
+// Whenever the active tab changes (including switches to a tab whose path is
+// identical to the previous one — a case the path watcher above does NOT fire
+// for), refresh the drive free-space readout shown in the PathBar dropdown and
+// force a fresh file listing for the now-active tab. This guarantees the drive
+// capacity figures and the file list stay current after the user has been
+// doing work in another tab or panel. The path watcher handles the visible
+// path-change case; loadDirectory's in-flight guard collapses any duplicate
+// request into one backend call.
+watch(activeTabId, (newId) => {
+  if (!newId) return;
+  refreshDrives();
+  const tab = tabs.value.find((t) => t.id === newId);
+  if (tab) {
+    // Drop the cache so this switch always re-fetches from disk (no stale view).
+    if (tabCache.value[newId]) delete tabCache.value[newId];
+    loadDirectory(tab.path, newId, { silent: true });
+  }
+});
 
 // ── Tab management ──
 
@@ -330,9 +357,19 @@ function switchTab(id) {
 // never touches the visible UI / loading flag — this is what makes tab switches
 // instant. `hasParent` now comes straight from `list_directory`, eliminating a
 // second round-trip per load.
-async function loadDirectory(path, tabId = activeTabId.value) {
+// `opts.silent` (used for tab-switch refreshes) skips the "Loading…" flash and
+// selection/error reset: the previous listing stays on screen until the fresh
+// one arrives, so a switch feels instant yet always shows current contents.
+async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
+  const silent = !!opts.silent;
   const isActive = tabId === activeTabId.value;
-  if (isActive) {
+  const key = `${tabId}:${path}`;
+  // Collapse duplicate in-flight loads (e.g. a tab switch that triggers both the
+  // path watcher and the active-tab watcher) into a single backend request.
+  if (inFlightLoads.has(key)) return;
+  inFlightLoads.add(key);
+
+  if (isActive && !silent) {
     loading.value = true;
     error.value = "";
     selectedEntry.value = null;
@@ -356,13 +393,18 @@ async function loadDirectory(path, tabId = activeTabId.value) {
   } catch (e) {
     // Don't cache a failed load — allow a retry on the next switch/refresh.
     if (tabCache.value[tabId]) delete tabCache.value[tabId];
-    if (isActive) {
+    if (isActive && !silent) {
       error.value = String(e);
       entries.value = [];
       hasParent.value = false;
+    } else if (isActive && silent) {
+      // Background refresh failed: keep the existing listing on screen rather
+      // than wiping it; just log so the failure isn't invisible.
+      console.warn("Background refresh failed:", e);
     }
   } finally {
-    if (isActive) loading.value = false;
+    inFlightLoads.delete(key);
+    if (isActive && !silent) loading.value = false;
   }
 }
 
