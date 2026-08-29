@@ -1049,7 +1049,13 @@ function onRowDragEnd() {
 }
 
 function onDragOver(e) {
-  if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("application/x-minitc-move")) return;
+  // Decide whether this is our own internal drag using the module-level
+  // dragState singleton (set on dragstart) — NOT e.dataTransfer.types. Custom
+  // MIME types are not reliably readable during dragover (some browsers hide
+  // them for privacy), and if that check fails we'd skip preventDefault() and
+  // the cursor would show the "forbidden" no-drop icon for the whole drag.
+  if (!dragState.sourceNames || dragState.sourceNames.length === 0) return;
+  if (!e.dataTransfer) return;
   const target = resolveDropTarget(e.target);
   if (!target) return; // file row → not a drop target
   e.preventDefault();
@@ -1076,7 +1082,9 @@ function parentDirOf(p) {
 }
 
 async function onDrop(e) {
-  if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("application/x-minitc-move")) return;
+  // Same reasoning as onDragOver: rely on dragState, not dataTransfer.types.
+  if (!dragState.sourceNames || dragState.sourceNames.length === 0) return;
+  if (!e.dataTransfer) return;
   e.preventDefault();
   const target = resolveDropTarget(e.target);
   clearDragHighlight();
