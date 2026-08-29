@@ -72,7 +72,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deleteWithAdmin, renameFile, openFile, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -639,6 +639,8 @@ function closeCtxMenu() {
 function buildMenuItems(entry) {
   const items = [];
   if (!entry) {
+    items.push({ label: "新建目录", action: "new-folder" });
+    items.push({ separator: true });
     items.push({ label: "刷新", action: "refresh" });
     return items;
   }
@@ -734,6 +736,9 @@ async function handleCtxSelect(item) {
     case "refresh":
       refresh();
       break;
+    case "new-folder":
+      await doNewFolder();
+      break;
     case "rename":
       fileListRef.value?.startRenameByEntry?.(entry);
       break;
@@ -743,6 +748,41 @@ async function handleCtxSelect(item) {
     case "add-to-archive":
       await doAddToArchive();
       break;
+  }
+}
+
+// Compute a non-colliding name for a new folder in the current directory,
+// matching Explorer: "新建文件夹", then "新建文件夹 (2)", "新建文件夹 (3)"…
+function uniqueNewFolderName() {
+  const existing = new Set(entries.value.map((e) => e.name));
+  const base = "新建文件夹";
+  if (!existing.has(base)) return base;
+  let i = 2;
+  while (existing.has(`${base} (${i})`)) i++;
+  return `${base} (${i})`;
+}
+
+// Create a new empty directory in the current directory (triggered by the
+// right-click "新建目录" menu item). After creation we refresh the listing and
+// immediately drop the new folder into inline-rename, mirroring Explorer's
+// "create + edit name" flow.
+async function doNewFolder() {
+  const path = activeTab.value?.path;
+  if (!path) return;
+  const name = uniqueNewFolderName();
+  const full = await joinPath(path, name);
+  try {
+    await createDirectory(full);
+    // Pre-select by name so the watch in FileList lands the caret on it, then
+    // enter inline rename once the refreshed listing includes the new folder.
+    pendingSelectName.value = name;
+    await refresh();
+    const entry = entries.value.find((e) => e.name === name);
+    if (entry) {
+      fileListRef.value?.startRenameByEntry?.(entry);
+    }
+  } catch (e) {
+    showToast("新建目录失败：" + String(e), "error");
   }
 }
 

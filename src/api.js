@@ -62,6 +62,12 @@ export async function openFile(path) {
   return invoke("open_file", { path });
 }
 
+/// Create an empty directory at `path` (one level only; refuses to overwrite
+/// an existing path). Used by the context-menu "新建目录" action.
+export async function createDirectory(path) {
+  return invoke("create_directory", { path });
+}
+
 /// Copy the given source paths into destDir.
 /// `overwrite` = true replaces same-named destinations; false skips them.
 /// Resolves to { errors: string[], skipped: number } (never throws for

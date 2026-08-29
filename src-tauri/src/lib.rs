@@ -601,6 +601,24 @@ fn rename_file(old_path: String, new_name: String) -> Result<(), String> {
     fs::rename(old, &new_path).map_err(|e| format!("Failed to rename: {}", e))
 }
 
+/// Create an empty directory at `path`. Creates exactly ONE level (the named
+/// directory) — never intermediate parents — and refuses to overwrite an
+/// existing path. Returns an error string on failure (e.g. a same-named entry
+/// already exists, or the parent directory does not exist).
+#[tauri::command]
+fn create_directory(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if p.exists() {
+        return Err(format!("路径已存在: {}", path));
+    }
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(format!("父目录不存在: {}", parent.display()));
+        }
+    }
+    fs::create_dir(p).map_err(|e| format!("创建目录失败: {}", e))
+}
+
 /// Payload streamed to the frontend during a copy/move so it can render a
 /// progress bar. `copied_bytes` / `total_bytes` drive the bar; `current_name`
 /// shows which file is currently being copied.
@@ -2200,6 +2218,7 @@ pub fn run() {
             delete_to_trash,
             delete_with_admin,
             rename_file,
+            create_directory,
             open_file,
             copy_items,
             move_items,
