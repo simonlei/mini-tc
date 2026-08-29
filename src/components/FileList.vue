@@ -46,6 +46,7 @@
       ref="entriesContainer"
       @click="onEntriesClick"
       @contextmenu.prevent="onEntriesContextMenu"
+      @dragenter="onDragEnter"
       @dragover="onDragOver"
       @dragleave="onDragLeave"
       @drop="onDrop"
@@ -1031,7 +1032,11 @@ function onRowDragStart(e, index) {
   }
   dragState.sourceNames = names;
   dragState.sourcePath = props.path;
-  e.dataTransfer.effectAllowed = "move";
+  // "all" keeps the drag maximally permissive; the actual cursor is narrowed to
+  // "move" via dropEffect in onDragEnter/onDragOver. Using "all" here avoids any
+  // effectAllowed/dropEffect mismatch that could otherwise force the forbidden
+  // cursor even after preventDefault().
+  e.dataTransfer.effectAllowed = "all";
   // Custom type marks this as an internal file move (used by dragover to decide
   // whether to allow a drop); a text payload is set as a fallback so the drag is
   // recognised by the browser at all.
@@ -1048,19 +1053,38 @@ function onRowDragEnd() {
   clearDragState();
 }
 
-function onDragOver(e) {
-  // Decide whether this is our own internal drag using the module-level
-  // dragState singleton (set on dragstart) — NOT e.dataTransfer.types. Custom
-  // MIME types are not reliably readable during dragover (some browsers hide
-  // them for privacy), and if that check fails we'd skip preventDefault() and
-  // the cursor would show the "forbidden" no-drop icon for the whole drag.
-  if (!dragState.sourceNames || dragState.sourceNames.length === 0) return;
-  if (!e.dataTransfer) return;
-  const target = resolveDropTarget(e.target);
-  if (!target) return; // file row → not a drop target
+// Whether the in-progress drag is one of our own internal file moves.
+// Primary signal: the dragState singleton set on dragstart. Fallback: our
+// dragstart always writes a text/plain payload, which is readable here even if
+// dragState somehow ended up empty — this prevents us from skipping
+// preventDefault() (which would leave the forbidden no-drop cursor up).
+function isOurDrag(e) {
+  if (dragState.sourceNames && dragState.sourceNames.length > 0) return true;
+  try {
+    return !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("text/plain"));
+  } catch {
+    return false;
+  }
+}
+
+function onDragEnter(e) {
+  // Some engines (Firefox, and as a safety net WebView2) only flip the drop
+  // cursor to "allowed" if BOTH dragenter and dragover call preventDefault().
+  if (!isOurDrag(e) || !e.dataTransfer) return;
   e.preventDefault();
   e.dataTransfer.dropEffect = "move";
+}
+
+function onDragOver(e) {
+  if (!isOurDrag(e) || !e.dataTransfer) return;
+  // MUST call preventDefault() for the cursor to switch away from "forbidden".
+  // Do this before resolving the target so a valid internal drag is always
+  // accepted (highlight is applied afterwards based on the resolved target).
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  const target = resolveDropTarget(e.target);
   clearDragHighlight();
+  if (!target) return; // file row → not a drop target (cursor stays neutral)
   if (target.type === "dir") dragOverIndex.value = target.index;
   else if (target.type === "parent") dragOverParent.value = true;
   else dragOverEmpty.value = true;
