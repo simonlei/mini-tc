@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tauri::Emitter;
 
 #[cfg(windows)]
@@ -646,6 +646,96 @@ fn same_path(a: &Path, b: &Path) -> bool {
     false
 }
 
+/// Component list used as a fallback when `canonicalize()` is unavailable (one
+/// side does not exist yet). The drive/UNC prefix is kept so that identical
+/// folder names on different volumes (`C:\x\a` vs `D:\x\a`) never compare as
+/// equal. Names are lowercased on Windows (case-insensitive filesystem).
+fn path_key(p: &Path) -> Vec<String> {
+    let norm = |s: &std::ffi::OsStr| -> String {
+        let s = s.to_string_lossy().to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    p.components()
+        .filter_map(|c| match c {
+            Component::Prefix(p) => Some(norm(p.as_os_str())),
+            Component::RootDir => Some(String::from("/")),
+            // `.` is a no-op for locating a path; `..` is kept verbatim (it
+            // only appears here when canonicalization failed, i.e. the path
+            // does not exist, so it can never match a real ancestor).
+            Component::CurDir => None,
+            Component::ParentDir => Some(String::from("..")),
+            Component::Normal(s) => Some(norm(s)),
+        })
+        .collect()
+}
+
+/// Returns true when `ancestor` is the same path as `p` or one of its parent
+/// directories. Compares canonicalized paths first (resolves case, `.`/`..`
+/// and symlinks), falling back to a component-wise comparison.
+fn is_ancestor_or_same(ancestor: &Path, p: &Path) -> bool {
+    match (ancestor.canonicalize(), p.canonicalize()) {
+        (Ok(a), Ok(b)) => b.starts_with(&a),
+        _ => {
+            let ka = path_key(ancestor);
+            let kb = path_key(p);
+            !ka.is_empty() && kb.len() >= ka.len() && kb[..ka.len()] == ka[..]
+        }
+    }
+}
+
+/// Refuse any copy/move where source and destination overlap. Two shapes are
+/// fatal and must never reach the filesystem:
+/// - `dest_item` is an ancestor of `src`: deleting the destination to overwrite
+///   it would delete the source along with it (e.g. moving `root/a/a` into
+///   `root/` targets `root/a`, which *contains* the source) — data loss.
+/// - `src` is an ancestor of `dest_item`: it would nest a directory inside
+///   itself (e.g. moving `root/a` into `root/a/b`).
+fn check_no_overlap(src: &Path, dest_item: &Path) -> Result<(), String> {
+    if is_ancestor_or_same(dest_item, src) {
+        return Result::Err(format!(
+            "拒绝操作：目标 {} 是源 {} 的父目录（或同一目录），覆盖会删除源本身",
+            dest_item.display(),
+            src.display()
+        ));
+    }
+    if is_ancestor_or_same(src, dest_item) {
+        return Result::Err(format!(
+            "拒绝操作：目标 {} 位于源 {} 内部，不能把目录放进自身",
+            dest_item.display(),
+            src.display()
+        ));
+    }
+    Result::Ok(())
+}
+
+/// Remove `dest_item` so it can be replaced by `src`. Refuses (and reports)
+/// anything that would make the source disappear: overlapping paths, a source
+/// that is already gone, or a source lost while removing the target.
+fn remove_target_for_overwrite(src: &Path, dest_item: &Path) -> Result<(), String> {
+    check_no_overlap(src, dest_item)?;
+    if !src.exists() {
+        return Result::Err(format!("源已不存在，中止覆盖: {}", src.display()));
+    }
+    // Snapshot the source before deleting anything, so we can prove afterwards
+    // that removing the target did not take the source with it.
+    let src_abs = src.canonicalize().ok();
+    if let Err(e) = remove_recursive(dest_item) {
+        return Result::Err(format!("无法覆盖 {}: {}", dest_item.display(), e));
+    }
+    let alive = match &src_abs {
+        Some(abs) => abs.exists(),
+        None => src.exists(),
+    };
+    if !alive {
+        return Result::Err(format!("源在覆盖过程中丢失，已中止: {}", src.display()));
+    }
+    Result::Ok(())
+}
+
 /// Walk a single source (file or directory) and append every file (with its
 /// destination path and byte size) plus every directory (size 0) to `tasks`.
 fn collect_copy_tasks(src: &Path, dest: &Path, tasks: &mut Vec<(PathBuf, PathBuf, u64)>) {
@@ -778,11 +868,18 @@ fn copy_all(
         if dest_item.exists() && same_path(src, &dest_item) {
             continue;
         }
+        // Never let a copy overlap itself: overwriting `dest_item` must not
+        // delete `src` (which can happen when the source lives inside the
+        // target directory, e.g. copying `root/a/a` into `root/`).
+        if let Err(e) = check_no_overlap(src, &dest_item) {
+            errors.push(e);
+            continue;
+        }
         if dest_item.exists() {
             if overwrite {
                 // Remove the existing target so the copy replaces it.
-                if let Err(e) = remove_recursive(&dest_item) {
-                    errors.push(format!("无法覆盖 {}: {}", name, e));
+                if let Err(e) = remove_target_for_overwrite(src, &dest_item) {
+                    errors.push(e);
                     continue;
                 }
             } else {
@@ -806,8 +903,10 @@ fn copy_all(
         }
         if dest.exists() {
             if overwrite {
-                if let Err(e) = remove_recursive(dest) {
-                    errors.push(format!("无法覆盖 {}: {}", dest.display(), e));
+                // Same overlap guard as the top level, for nested conflicts
+                // inside a copied directory tree.
+                if let Err(e) = remove_target_for_overwrite(src, dest) {
+                    errors.push(e);
                     continue;
                 }
             } else {
@@ -913,10 +1012,17 @@ fn move_items(
             skipped += 1;
             continue;
         }
+        // Refuse overlap in both directions: target containing the source
+        // (overwrite would delete the source) and target inside the source
+        // (would nest a directory within itself).
+        if let Err(e) = check_no_overlap(src_path, &dest_item) {
+            errors.push(e);
+            continue;
+        }
         if dest_item.exists() {
             if overwrite {
-                if let Err(e) = remove_recursive(&dest_item) {
-                    errors.push(format!("无法覆盖 {}: {}", name, e));
+                if let Err(e) = remove_target_for_overwrite(src_path, &dest_item) {
+                    errors.push(e);
                     continue;
                 }
             } else {
@@ -935,14 +1041,22 @@ fn move_items(
     if !cross_volume.is_empty() {
         let mut cv_skipped = 0;
         let copy_errors = copy_all(&app, &cross_volume, dest_path, overwrite, &mut cv_skipped);
+        let copy_failed = !copy_errors.is_empty();
         errors.extend(copy_errors);
         skipped += cv_skipped;
-        for src_path in &cross_volume {
-            let name = src_path.file_name().unwrap().to_string_lossy().to_string();
-            let dest_item = dest_path.join(&name);
-            if dest_item.exists() {
-                if let Err(e) = remove_recursive(src_path) {
-                    errors.push(format!("删除源失败 {}: {}", name, e));
+        // Only delete the sources when the copy reported no error at all. A
+        // partial copy followed by a source delete is unrecoverable data loss,
+        // so on any failure we keep the source and let the user retry.
+        if copy_failed {
+            errors.push("复制未完成，已保留源文件（未删除源以避免数据丢失）".to_string());
+        } else {
+            for src_path in &cross_volume {
+                let name = src_path.file_name().unwrap().to_string_lossy().to_string();
+                let dest_item = dest_path.join(&name);
+                if dest_item.exists() {
+                    if let Err(e) = remove_recursive(src_path) {
+                        errors.push(format!("删除源失败 {}: {}", name, e));
+                    }
                 }
             }
         }
@@ -1808,9 +1922,7 @@ fn extract_archive(
             // survives paths containing spaces as a single argument. The `-y`
             // (auto-confirm) flag is omitted for GUI tools so 7zFM pops its
             // interactive window and lets the user set the password / target.
-            cmd.arg("x")
-                .arg(&archive)
-                .arg(format!("-o{}", target_str));
+            cmd.arg("x").arg(&archive).arg(format!("-o{}", target_str));
             if !syntax.ends_with("-gui") {
                 cmd.arg("-y");
             }
@@ -1823,7 +1935,11 @@ fn extract_archive(
     // use this path; the extraction arguments were already built above per
     // syntax. We spawn without waiting or checking the exit code.
     if syntax == "7z-gui" || syntax == "winrar-gui" {
-        let gui_name = if syntax == "winrar-gui" { "WinRAR" } else { "7-Zip" };
+        let gui_name = if syntax == "winrar-gui" {
+            "WinRAR"
+        } else {
+            "7-Zip"
+        };
         match cmd.spawn() {
             Ok(_) => {
                 return Ok(ExtractResult {
