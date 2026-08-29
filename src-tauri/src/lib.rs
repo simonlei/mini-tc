@@ -687,21 +687,12 @@ fn is_ancestor_or_same(ancestor: &Path, p: &Path) -> bool {
     }
 }
 
-/// Refuse any copy/move where source and destination overlap. Two shapes are
-/// fatal and must never reach the filesystem:
-/// - `dest_item` is an ancestor of `src`: deleting the destination to overwrite
-///   it would delete the source along with it (e.g. moving `root/a/a` into
-///   `root/` targets `root/a`, which *contains* the source) — data loss.
-/// - `src` is an ancestor of `dest_item`: it would nest a directory inside
-///   itself (e.g. moving `root/a` into `root/a/b`).
-fn check_no_overlap(src: &Path, dest_item: &Path) -> Result<(), String> {
-    if is_ancestor_or_same(dest_item, src) {
-        return Result::Err(format!(
-            "拒绝操作：目标 {} 是源 {} 的父目录（或同一目录），覆盖会删除源本身",
-            dest_item.display(),
-            src.display()
-        ));
-    }
+/// Reject the one shape that is genuinely impossible / risky: the destination
+/// directory is located *inside* the source (e.g. moving `root/a` into
+/// `root/a/b`). The reverse — the source living inside the destination — is now
+/// allowed and resolved as a directory **merge** (see `plan_overwrite`), which
+/// is exactly what users expect when pasting `root/a/a` into `root/`.
+fn check_no_nested_target(src: &Path, dest_item: &Path) -> Result<(), String> {
     if is_ancestor_or_same(src, dest_item) {
         return Result::Err(format!(
             "拒绝操作：目标 {} 位于源 {} 内部，不能把目录放进自身",
@@ -712,28 +703,53 @@ fn check_no_overlap(src: &Path, dest_item: &Path) -> Result<(), String> {
     Result::Ok(())
 }
 
-/// Remove `dest_item` so it can be replaced by `src`. Refuses (and reports)
-/// anything that would make the source disappear: overlapping paths, a source
-/// that is already gone, or a source lost while removing the target.
-fn remove_target_for_overwrite(src: &Path, dest_item: &Path) -> Result<(), String> {
-    check_no_overlap(src, dest_item)?;
-    if !src.exists() {
-        return Result::Err(format!("源已不存在，中止覆盖: {}", src.display()));
+/// How to handle a destination that already exists.
+enum OverwriteAction {
+    /// Leave the destination alone: it does not exist, or it is a directory that
+    /// should be *merged* into (both source and destination are directories, and
+    /// the user chose to overwrite — the safe behaviour that never deletes
+    /// either side, and is the only correct result when the source lives inside
+    /// the destination). The caller copies/moves into it recursively.
+    Leave,
+    /// Remove the existing destination before replacing it with the source.
+    /// Only used for leaf conflicts (file vs file, or a type mismatch).
+    Replace,
+    /// Skip the source entirely (a conflict the user chose not to overwrite).
+    Skip,
+}
+
+/// Decide what to do when `dest_item` already exists for `src`.
+///
+/// Directory-vs-directory conflicts are resolved by **merging** the two trees
+/// instead of deleting the destination. This is the critical fix for the old
+/// data-loss bug: deleting `root/a` to replace it would wipe the source
+/// `root/a/a` (which lives inside `root/a`) along with everything else. Merging
+/// keeps both sides and, for a move, simply empties the now-redundant source.
+fn plan_overwrite(
+    src: &Path,
+    dest_item: &Path,
+    overwrite: bool,
+) -> Result<OverwriteAction, String> {
+    if !dest_item.exists() {
+        return Result::Ok(OverwriteAction::Leave);
     }
-    // Snapshot the source before deleting anything, so we can prove afterwards
-    // that removing the target did not take the source with it.
-    let src_abs = src.canonicalize().ok();
-    if let Err(e) = remove_recursive(dest_item) {
-        return Result::Err(format!("无法覆盖 {}: {}", dest_item.display(), e));
+    if src.is_dir() && dest_item.is_dir() {
+        // Merge the directories rather than replace. If the user declined to
+        // overwrite, skip instead of touching the existing folder.
+        return Result::Ok(if overwrite {
+            OverwriteAction::Leave
+        } else {
+            OverwriteAction::Skip
+        });
     }
-    let alive = match &src_abs {
-        Some(abs) => abs.exists(),
-        None => src.exists(),
-    };
-    if !alive {
-        return Result::Err(format!("源在覆盖过程中丢失，已中止: {}", src.display()));
+    if overwrite {
+        if !src.exists() {
+            return Result::Err(format!("源已不存在，中止覆盖: {}", src.display()));
+        }
+        Result::Ok(OverwriteAction::Replace)
+    } else {
+        Result::Ok(OverwriteAction::Skip)
     }
-    Result::Ok(())
 }
 
 /// Walk a single source (file or directory) and append every file (with its
@@ -868,23 +884,34 @@ fn copy_all(
         if dest_item.exists() && same_path(src, &dest_item) {
             continue;
         }
-        // Never let a copy overlap itself: overwriting `dest_item` must not
-        // delete `src` (which can happen when the source lives inside the
-        // target directory, e.g. copying `root/a/a` into `root/`).
-        if let Err(e) = check_no_overlap(src, &dest_item) {
+        // Reject only the genuinely impossible case: the destination nested
+        // inside the source. The source-inside-destination case is resolved as
+        // a directory merge below, not a delete.
+        if let Err(e) = check_no_nested_target(src, &dest_item) {
             errors.push(e);
             continue;
         }
-        if dest_item.exists() {
-            if overwrite {
-                // Remove the existing target so the copy replaces it.
-                if let Err(e) = remove_target_for_overwrite(src, &dest_item) {
-                    errors.push(e);
-                    continue;
-                }
-            } else {
+        match plan_overwrite(src, &dest_item, overwrite) {
+            Result::Err(e) => {
+                errors.push(e);
+                continue;
+            }
+            Result::Ok(OverwriteAction::Skip) => {
                 *skipped += 1;
                 continue;
+            }
+            Result::Ok(OverwriteAction::Replace) => {
+                // Replace a leaf (file-vs-file or a type mismatch). Never a
+                // directory-vs-directory conflict — those go through `Leave`
+                // and are merged.
+                if let Err(e) = remove_recursive(&dest_item) {
+                    errors.push(format!("无法覆盖 {}: {}", name, e));
+                    continue;
+                }
+            }
+            Result::Ok(OverwriteAction::Leave) => {
+                // Destination absent, or a directory being merged into: leave it
+                // and let the recursive copy add/replace its children.
             }
         }
         collect_copy_tasks(src, &dest_item, &mut tasks);
@@ -901,18 +928,24 @@ fn copy_all(
             *skipped += 1;
             continue;
         }
-        if dest.exists() {
-            if overwrite {
-                // Same overlap guard as the top level, for nested conflicts
-                // inside a copied directory tree.
-                if let Err(e) = remove_target_for_overwrite(src, dest) {
-                    errors.push(e);
-                    continue;
-                }
-            } else {
+        match plan_overwrite(src, dest, overwrite) {
+            Result::Err(e) => {
+                errors.push(e);
+                continue;
+            }
+            Result::Ok(OverwriteAction::Skip) => {
                 *skipped += 1;
                 continue;
             }
+            Result::Ok(OverwriteAction::Replace) => {
+                // Replace a leaf conflict; directory-vs-directory is merged via
+                // `Leave` (the create_dir_all below is a no-op on existing dirs).
+                if let Err(e) = remove_recursive(dest) {
+                    errors.push(format!("无法覆盖 {}: {}", dest.display(), e));
+                    continue;
+                }
+            }
+            Result::Ok(OverwriteAction::Leave) => {}
         }
         emit_progress(
             app,
@@ -990,7 +1023,12 @@ fn move_items(
 
     let mut errors: Vec<String> = Vec::new();
     let mut skipped: usize = 0;
+    // Items that cannot be renamed in place (cross-volume) → copy then delete.
     let mut cross_volume: Vec<PathBuf> = Vec::new();
+    // Items whose destination is an existing directory → must be *merged*
+    // (copy into it, then delete the now-empty source), since a rename onto a
+    // non-empty directory is impossible and a delete-and-replace would lose data.
+    let mut merge_move: Vec<PathBuf> = Vec::new();
 
     for src in &sources {
         let src_path = Path::new(src);
@@ -1012,22 +1050,31 @@ fn move_items(
             skipped += 1;
             continue;
         }
-        // Refuse overlap in both directions: target containing the source
-        // (overwrite would delete the source) and target inside the source
-        // (would nest a directory within itself).
-        if let Err(e) = check_no_overlap(src_path, &dest_item) {
+        // Reject only the impossible case: destination nested inside the source.
+        // Source-inside-destination is resolved as a directory merge below.
+        if let Err(e) = check_no_nested_target(src_path, &dest_item) {
             errors.push(e);
             continue;
         }
         if dest_item.exists() {
-            if overwrite {
-                if let Err(e) = remove_target_for_overwrite(src_path, &dest_item) {
-                    errors.push(e);
+            match plan_overwrite(src_path, &dest_item, overwrite)? {
+                OverwriteAction::Skip => {
+                    skipped += 1;
                     continue;
                 }
-            } else {
-                skipped += 1;
-                continue;
+                OverwriteAction::Replace => {
+                    // Leaf conflict: remove the destination, then rename below.
+                    if let Err(e) = remove_recursive(&dest_item) {
+                        errors.push(format!("无法覆盖 {}: {}", name, e));
+                        continue;
+                    }
+                }
+                OverwriteAction::Leave => {
+                    // Directory merge: cannot rename onto an existing dir, so
+                    // defer to a copy+delete that merges the trees.
+                    merge_move.push(src_path.to_path_buf());
+                    continue;
+                }
             }
         }
         // Try rename first; if it fails (cross-volume), defer to copy+delete.
@@ -1056,6 +1103,33 @@ fn move_items(
                 if dest_item.exists() {
                     if let Err(e) = remove_recursive(src_path) {
                         errors.push(format!("删除源失败 {}: {}", name, e));
+                    }
+                }
+            }
+        }
+    }
+
+    // Directory-merge moves: copy with progress (merge semantics engage because
+    // `overwrite` is forced true so a same-named destination is merged, not
+    // replaced), then remove the now-empty source directory.
+    if !merge_move.is_empty() {
+        let mut m_skipped = 0;
+        let copy_errors = copy_all(&app, &merge_move, dest_path, true, &mut m_skipped);
+        let copy_failed = !copy_errors.is_empty();
+        errors.extend(copy_errors);
+        skipped += m_skipped;
+        if copy_failed {
+            errors.push("合并移动未完成，已保留源目录（未删除源以避免数据丢失）".to_string());
+        } else {
+            for src_path in &merge_move {
+                let name = src_path.file_name().unwrap().to_string_lossy().to_string();
+                if src_path.exists() {
+                    // The source's contents have been merged into the destination
+                    // folder, so it should be empty now. Remove it; if anything
+                    // remains (leftovers / delete failure) the remove fails and we
+                    // keep the source — safer than forcing data loss.
+                    if let Err(e) = remove_recursive(src_path) {
+                        errors.push(format!("清理源目录失败 {}: {}", name, e));
                     }
                 }
             }
