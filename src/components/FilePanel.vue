@@ -40,6 +40,7 @@
       @open="onOpen"
       @rename="onRename"
       @ctx-menu="onCtxMenu"
+      @drop-move="onDropMove"
       @pending-select-resolved="pendingSelectName = null"
     />
 
@@ -114,7 +115,7 @@ const props = defineProps({
   panelId: { type: String, required: true },
 });
 
-const emit = defineEmits(["activate", "open-video", "deleted"]);
+const emit = defineEmits(["activate", "open-video", "deleted", "drop-move"]);
 
 // Config name → ~/.minitc/tabs-<panelId>.json (unified cross-run store).
 const STORAGE_KEY = `tabs-${props.panelId}`;
@@ -886,6 +887,12 @@ function fallbackCopy(text, done) {
 
 // Expose selectedEntry and currentPath for parent access (preview feature)
 const fileListRef = ref(null);
+
+// Forward a drag-and-drop move request to the app, which owns `move_items` and
+// the two-panel refresh.
+function onDropMove(payload) {
+  emit("drop-move", payload);
+}
 
 defineExpose({
   selectedEntry,

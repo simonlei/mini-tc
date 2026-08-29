@@ -118,6 +118,7 @@
           @activate="onPanelActivate('left')"
           @open-video="openVideo"
           @deleted="onPanelDeleted"
+          @drop-move="onDropMove"
         />
       </div>
 
@@ -157,6 +158,7 @@
           @activate="onPanelActivate('right')"
           @open-video="openVideo"
           @deleted="onPanelDeleted"
+          @drop-move="onDropMove"
         />
       </div>
     </div>
@@ -689,18 +691,15 @@ async function pasteFromClipboard() {
 
 // Core paste logic (used for both copy and cut pastes sourced from the OS
 // clipboard). `operation` is 'copy' (keep source) or 'cut' (move, then
-// consume the clipboard).
-async function doPaste(operation, sources) {
+// consume the clipboard). `destDirOverride` lets a drag-and-drop move supply an
+// explicit destination (not necessarily the active panel).
+async function doPaste(operation, sources, destDirOverride) {
   pasteOperation.value = operation;
-  // Paste target = the currently active panel — i.e. the directory the user
-  // is currently focused on ("selected"). Ctrl+V drops into whatever folder
-  // the active panel is showing, so it lands in the directory you're looking
-  // at (matching the common expectation, and fixing the earlier bug where it
-  // went to the other panel's stale directory).
-  const targetPanel = getActivePanelRef();
-  const destDir = targetPanel?.currentPath;
+  // Paste target = the currently active panel (Ctrl+V) — i.e. the directory the
+  // user is currently focused on. A drag-drop move passes an explicit destDir.
+  const destDir = destDirOverride || getActivePanelRef()?.currentPath;
   if (!destDir) {
-    showToast("当前面板目录无效", "error");
+    showToast("目标目录无效", "error");
     return;
   }
 
@@ -784,6 +783,17 @@ async function doPaste(operation, sources) {
     progress.value.visible = false;
     if (unlisten) unlisten();
   }
+}
+
+// Drag-and-drop move: drop files onto a folder / ".." / empty area of a panel.
+// Reuses the paste pipeline (conflict prompt, progress bar, two-panel refresh)
+// with a 'cut' operation and the drop's explicit destination directory.
+async function doDropMove(sources, destDir) {
+  await doPaste("cut", sources, destDir);
+}
+
+function onDropMove({ sources, destDir }) {
+  doDropMove(sources, destDir);
 }
 
 // ── Toast feedback (success / error / info) ──

@@ -40,11 +40,23 @@
     </div>
 
     <!-- Scrollable file entries -->
-    <div class="file-entries" ref="entriesContainer" @click="onEntriesClick" @contextmenu.prevent="onEntriesContextMenu">
+    <div
+      class="file-entries"
+      :class="{ 'drag-over-empty': dragOverEmpty }"
+      ref="entriesContainer"
+      @click="onEntriesClick"
+      @contextmenu.prevent="onEntriesContextMenu"
+      @dragover="onDragOver"
+      @dragleave="onDragLeave"
+      @drop="onDrop"
+    >
       <!-- Parent dir entry (hidden only while an actual filter is active) -->
       <div
         v-if="hasParent && (!isSearching || searchQuery === '')"
         class="file-row parent-row"
+        :class="{ 'drag-over': dragOverParent }"
+        data-row-type="parent"
+        data-is-dir="true"
         @click="clearSelection"
         @dblclick="$emit('navigate-parent')"
         @contextmenu.prevent.stop="onRowContextMenu(null, $event)"
@@ -65,10 +77,18 @@
           'is-dir': entry.is_dir,
           'is-hidden': entry.is_hidden,
           'is-cut': cutSet.has(entry.name),
+          'drag-over': dragOverIndex === index,
         }"
+        draggable="true"
+        data-row-type="entry"
+        :data-index="index"
+        :data-name="entry.name"
+        :data-is-dir="entry.is_dir"
         @click="onRowClick(index, $event)"
         @dblclick="onDoubleClick(entry)"
         @contextmenu.prevent.stop="onRowContextMenu(index, $event, entry)"
+        @dragstart="onRowDragStart($event, index)"
+        @dragend="onRowDragEnd"
       >
         <div class="col-name">
           <span class="file-icon" :class="entry.is_dir ? 'folder-icon' : 'file-icon-' + entry.extension.toLowerCase()">
@@ -108,6 +128,8 @@
 
 <script setup>
 import { computed, ref, watch, nextTick } from "vue";
+import { joinPath, getParentDir } from "../api.js";
+import { dragState, clearDragState } from "../dragState.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -123,7 +145,7 @@ const props = defineProps({
   cutNames: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename", "drop-move"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -135,6 +157,14 @@ const activeIndex = ref(-1);
 const anchorIndex = ref(-1);
 
 const cutSet = computed(() => new Set(props.cutNames || []));
+
+// ── Drag-and-drop move state ──
+// dragOverIndex:  entry index currently hovered as a drop target (number) or -1.
+// dragOverParent: the ".." parent row is hovered.
+// dragOverEmpty:  the empty area of the list is hovered (drop → current dir).
+const dragOverIndex = ref(-1);
+const dragOverParent = ref(false);
+const dragOverEmpty = ref(false);
 
 const entriesContainer = ref(null);
 const listContainer = ref(null);
@@ -949,6 +979,127 @@ function focusList() {
   nextTick(() => { listContainer.value?.focus(); });
 }
 
+// ── Drag-and-drop move ──
+// Dragging a file/folder row onto a directory (or the ".." / empty area) moves
+// the dragged item(s) there. Multi-selection is honoured: dragging any selected
+// row drags the whole selection. Cross-panel drops are supported — the actual
+// move is delegated up to FilePanel → App (which owns `move_items` and the
+// two-panel refresh). This matches the "cut + paste into target" semantics.
+
+function clearDragHighlight() {
+  dragOverIndex.value = -1;
+  dragOverParent.value = false;
+  dragOverEmpty.value = false;
+}
+
+// Resolve where a drop would land from the DOM element under the cursor:
+//   { type: "dir",     name, index } → a directory row (move INTO it)
+//   { type: "parent" }                → the ".." row (move INTO parent dir)
+//   { type: "current" }               → empty list area (move INTO current dir)
+//   null                             → a file row (not a valid target → ignore)
+function resolveDropTarget(target) {
+  const rowEl = target && target.closest ? target.closest(".file-row") : null;
+  if (!rowEl) return { type: "current" };
+  const rt = rowEl.getAttribute("data-row-type");
+  if (rt === "parent") return { type: "parent" };
+  if (rt === "entry") {
+    if (rowEl.getAttribute("data-is-dir") === "true") {
+      return {
+        type: "dir",
+        name: rowEl.getAttribute("data-name"),
+        index: Number(rowEl.getAttribute("data-index")),
+      };
+    }
+    return null; // dropping onto a file → not allowed
+  }
+  return { type: "current" };
+}
+
+function onRowDragStart(e, index) {
+  // Build the set of source names: the whole multi-selection when the dragged
+  // row is part of it, otherwise just the dragged row.
+  let names;
+  if (selectedIndices.value.has(index)) {
+    names = getSelectedEntries().map((x) => x.name);
+  } else {
+    const entry = displayedEntries.value[index];
+    names = entry ? [entry.name] : [];
+  }
+  if (names.length === 0) {
+    e.preventDefault();
+    return;
+  }
+  dragState.sourceNames = names;
+  dragState.sourcePath = props.path;
+  e.dataTransfer.effectAllowed = "move";
+  // Custom type marks this as an internal file move (used by dragover to decide
+  // whether to allow a drop); a text payload is set as a fallback so the drag is
+  // recognised by the browser at all.
+  try {
+    e.dataTransfer.setData("application/x-minitc-move", "1");
+    e.dataTransfer.setData("text/plain", names.join("\n"));
+  } catch {
+    /* some browsers restrict setData; the drag still works via effectAllowed */
+  }
+}
+
+function onRowDragEnd() {
+  clearDragHighlight();
+  clearDragState();
+}
+
+function onDragOver(e) {
+  if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("application/x-minitc-move")) return;
+  const target = resolveDropTarget(e.target);
+  if (!target) return; // file row → not a drop target
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  clearDragHighlight();
+  if (target.type === "dir") dragOverIndex.value = target.index;
+  else if (target.type === "parent") dragOverParent.value = true;
+  else dragOverEmpty.value = true;
+}
+
+function onDragLeave(e) {
+  // Only clear when the pointer truly leaves the entries container (not when it
+  // moves onto a child row, which would otherwise flicker the highlight).
+  if (entriesContainer.value && e.relatedTarget && entriesContainer.value.contains(e.relatedTarget)) return;
+  clearDragHighlight();
+}
+
+// Normalised parent directory of a path (used to skip no-op moves where a source
+// is already directly inside the destination).
+function parentDirOf(p) {
+  const norm = p.replace(/\\/g, "/");
+  const i = norm.lastIndexOf("/");
+  return i <= 0 ? "" : norm.slice(0, i);
+}
+
+async function onDrop(e) {
+  if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("application/x-minitc-move")) return;
+  e.preventDefault();
+  const target = resolveDropTarget(e.target);
+  clearDragHighlight();
+  if (!target) return; // dropped on a file → ignore
+
+  const sources = await Promise.all(dragState.sourceNames.map((n) => joinPath(dragState.sourcePath, n)));
+  clearDragState();
+  if (sources.length === 0) return;
+
+  let destDir = null;
+  if (target.type === "dir") destDir = await joinPath(props.path, target.name);
+  else if (target.type === "parent") destDir = await getParentDir(props.path);
+  else destDir = props.path;
+  if (!destDir) return;
+
+  // Skip no-op moves (a source already sitting directly in the destination).
+  const normDest = destDir.replace(/\\/g, "/");
+  const filtered = sources.filter((s) => parentDirOf(s) !== normDest);
+  if (filtered.length === 0) return;
+
+  emit("drop-move", { sources: filtered, destDir });
+}
+
 defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList });
 </script>
 
@@ -1071,6 +1222,23 @@ defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSel
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+}
+
+/* Drop-target highlight while dragging a file/folder over the list. */
+.file-entries.drag-over-empty {
+  outline: 1px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--row-hover);
+}
+
+.file-row.drag-over {
+  background: var(--accent);
+  color: #fff;
+}
+
+.file-row.drag-over .file-icon,
+.file-row.drag-over .file-name {
+  color: #fff;
 }
 
 .file-row {
