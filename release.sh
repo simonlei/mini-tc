@@ -3,9 +3,11 @@
 # Mini TC - 发布脚本
 # 用法:
 #   ./release.sh v0.1.1        # 推送 main 并打标签，触发 GitHub Actions 构建
+#   ./release.sh               # 自动取当前最新版本，小版本号 +1 后发布
+#                              # (最新为 v0.1.6 时等同于 ./release.sh v0.1.7)
 #
 # 做的事:
-#   1. 校验版本号格式 (vX.Y.Z)
+#   1. 校验版本号格式 (vX.Y.Z)；未给版本号时自动推导下一个补丁版本
 #   2. 前置检查：工作区干净、github 远程存在
 #   3. 推送 main 到 github 远程
 #   4. 若标签已存在则先删除（本地+远端），再创建并推送 vX.Y.Z 标签 (触发 Release workflow)
@@ -17,14 +19,8 @@
 set -euo pipefail
 
 # ---- 参数校验 ----
-if [ $# -ne 1 ]; then
-  echo "用法: $0 vX.Y.Z   (例: $0 v0.1.1)"
-  exit 1
-fi
-
-TAG="$1"
-if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "ERROR: 版本号格式应为 vX.Y.Z (例: v0.1.1)，收到: $TAG"
+if [ $# -gt 1 ]; then
+  echo "用法: $0 [vX.Y.Z]   (例: $0 v0.1.1；不带参数则自动 +1 小版本)"
   exit 1
 fi
 
@@ -42,6 +38,30 @@ REMOTE="github"
 if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   echo "ERROR: 未找到名为 '$REMOTE' 的远程，请检查 git remote -v"
   exit 1
+fi
+
+if [ $# -eq 1 ]; then
+  TAG="$1"
+  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: 版本号格式应为 vX.Y.Z (例: v0.1.1)，收到: $TAG"
+    exit 1
+  fi
+else
+  # 不带参数：取本地 + 远端标签里最大的 vX.Y.Z，小版本号 +1
+  LATEST="$(
+    {
+      git tag -l 'v[0-9]*.[0-9]*.[0-9]*'
+      git ls-remote --tags "$REMOTE" 'refs/tags/v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null \
+        | sed -e 's#.*refs/tags/##' -e '/\^{}$/d'
+    } | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+  )"
+  if [ -z "$LATEST" ]; then
+    echo "ERROR: 未找到任何 vX.Y.Z 标签，请显式指定版本号：$0 v0.1.0"
+    exit 1
+  fi
+  IFS='.' read -r MAJOR MINOR PATCH <<<"${LATEST#v}"
+  TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+  echo "==> 当前最新版本 $LATEST，自动发布下一版本 $TAG"
 fi
 
 echo "==> 发布 $TAG"
