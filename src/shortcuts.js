@@ -65,7 +65,7 @@ export const COMMANDS = [
   { id: "list.delete", scope: "fileList", label: "删除", desc: "移入回收站", defaults: ["Delete", "Ctrl+Backspace", "Meta+Backspace"] },
   // Combos are stored in canonical form: Ctrl, Alt, Shift, Meta — so the
   // Meta (Cmd) variant is "Shift+Meta+Backspace", not "Meta+Shift+Backspace".
-  { id: "list.deletePermanent", scope: "fileList", label: "永久删除", desc: "不经过回收站，确认后直接抹除", defaults: ["Shift+Delete", "Ctrl+Shift+Backspace", "Shift+Meta+Backspace"] },
+  { id: "list.deletePermanent", scope: "fileList", label: "永久删除", desc: "不经过回收站，直接抹除（不可恢复）", defaults: ["Shift+Delete", "Ctrl+Shift+Backspace", "Shift+Meta+Backspace"] },
   { id: "list.rename", scope: "fileList", label: "重命名", defaults: ["F2"] },
 
   // ── 视频播放 ──
