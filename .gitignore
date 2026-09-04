@@ -38,3 +38,6 @@ scripts/cargo-check.log
 src-tauri/target-check/
 
 .agent
+
+# Temp commit-message file (git commit -F .commitmsg)
+.commitmsg
