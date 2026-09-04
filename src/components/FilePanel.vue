@@ -571,6 +571,9 @@ async function onDelete(targets, opts = {}) {
     const next = { ...dirSizes.value };
     successNames.forEach((n) => delete next[n]);
     dirSizes.value = next;
+    // Free space on the drive changed (trash or permanent delete), so refresh
+    // the capacity readout shown in the PathBar drive dropdown.
+    refreshDrives();
   }
 
   // 通知父组件删除结果（含本面板剩余条目数），供「预览中删光目录 → 自动退出预览」联动。
@@ -605,6 +608,7 @@ async function onDelete(targets, opts = {}) {
       refresh().then(() => {
         emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
       });
+      refreshDrives();
     }, 2000);
   }
 }
