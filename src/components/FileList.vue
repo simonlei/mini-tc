@@ -709,7 +709,8 @@ function onRenameBlur(e) {
 
 // Emit a "delete" event for the current selection (or the active row when
 // nothing is explicitly selected). Shared by the Delete key and Cmd/Ctrl+Backspace.
-function deleteSelected() {
+// `permanent` (Shift+Delete) asks the panel to skip the recycle bin.
+function deleteSelected({ permanent = false } = {}) {
   const list = displayedEntries.value;
   const targets = getSelectedEntries();
   if (targets.length === 0 && activeIndex.value >= 0) {
@@ -728,7 +729,7 @@ function deleteSelected() {
     }
   }
   if (pendingName) pendingSelectName.value = pendingName;
-  emit("delete", targets);
+  emit("delete", targets, { permanent });
 }
 
 // All file-list keys are user-configurable (配置 → 快捷键设置, "文件列表"
@@ -752,6 +753,17 @@ function onKeydown(e) {
     e.preventDefault();
     markHandled(e);
     startSearch();
+    return;
+  }
+
+  // Permanent delete: Shift+Delete (and Shift+Cmd/Ctrl+Backspace on macOS,
+  // which has no forward-Delete key). Bypasses the recycle bin — the panel
+  // asks for confirmation first. Checked before plain Delete; `matches()`
+  // requires an exact modifier match, so the two never both fire.
+  if (matches("list.deletePermanent", e)) {
+    e.preventDefault();
+    markHandled(e);
+    deleteSelected({ permanent: true });
     return;
   }
 

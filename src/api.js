@@ -43,6 +43,14 @@ export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
 
+/// Delete a file or directory outright — no recycle bin, unrecoverable.
+/// Directories are removed recursively. Rejects with a `DeleteError`
+/// ({ kind, message }); `kind` is "permission_denied" when the caller should
+/// offer the elevated (`deleteWithAdmin`) retry.
+export async function deletePermanently(path) {
+  return invoke("delete_permanently", { path });
+}
+
 /// Delete a path with administrator privileges (Windows only). Uses an
 /// elevated PowerShell (ShellExecuteW "runas") to run Remove-Item -Recurse
 /// -Force, bypassing the recycle bin. Returns immediately after the elevated

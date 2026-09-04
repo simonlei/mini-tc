@@ -506,6 +506,93 @@ fn delete_to_trash(path: String) -> Result<(), DeleteError> {
     Ok(())
 }
 
+/// Recursively clear the read-only attribute inside `path` (Windows refuses to
+/// delete read-only files, and `remove_dir_all` aborts on the first one).
+/// Errors are swallowed on purpose: if the attribute can't be cleared, the
+/// subsequent delete reports the real problem.
+fn clear_readonly_recursive(path: &Path) {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    // Never descend into symlinks / reparse points — the delete below removes
+    // the link itself, not its target.
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(path, perms);
+    }
+    if meta.is_dir() {
+        if let Ok(rd) = fs::read_dir(path) {
+            for child in rd.flatten() {
+                clear_readonly_recursive(&child.path());
+            }
+        }
+    }
+}
+
+/// Delete a file or directory WITHOUT going through the recycle bin — the
+/// counterpart of `delete_to_trash`, bound to Shift+Delete in the UI.
+/// Directories are removed recursively (`remove_dir_all`). Returns the same
+/// structured `DeleteError` as `delete_to_trash`, so the frontend can offer the
+/// elevated (`delete_with_admin`) retry path on permission failures.
+#[tauri::command]
+fn delete_permanently(path: String) -> Result<(), DeleteError> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(DeleteError {
+            kind: "not_found".to_string(),
+            message: format!("路径不存在: {}", path),
+        });
+    }
+
+    // Read-only files would abort the delete (and a whole directory tree on
+    // Windows), so drop the attribute first.
+    clear_readonly_recursive(p);
+
+    // Decide file vs directory from the link itself: a symlink pointing at a
+    // directory must be unlinked as a link, not traversed.
+    let meta = match fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(DeleteError {
+                kind: "other".to_string(),
+                message: format!("无法读取属性: {}", e),
+            })
+        }
+    };
+
+    let result = if meta.file_type().is_symlink() {
+        if meta.file_type().is_dir() {
+            fs::remove_dir(p)
+        } else {
+            fs::remove_file(p)
+        }
+    } else if meta.is_dir() {
+        fs::remove_dir_all(p)
+    } else {
+        fs::remove_file(p)
+    };
+
+    if let Err(e) = result {
+        // Access-denied / file-in-use are the common cases worth retrying with
+        // elevation; anything else is reported as-is.
+        let kind = if e.kind() == io::ErrorKind::PermissionDenied {
+            "permission_denied"
+        } else {
+            "other"
+        };
+        return Err(DeleteError {
+            kind: kind.to_string(),
+            message: format!("永久删除失败: {}", e),
+        });
+    }
+    Ok(())
+}
+
 /// Delete a path with administrator privileges (Windows only). Uses
 /// ShellExecuteW with the "runas" verb to spawn an elevated PowerShell that
 /// runs `Remove-Item -Recurse -Force`, bypassing the recycle bin (an elevated
@@ -2216,6 +2303,7 @@ pub fn run() {
             read_file_preview,
             get_dir_size,
             delete_to_trash,
+            delete_permanently,
             delete_with_admin,
             rename_file,
             create_directory,

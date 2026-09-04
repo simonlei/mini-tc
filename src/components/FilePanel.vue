@@ -54,6 +54,25 @@
       @select="handleCtxSelect"
     />
 
+    <!-- Permanent-delete confirmation (Shift+Delete). Local to the panel so
+         the flow stays self-contained; Escape cancels, Enter confirms. -->
+    <div class="confirm-overlay" v-if="permConfirm.visible" @click.self="closePermConfirm(false)">
+      <div class="confirm-dialog">
+        <h3>永久删除</h3>
+        <p>
+          以下项目将被直接抹除，不进入回收站，无法恢复。
+        </p>
+        <ul class="confirm-list">
+          <li v-for="(n, i) in permConfirm.names.slice(0, 5)" :key="i">{{ n }}</li>
+          <li v-if="permConfirm.names.length > 5">…等 {{ permConfirm.names.length }} 项</li>
+        </ul>
+        <div class="confirm-actions">
+          <button class="btn-secondary" @click="closePermConfirm(false)">取消</button>
+          <button class="btn-danger" ref="permConfirmBtn" @click="closePermConfirm(true)">永久删除</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Panel status bar -->
     <div class="panel-status">
       <span>{{ entries.length }} items</span>
@@ -68,12 +87,12 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -164,6 +183,52 @@ function showToast(text, type = "info") {
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { toast.value.visible = false; }, 3200);
 }
+
+// ── Permanent-delete confirmation ──
+// Shift+Delete bypasses the recycle bin, so the deletion is unrecoverable and
+// gets an explicit confirm step (unlike the plain Delete → trash path).
+const permConfirm = ref({ visible: false, names: [] });
+let permConfirmResolve = null;
+const permConfirmBtn = ref(null);
+
+function confirmPermanentDelete(names) {
+  permConfirm.value = { visible: true, names };
+  // Focus the destructive button so Enter confirms (and a stray Enter meant
+  // for the file list can't silently approve).
+  nextTick(() => permConfirmBtn.value?.focus());
+  return new Promise((resolve) => {
+    permConfirmResolve = resolve;
+  });
+}
+
+function closePermConfirm(value) {
+  permConfirm.value = { visible: false, names: [] };
+  const resolve = permConfirmResolve;
+  permConfirmResolve = null;
+  if (resolve) resolve(value);
+}
+
+// Capture-phase so Escape / Enter are consumed before the file list (or the
+// app's global shortcut handler) sees them.
+function onPermConfirmKeydown(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    closePermConfirm(false);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    e.stopPropagation();
+    closePermConfirm(true);
+  }
+}
+
+watch(
+  () => permConfirm.value.visible,
+  (visible) => {
+    if (visible) window.addEventListener("keydown", onPermConfirmKeydown, true);
+    else window.removeEventListener("keydown", onPermConfirmKeydown, true);
+  }
+);
 
 // ── Persistence helpers ──
 // Tabs (per panel) are persisted to ~/.minitc/tabs-<panelId>.json via the
@@ -532,26 +597,42 @@ async function calcDirSize(folderName) {
 
 // ── Delete ──
 
-async function onDelete(targets) {
+// `opts.permanent` (Shift+Delete) deletes outright instead of trashing; it is
+// unrecoverable, so it goes through a confirmation dialog first.
+async function onDelete(targets, opts = {}) {
   if (!activeTab.value) return;
   const list = Array.isArray(targets) ? targets : [targets];
   if (list.length === 0) return;
+  const permanent = opts.permanent === true;
+
+  if (permanent) {
+    const ok = await confirmPermanentDelete(list.map((e) => e.name));
+    if (!ok) return;
+  }
+
+  const remove = permanent ? deletePermanently : deleteToTrash;
 
   const successNames = [];
-  const failed = [];        // trash failed → auto-retry with admin
+  const failed = [];        // delete failed → auto-retry with admin
   const adminLaunched = []; // admin delete was accepted (UAC approved)
 
   for (const entry of list) {
     const fullPath = await joinPath(activeTab.value.path, entry.name);
     try {
-      await deleteToTrash(fullPath);
+      await remove(fullPath);
       successNames.push(entry.name);
     } catch (e) {
+      const m = e && typeof e === "object" && e.message ? e.message : String(e);
+      // A missing path is not worth an elevation prompt — report it directly.
+      if (e && e.kind === "not_found") {
+        showToast(`「${entry.name}」${m}`, "error");
+        continue;
+      }
       failed.push({ entry, fullPath });
     }
   }
 
-  // Remove entries that were successfully deleted via trash.
+  // Remove entries that were successfully deleted.
   if (successNames.length) {
     const removed = new Set(successNames);
     entries.value = entries.value.filter((e) => !removed.has(e.name));
@@ -979,5 +1060,90 @@ defineExpose({
   background: #7a1f1f;
   color: #ffe8e8;
   border: 1px solid #c0392b;
+}
+
+/* ── Permanent-delete confirmation ── */
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 400;
+}
+
+.confirm-dialog {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  min-width: 280px;
+  max-width: 420px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+.confirm-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.confirm-dialog p {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.confirm-list {
+  margin: 0 0 14px;
+  padding-left: 18px;
+  max-height: 140px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.confirm-list li {
+  margin: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.btn-secondary {
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  background: var(--hover-bg);
+}
+
+.btn-danger {
+  padding: 6px 16px;
+  border: 1px solid #c0392b;
+  border-radius: 4px;
+  background: #7a1f1f;
+  color: #ffe8e8;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-danger:hover {
+  background: #962626;
 }
 </style>
