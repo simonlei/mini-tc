@@ -123,6 +123,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { loadConfig, saveConfig } from "../api.js";
 import { listDirectory, getParentDir, joinPath, openFile } from "../api.js";
+import { matches, markHandled } from "../shortcuts.js";
 
 const props = defineProps({
   filePath: { type: String, required: true },
@@ -542,35 +543,55 @@ function selectTrack(id) { selectedTrackId.value = id; }
 function adjustOffset(d) { subtitleOffset.value = +(subtitleOffset.value + d).toFixed(2); }
 
 // ── Keyboard ──
+// Every binding is user-configurable (配置 → 快捷键设置, "视频播放" scope;
+// 关闭预览 lives in the 全局 scope so it also covers image/text previews).
+// This handler runs on the capture phase, i.e. before the file list and the
+// app's global handler, so markHandled() keeps a keystroke from firing twice.
 function onKey(e) {
-  const tag = (e.target.tagName || "").toUpperCase();
-  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
-    if (e.key === "Escape") emit("close");
+  // Esc closes the preview even when focus sits on one of the controls
+  // (volume slider / speed select), which swallow other keys.
+  if (matches("preview.close", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    emit("close");
     return;
   }
-  switch (e.key) {
-    case " ":
-    case "k":
-      e.preventDefault(); togglePlay(); break;
-    case "ArrowLeft":
-      e.preventDefault(); skip(e.shiftKey ? -30 : -5); break;
-    case "ArrowRight":
-      e.preventDefault(); skip(e.shiftKey ? 30 : 5); break;
-    case "ArrowUp":
-      e.preventDefault(); e.stopPropagation(); emit("navigate-list", -1); break;
-    case "ArrowDown":
-      e.preventDefault(); e.stopPropagation(); emit("navigate-list", 1); break;
-    case "f":
-    case "F":
-      e.preventDefault(); toggleFullscreen(); break;
-    case "c":
-    case "C":
-      e.preventDefault(); selectTrack(subtitleText.value ? null : (subtitleTracks.value[0]?.id ?? null)); break;
-    case "m":
-    case "M":
-      e.preventDefault(); toggleMute(); break;
-    case "Escape":
-      e.preventDefault(); emit("close"); break;
+
+  const tag = (e.target.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+  if (matches("video.playPause", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); togglePlay(); return;
+  }
+  if (matches("video.back5", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); skip(-5); return;
+  }
+  if (matches("video.forward5", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); skip(5); return;
+  }
+  if (matches("video.back30", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); skip(-30); return;
+  }
+  if (matches("video.forward30", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); skip(30); return;
+  }
+  if (matches("video.prevFile", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); emit("navigate-list", -1); return;
+  }
+  if (matches("video.nextFile", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); emit("navigate-list", 1); return;
+  }
+  if (matches("video.fullscreen", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); toggleFullscreen(); return;
+  }
+  if (matches("video.subtitle", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e);
+    selectTrack(subtitleText.value ? null : (subtitleTracks.value[0]?.id ?? null));
+    return;
+  }
+  if (matches("video.mute", e)) {
+    e.preventDefault(); e.stopPropagation(); markHandled(e); toggleMute(); return;
   }
 }
 function toggleFullscreen() {

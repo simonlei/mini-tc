@@ -16,6 +16,7 @@
   - 覆盖策略（防数据丢失 + 目录合并）：同名**文件夹**冲突时采用**合并**（merge）而非整目录替换删除——例如把 `root/a/a` 移动/拷贝到 `root/`，其内容会并入已存在的 `root/a`（移动后 `root/a/a` 自身被清空移除），不会误删数据；同名**文件**冲突才按覆盖/跳过处理。仍拒绝真正危险的操作：把目录移动到自身内部（`root/a` → `root/a/b`）。跨卷移动若复制阶段出错则保留源文件不删除。
 - **鼠标拖拽移动**：直接用鼠标把文件/文件夹（单个或 Ctrl/Shift 多选集合）拖到目标文件夹、空白区（= 当前目录）或「..」（= 父目录）即可移动到该目录；支持**跨栏拖拽**（从左栏拖到右栏目录）。落点高亮提示，移动后自动刷新源栏与目标栏，冲突处理与同名项合并策略复用粘贴逻辑（落到文件上则忽略拖放）
   - ⚠️ **依赖 `app.windows[].dragDropEnabled = false`（勿改回 true）**：Tauri 2 在 Windows 上默认 `dragDropEnabled: true`，会在 **OS 层劫持** webview 的拖放系统，导致前端收不到 HTML5 `dragover` 事件、内部拖拽全程显示禁止图标（tauri-apps/tauri#15138）。关掉后页面内拖放才正常工作。代价是**失去原生外部文件拖入能力**（从资源管理器拖文件进来拿不到文件路径）——本应用未实现该功能，故为零回归；若将来要做外部拖入，需自建透明浮层窗口等方案。
+- **快捷键自定义**（配置 → 快捷键设置）：独立页面集中展示代码中的全部快捷键；支持按名称/组合键搜索、按作用域（全局 / 文件列表 / 视频播放）分组折叠、录制式重新绑定（Ctrl / Alt / Shift / Command 任意组合）、同一命令绑定多个快捷键、同作用域重复时红色高亮冲突并提示占用方。配置持久化到 `~/.minitc/shortcuts.json`，仅存增量，新版本新增的默认快捷键会自动生效
 - **自动更新**（帮助 → 检查更新）
 - Windows / macOS / Linux 跨平台支持
 
@@ -89,14 +90,17 @@ mini-tc/
 │   ├── main.js               # 应用入口
 │   ├── api.js                # Tauri invoke 封装
 │   ├── style.css             # 全局样式（4 套主题变量）
+│   ├── shortcuts.js          # 快捷键注册表：命令 / 作用域 / 匹配 / 冲突检测
 │   └── components/
-│       ├── FilePanel.vue     # 面板容器（Tab + 路径 + 文件列表 + 右键菜单）
-│       ├── TabBar.vue        # 多 Tab 管理
-│       ├── PathBar.vue       # 可编辑路径栏 + 盘符切换 + 面包屑
-│       ├── FileList.vue      # 文件列表（排序 + 多选 + 右键触发）
-│       ├── FilePreview.vue   # 文件预览（文本/图片）
-│       ├── VideoPreview.vue  # 视频预览
-│       └── ContextMenu.vue   # 通用右键菜单组件
+│       ├── FilePanel.vue        # 面板容器（Tab + 路径 + 文件列表 + 右键菜单）
+│       ├── TabBar.vue           # 多 Tab 管理
+│       ├── PathBar.vue          # 可编辑路径栏 + 盘符切换 + 面包屑
+│       ├── FileList.vue         # 文件列表（排序 + 多选 + 右键触发）
+│       ├── FilePreview.vue      # 文件预览（文本/图片）
+│       ├── VideoPreview.vue     # 视频预览
+│       ├── ContextMenu.vue      # 通用右键菜单组件
+│       ├── SettingsDialog.vue   # 文件预览设置
+│       └── ShortcutsDialog.vue  # 快捷键设置（独立页面）
 ├── src-tauri/                # Rust 后端
 │   ├── src/
 │   │   ├── main.rs

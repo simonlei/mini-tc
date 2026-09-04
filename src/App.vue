@@ -29,6 +29,10 @@
             <span class="check-mark"></span>
             <span>文件预览设置</span>
           </div>
+          <div class="menu-option" @click="openShortcuts(); configMenuOpen = false">
+            <span class="check-mark"></span>
+            <span>快捷键设置</span>
+          </div>
         </div>
       </div>
       <div class="menu-item" @click="toggleHelpMenu">
@@ -82,6 +86,13 @@
       :builtins="BUILTIN_TEXT_EXTENSIONS"
       @close="onSettingsClose"
       @save="onSettingsSave"
+    />
+
+    <!-- Keyboard-shortcut settings dialog (own page, not part of 设置) -->
+    <ShortcutsDialog
+      v-if="shortcutsVisible"
+      @close="onShortcutsClose"
+      @save="onShortcutsSave"
     />
 
     <!-- Main content: two panels with a draggable separator -->
@@ -212,7 +223,9 @@ import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
 import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
+import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled } from "./shortcuts.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
@@ -251,6 +264,26 @@ function onSettingsSave(exts) {
 
 function onSettingsClose() {
   settingsVisible.value = false;
+}
+
+// ── Shortcut-settings dialog ──
+// A dedicated page (separate from 文件预览设置) listing every command, grouped
+// by scope, with rebinding / conflict detection handled inside the component.
+const shortcutsVisible = ref(false);
+
+function openShortcuts() {
+  helpMenuOpen.value = false;
+  configMenuOpen.value = false;
+  shortcutsVisible.value = true;
+}
+
+function onShortcutsClose() {
+  shortcutsVisible.value = false;
+}
+
+async function onShortcutsSave() {
+  await saveShortcuts();
+  shortcutsVisible.value = false;
 }
 
 const updateDialog = ref({
@@ -380,6 +413,9 @@ async function downloadUpdate() {
 onMounted(() => {
   initTheme();
   loadTextPreviewConfig();
+  // Load ~/.minitc/shortcuts.json before the first keystroke can arrive; until
+  // it resolves every command simply falls back to its built-in defaults.
+  loadShortcuts();
   getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
 });
 
@@ -1035,6 +1071,11 @@ onMounted(() => {
     rightPanel.value?.clearCut?.();
   });
   document.addEventListener("keydown", (e) => {
+    // Skip keys already consumed by a more specific scope (the file list runs
+    // first because it listens on the element, the video preview runs first
+    // because it listens on the capture phase).
+    if (isHandled(e)) return;
+
     // Esc: close the current preview (image / text / pdf / video / unsupported)
     // and return the source file list to the file that was just previewed. When
     // no preview is open, this is a no-op — Esc no longer cancels selection on
@@ -1042,29 +1083,32 @@ onMounted(() => {
     // If focus is inside a text input (the source panel's filename filter or
     // address bar, which stay interactive during preview), let that input handle
     // Esc on its own (e.g. cancel the filter) instead of closing the preview.
-    if (e.key === "Escape" && previewVisible.value) {
+    if (matches("preview.close", e) && previewVisible.value) {
       const t = e.target;
       const inEditable =
         t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
       if (!inEditable) {
         e.preventDefault();
+        markHandled(e);
         closePreview();
         return;
       }
     }
 
     // Ctrl+Q: Toggle file preview
-    if (e.key === "q" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+    if (matches("preview.toggle", e)) {
       e.preventDefault();
+      markHandled(e);
       togglePreview();
       return;
     }
 
     // Ctrl+A: select all entries in the active panel (skip when typing in a text input).
-    if (e.key === "a" && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+    if (matches("edit.selectAll", e)) {
       const t = e.target;
       if (t && t.tagName === "INPUT") return; // let the filter input select its text
       e.preventDefault();
+      markHandled(e);
       getActivePanelRef()?.selectAll?.();
       return;
     }
@@ -1076,40 +1120,35 @@ onMounted(() => {
     // sense on the file grid, and intercepting here would preventDefault the
     // native text paste (and then wrongly report "剪贴板为空" when the
     // clipboard holds plain text, not a file list).
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+    const isCopy = matches("edit.copy", e);
+    const isCut = matches("edit.cut", e);
+    const isPaste = matches("edit.paste", e);
+    if (isCopy || isCut || isPaste) {
       const t = e.target;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
         return; // let the browser do native text copy/cut/paste
       }
-      if (e.key === "c" || e.key === "C" || e.key === "x" || e.key === "X") {
+      if (isCopy || isCut) {
         // If the user has selected text inside a preview pane, let the browser
         // copy that text natively instead of treating it as a file clipboard op
         // (file-list selection → copy file; preview text selection → copy text).
         if (hasPreviewTextSelection()) return;
         // PDF 预览聚焦时放行 Ctrl+C（复制 PDF 内文本），交由 WebView 原生处理。
         // Ctrl+X 不放行（PDF 只读，无剪切内容语义，仍按文件剪切逻辑处理）。
-        if ((e.key === "c" || e.key === "C") && isPdfIframeFocused()) return;
+        if (isCopy && isPdfIframeFocused()) return;
       }
-      if (e.key === "c" || e.key === "C") {
-        e.preventDefault();
-        setClipboard("copy");
-        return;
-      }
-      if (e.key === "x" || e.key === "X") {
-        e.preventDefault();
-        setClipboard("cut");
-        return;
-      }
-      if (e.key === "v" || e.key === "V") {
-        e.preventDefault();
-        pasteFromClipboard();
-        return;
-      }
+      e.preventDefault();
+      markHandled(e);
+      if (isCopy) setClipboard("copy");
+      else if (isCut) setClipboard("cut");
+      else pasteFromClipboard();
+      return;
     }
 
     // Ctrl+Tab: Switch active panel (skip if target is showing preview)
-    if (e.key === "Tab" && (e.ctrlKey || e.metaKey)) {
+    if (matches("panel.switch", e)) {
       e.preventDefault();
+      markHandled(e);
       if (previewVisible.value) {
         // Don't allow switching to the preview panel
         return;

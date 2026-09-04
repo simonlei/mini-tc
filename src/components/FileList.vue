@@ -131,6 +131,7 @@
 import { computed, ref, watch, nextTick } from "vue";
 import { joinPath, getParentDir } from "../api.js";
 import { dragState, clearDragState } from "../dragState.js";
+import { matches, markHandled } from "../shortcuts.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -730,9 +731,15 @@ function deleteSelected() {
   emit("delete", targets);
 }
 
+// All file-list keys are user-configurable (配置 → 快捷键设置, "文件列表"
+// scope). Each branch claims the event via markHandled() so the app's global
+// handler (which runs later on document) doesn't fire a second command for the
+// same keystroke.
 function onKeydown(e) {
   // If focus is inside the search input, let it handle keys itself.
   if (e.target && e.target.tagName === "INPUT") return;
+
+  const list = displayedEntries.value;
 
   // Open the filter with an explicit activation key ("/"). Using a dedicated
   // non-composing key — instead of "any printable key" — guarantees the search
@@ -741,87 +748,119 @@ function onKeydown(e) {
   // starts composition; since "/" is plain text (not composition) and focuses
   // the input synchronously, the very next key (the first pinyin letter) composes
   // into the already-focused input. "/" itself is prevented from being typed.
-  if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+  if (matches("list.filter", e)) {
     e.preventDefault();
+    markHandled(e);
     startSearch();
     return;
   }
 
-  const list = displayedEntries.value;
+  // Delete: a bare Delete, or Cmd/Ctrl+Backspace. macOS has no dedicated
+  // forward-Delete key, so Cmd+Backspace is the conventional "delete" gesture
+  // there; Ctrl+Backspace is accepted for parity on Windows/Linux.
+  if (matches("list.delete", e)) {
+    e.preventDefault();
+    markHandled(e);
+    deleteSelected();
+    return;
+  }
 
   // Backspace navigates to parent — works even in empty directories.
-  // macOS has no dedicated forward-Delete key, so Cmd+Backspace is the
-  // conventional "delete" gesture there; we also accept Ctrl+Backspace for
-  // parity on Windows/Linux. A bare Backspace (no modifier) still goes up a level.
-  if (e.key === "Backspace") {
-    if (e.metaKey || e.ctrlKey) {
-      e.preventDefault();
-      deleteSelected();
-      return;
-    }
+  if (matches("list.parent", e)) {
     e.preventDefault();
+    markHandled(e);
     emit("navigate-parent");
     return;
   }
 
-  // Enter on ".." (activeIndex === -1) navigates to parent — but only when not searching
-  if (e.key === "Enter" && activeIndex.value === -1 && !isSearching.value) {
+  // Inline rename the last-selected row (or active row when only one/none).
+  if (matches("list.rename", e)) {
     e.preventDefault();
+    markHandled(e);
+    const idx = targetRenameIndex();
+    if (idx >= 0) startRename(idx);
+    return;
+  }
+
+  // Enter on ".." (activeIndex === -1) navigates to parent — but only when not searching
+  if (matches("list.open", e) && activeIndex.value === -1 && !isSearching.value) {
+    e.preventDefault();
+    markHandled(e);
     emit("navigate-parent");
     return;
   }
 
   if (list.length === 0) return;
 
-  if (e.key === "ArrowDown") {
+  if (matches("list.down", e)) {
     e.preventDefault();
-    if (e.shiftKey) extendSelection(1);
-    else moveSelection(1);
-  } else if (e.key === "ArrowUp") {
+    markHandled(e);
+    moveSelection(1);
+  } else if (matches("list.extendDown", e)) {
     e.preventDefault();
-    if (e.shiftKey) extendSelection(-1);
-    else moveSelection(-1);
-  } else if (e.key === "PageDown") {
+    markHandled(e);
+    extendSelection(1);
+  } else if (matches("list.up", e)) {
     e.preventDefault();
-    if (e.shiftKey) extendPage(1);
-    else movePage(1);
-  } else if (e.key === "PageUp") {
+    markHandled(e);
+    moveSelection(-1);
+  } else if (matches("list.extendUp", e)) {
     e.preventDefault();
-    if (e.shiftKey) extendPage(-1);
-    else movePage(-1);
-  } else if (e.key === "Home") {
+    markHandled(e);
+    extendSelection(-1);
+  } else if (matches("list.pageDown", e)) {
     e.preventDefault();
-    if (e.shiftKey) {
-      if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value === -1 ? 0 : activeIndex.value;
-      const end = anchorIndex.value;
-      const set = new Set();
-      for (let i = 0; i <= end; i++) set.add(i);
-      selectedIndices.value = set;
-      activeIndex.value = 0;
-      emitSelection();
-      scrollToRow(0, "start");
-    } else {
-      selectRow(0);
-      scrollToRow(0, "start");
-    }
-  } else if (e.key === "End") {
+    markHandled(e);
+    movePage(1);
+  } else if (matches("list.extendPageDown", e)) {
     e.preventDefault();
+    markHandled(e);
+    extendPage(1);
+  } else if (matches("list.pageUp", e)) {
+    e.preventDefault();
+    markHandled(e);
+    movePage(-1);
+  } else if (matches("list.extendPageUp", e)) {
+    e.preventDefault();
+    markHandled(e);
+    extendPage(-1);
+  } else if (matches("list.first", e)) {
+    e.preventDefault();
+    markHandled(e);
+    selectRow(0);
+    scrollToRow(0, "start");
+  } else if (matches("list.extendFirst", e)) {
+    e.preventDefault();
+    markHandled(e);
+    if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value === -1 ? 0 : activeIndex.value;
+    const end = anchorIndex.value;
+    const set = new Set();
+    for (let i = 0; i <= end; i++) set.add(i);
+    selectedIndices.value = set;
+    activeIndex.value = 0;
+    emitSelection();
+    scrollToRow(0, "start");
+  } else if (matches("list.last", e)) {
+    e.preventDefault();
+    markHandled(e);
     const last = list.length - 1;
-    if (e.shiftKey) {
-      if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value === -1 ? last : activeIndex.value;
-      const start = anchorIndex.value;
-      const set = new Set();
-      for (let i = start; i <= last; i++) set.add(i);
-      selectedIndices.value = set;
-      activeIndex.value = last;
-      emitSelection();
-      scrollToRow(last, "end");
-    } else {
-      selectRow(last);
-      scrollToRow(last, "end");
-    }
-  } else if (e.key === "Enter") {
+    selectRow(last);
+    scrollToRow(last, "end");
+  } else if (matches("list.extendLast", e)) {
     e.preventDefault();
+    markHandled(e);
+    const last = list.length - 1;
+    if (anchorIndex.value === -1) anchorIndex.value = activeIndex.value === -1 ? last : activeIndex.value;
+    const start = anchorIndex.value;
+    const set = new Set();
+    for (let i = start; i <= last; i++) set.add(i);
+    selectedIndices.value = set;
+    activeIndex.value = last;
+    emitSelection();
+    scrollToRow(last, "end");
+  } else if (matches("list.open", e)) {
+    e.preventDefault();
+    markHandled(e);
     const entry = list[activeIndex.value];
     console.log("[Enter] activeIndex:", activeIndex.value, "entry:", entry?.name, "is_dir:", entry?.is_dir);
     if (entry) {
@@ -831,22 +870,15 @@ function onKeydown(e) {
         emit("open", entry.name);
       }
     }
-  } else if (e.key === " " || e.code === "Space") {
+  } else if (matches("list.dirSize", e)) {
     e.preventDefault();
+    markHandled(e);
     if (activeIndex.value >= 0) {
       const entry = list[activeIndex.value];
       if (entry && entry.is_dir) {
         emit("calc-dir-size", entry.name);
       }
     }
-  } else if (e.key === "Delete") {
-    e.preventDefault();
-    deleteSelected();
-  } else if (e.key === "F2") {
-    // Inline rename the last-selected row (or active row when only one/none).
-    e.preventDefault();
-    const idx = targetRenameIndex();
-    if (idx >= 0) startRename(idx);
   }
 }
 
