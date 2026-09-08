@@ -24,6 +24,7 @@
         class="vp-stage"
         v-else
         @mousemove="showControlsTmp"
+        @mouseleave="onStageLeave"
         @wheel.prevent="onWheel"
       >
         <video
@@ -49,8 +50,14 @@
         <!-- Subtitle overlay -->
         <div class="vp-subtitle" v-if="subtitleText">{{ subtitleText }}</div>
 
-        <!-- Controls -->
-        <div class="vp-controls" :class="{ hidden: !showCtrls && playing }" @click.stop>
+        <!-- Controls: the progress row is ALWAYS visible (so you can always see
+             where you are and seek); only the button row auto-hides. -->
+        <div
+          class="vp-controls"
+          @click.stop
+          @mouseenter="onControlsEnter"
+          @mouseleave="onControlsLeave"
+        >
           <div class="vp-progress">
             <span class="vp-time">{{ fmtTime(videoTime) }}</span>
             <input
@@ -65,7 +72,7 @@
             <span class="vp-time">{{ fmtTime(duration) }}</span>
           </div>
 
-          <div class="vp-buttons">
+          <div class="vp-buttons" :class="{ collapsed: !showCtrls && playing }">
             <button class="vp-btn" @click="togglePlay" :title="playing ? '暂停 (Space)' : '播放 (Space)'">{{ playing ? "⏸" : "▶" }}</button>
             <button class="vp-btn" @click="skip(-10)" title="快退 10s (←)">⏪</button>
             <button class="vp-btn" @click="skip(10)" title="快进 10s (→)">⏩</button>
@@ -187,7 +194,10 @@ const muted = ref(false);
 const rate = ref(1);
 const resW = ref(0);
 const resH = ref(0);
+const CTRLS_HIDE_DELAY = 3000;
 const showCtrls = ref(true);
+// True while the pointer rests on the control bar — never auto-hide then.
+const hoveringCtrls = ref(false);
 let ctrlsTimer = null;
 
 // Set when the current clip ended and we're auto-advancing to the next one, so
@@ -254,8 +264,14 @@ function togglePlay() {
 function onPlay() {
   playing.value = true;
   startVideoFrameWatch();
+  showControlsTmp(); // start the auto-hide countdown even if the mouse is idle
 }
-function onPause() { playing.value = false; }
+function onPause() {
+  playing.value = false;
+  // Paused → always show the full control bar again.
+  clearTimeout(ctrlsTimer);
+  showCtrls.value = true;
+}
 function seekTo(val) {
   const v = videoEl.value;
   if (!v) return;
@@ -604,10 +620,34 @@ function toggleFullscreen() {
   }
 }
 function openExternal() { openFile(props.filePath).catch((e) => { loadError.value = String(e); }); }
+// (Re)start the auto-hide countdown. Called on playback start, on pointer
+// movement and when the pointer leaves the stage — NOT only on mousemove, so
+// that starting playback with the keyboard (Space) also hides the buttons.
+function scheduleHide() {
+  clearTimeout(ctrlsTimer);
+  ctrlsTimer = setTimeout(() => {
+    if (playing.value && !hoveringCtrls.value) showCtrls.value = false;
+  }, CTRLS_HIDE_DELAY);
+}
 function showControlsTmp() {
   showCtrls.value = true;
+  scheduleHide();
+}
+// Keep the button row alive while the pointer rests on the control bar (e.g.
+// dragging the seek slider or reaching for the volume control).
+function onControlsEnter() {
+  hoveringCtrls.value = true;
   clearTimeout(ctrlsTimer);
-  ctrlsTimer = setTimeout(() => { if (playing.value) showCtrls.value = false; }, 3000);
+  showCtrls.value = true;
+}
+function onControlsLeave() {
+  hoveringCtrls.value = false;
+  showControlsTmp();
+}
+// Pointer left the video area entirely → hide the buttons (progress stays).
+function onStageLeave() {
+  hoveringCtrls.value = false;
+  scheduleHide();
 }
 
 // Reload the video source (also re-detects subtitles). Up / Down navigation is
@@ -791,9 +831,25 @@ onBeforeUnmount(() => {
   bottom: 0;
   padding: 6px 10px 10px;
   background: linear-gradient(transparent, rgba(0, 0, 0, 0.82));
-  transition: opacity 0.2s;
 }
-.vp-controls.hidden { opacity: 0; pointer-events: none; }
+
+.vp-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  max-height: 90px;
+  overflow: hidden;
+  transition: opacity 0.2s, max-height 0.2s, margin-top 0.2s;
+}
+/* Only the buttons auto-hide; the progress bar above them stays put. */
+.vp-buttons.collapsed {
+  opacity: 0;
+  max-height: 0;
+  margin-top: 0;
+  pointer-events: none;
+}
 
 .vp-progress {
   display: flex;
