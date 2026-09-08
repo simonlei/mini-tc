@@ -719,13 +719,28 @@ function deleteSelected({ permanent = false } = {}) {
   }
   if (targets.length === 0) return;
 
-  // Preserve focus on a neighbour for the single-delete case.
+  // Preserve the caret on a neighbour so the selection survives the delete.
+  // Rule (same for single and multi delete, matching Explorer): take the first
+  // entry AFTER the last deleted row; when the deleted block reached the end of
+  // the list, fall back to the nearest survivor BEFORE it. Nothing survives →
+  // no pending name, and the list simply ends up with no selection.
+  const targetSet = new Set(targets);
+  let lastIdx = -1;
+  for (const t of targets) {
+    const i = list.indexOf(t);
+    if (i > lastIdx) lastIdx = i;
+  }
   let pendingName = null;
-  if (targets.length === 1) {
-    const idx = list.indexOf(targets[0]);
-    if (idx >= 0) {
-      if (idx < list.length - 1) pendingName = list[idx + 1].name;
-      else if (idx > 0) pendingName = list[idx - 1].name;
+  if (lastIdx >= 0) {
+    if (lastIdx + 1 < list.length) {
+      pendingName = list[lastIdx + 1].name;
+    } else {
+      for (let i = lastIdx - 1; i >= 0; i--) {
+        if (!targetSet.has(list[i])) {
+          pendingName = list[i].name;
+          break;
+        }
+      }
     }
   }
   if (pendingName) pendingSelectName.value = pendingName;
