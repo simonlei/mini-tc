@@ -1,0 +1,102 @@
+name: Sync from CNB and Release
+
+# 从 CNB 远程（cnb.cool，源码主仓库）拉取最新代码，同步到 GitHub 镜像，
+# 然后按当前最新版本自动递增（小版本 +1）创建并推送 vX.Y.Z 标签，
+# 从而触发 .github/workflows/release.yml 完成三平台构建与发布。
+#
+# 触发：Actions 页面手动运行（workflow_dispatch）。
+#   可选填 version 显式指定版本（如 v0.1.9）；留空则自动取最新标签补丁号 +1。
+#
+# 必需 Secrets（Settings → Secrets and variables → Actions）：
+#   RELEASE_PAT      # 具有 contents:write 权限的 Personal Access Token。
+#                    # 必须用 PAT 而非 GITHUB_TOKEN 推送标签：GITHUB_TOKEN 触发的
+#                    # push/tag 事件不会再次触发其他 workflow，PAT 推送才会触发 release.yml。
+#   CNB_REPO_URL     # 可选，CNB 仓库地址，默认 https://cnb.cool/simon-lei/mini-tc.git
+#   CNB_TOKEN        # 可选，CNB 私有仓库拉取所需的访问令牌；公开仓库可不配
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本（如 v0.1.9；留空则自动小版本 +1）'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-cnb-release
+  cancel-in-progress: false
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          # 用 PAT 认证，使后续 tag 推送归属真实用户，从而触发 release.yml。
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync latest code from CNB remote
+        env:
+          CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: |
+          REPO_URL="${CNB_REPO_URL:-https://cnb.cool/simon-lei/mini-tc.git}"
+          if [ -n "${CNB_TOKEN:-}" ]; then
+            REPO_URL="https://cnb:${CNB_TOKEN}@${REPO_URL#https://}"
+          fi
+          echo "==> 拉取 CNB 远程最新代码: $REPO_URL"
+          git remote add cnb "$REPO_URL"
+          git fetch cnb main
+          git reset --hard cnb/main
+          echo "==> 同步 main 到 GitHub 镜像"
+          git push origin main
+
+      - name: Determine next version tag
+        id: next
+        run: |
+          TAG_INPUT="${{ github.event.inputs.version }}"
+          if [ -n "$TAG_INPUT" ]; then
+            if [[ ! "$TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: 版本号格式应为 vX.Y.Z (例: v0.1.9)，收到: $TAG_INPUT"
+              exit 1
+            fi
+            TAG="$TAG_INPUT"
+          else
+            LATEST="$(
+              git ls-remote --tags origin 'refs/tags/v[0-9]*.[0-9]*.[0-9]*' \
+                | sed -e 's#.*refs/tags/##' -e '/\^{}$/d' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V | tail -1
+            )"
+            if [ -z "$LATEST" ]; then
+              echo "ERROR: 未找到任何 vX.Y.Z 标签，请显式指定版本号"
+              exit 1
+            fi
+            IFS='.' read -r MAJOR MINOR PATCH <<<"${LATEST#v}"
+            TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "==> 当前最新版本 $LATEST，自动发布下一版本 $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push release tag
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "ERROR: 标签 $TAG 已存在于 GitHub，请改用更大的版本号后重试"
+            exit 1
+          fi
+          echo "==> 创建并推送标签 $TAG"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "==> 已推送标签 $TAG，Release workflow 将被触发"
