@@ -217,7 +217,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, nextTick } from "vue";
+import { ref, watch, onMounted, onUnmounted, nextTick } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
@@ -1053,23 +1053,73 @@ watch(activePanel, async () => {
   await showFilePreview(entry, path, isTextPreviewExt(ext));
 });
 
+// ── Window focus regain ──
+// Typical case: right-click an archive → extract with 7-Zip → the external
+// window opens, does its work and closes → the user comes back to mini-tc.
+// On regain we re-list both panels (another app may have moved/deleted files),
+// drop stale cut-ghosting, refresh the free-space readouts, and — the point of
+// this handler — hand keyboard focus back to the active file list. Without the
+// focus restore the caret is stranded outside the webview: the list sits there
+// with nothing focused and arrow keys / Enter do nothing until the user clicks
+// a row by hand.
+let lastRegainAt = 0;
+let unlistenTauriFocus = null;
+let appUnmounted = false;
+
+function isTypingTarget(el) {
+  if (!el) return false;
+  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return true;
+  return el.isContentEditable === true;
+}
+
+// Put keyboard focus back on the active panel's file list. Skipped while the
+// user is typing somewhere (address bar, filename filter, inline rename) or is
+// inside a preview surface, so we never yank focus out of a live interaction.
+function restoreActiveListFocus() {
+  const el = document.activeElement;
+  if (isTypingTarget(el)) return;
+  if (el && el.closest && el.closest(".file-preview, iframe, video")) return;
+  const panel = activePanel.value === "left" ? leftPanel.value : rightPanel.value;
+  panel?.focusList?.();
+}
+
+async function onWindowFocusRegain() {
+  // `tauri://focus` and the DOM `focus` event both fire for one regain (and
+  // some paths fire them a few times); debounce so we don't re-list repeatedly.
+  const now = Date.now();
+  if (now - lastRegainAt < 500) return;
+  lastRegainAt = now;
+
+  await Promise.all([leftPanel.value?.refresh?.(), rightPanel.value?.refresh?.()]);
+  // Refresh the drive free-space figures in both PathBar dropdowns too, so
+  // the remaining-capacity readouts stay current after the user has been
+  // doing work outside mini-tc (copying files, etc.).
+  leftPanel.value?.refreshDrives?.();
+  rightPanel.value?.refreshDrives?.();
+  leftPanel.value?.clearCut?.();
+  rightPanel.value?.clearCut?.();
+  restoreActiveListFocus();
+}
+
+function onVisibilityRegain() {
+  if (!document.hidden) onWindowFocusRegain();
+}
+
 // Keyboard shortcuts
 onMounted(() => {
-  // When the window regains focus (e.g. the user cut files in mini-tc, pasted
-  // them in File Explorer, then switched back), re-list both panels and clear
-  // any stale cut-ghosting. Without this the source panel keeps showing files
-  // that have already been moved away by another app.
-  listen("tauri://focus", () => {
-    leftPanel.value?.refresh?.();
-    rightPanel.value?.refresh?.();
-    // Refresh the drive free-space figures in both PathBar dropdowns too, so
-    // the remaining-capacity readouts stay current after the user has been
-    // doing work outside mini-tc (copying files, etc.).
-    leftPanel.value?.refreshDrives?.();
-    rightPanel.value?.refreshDrives?.();
-    leftPanel.value?.clearCut?.();
-    rightPanel.value?.clearCut?.();
+  // Window regained focus (the handler above owns the refresh + focus restore).
+  listen("tauri://focus", onWindowFocusRegain).then((fn) => {
+    // If the component is already gone by the time the promise settles, drop
+    // the listener right away instead of leaking it.
+    if (appUnmounted) fn();
+    else unlistenTauriFocus = fn;
   });
+  // DOM-level fallbacks: when an external 7-Zip window closes and hands focus
+  // straight back, `tauri://focus` is not always emitted, and a minimized /
+  // occluded window restore only shows up here.
+  window.addEventListener("focus", onWindowFocusRegain);
+  document.addEventListener("visibilitychange", onVisibilityRegain);
+
   document.addEventListener("keydown", (e) => {
     // Skip keys already consumed by a more specific scope (the file list runs
     // first because it listens on the element, the video preview runs first
@@ -1156,6 +1206,13 @@ onMounted(() => {
       activePanel.value = activePanel.value === "left" ? "right" : "left";
     }
   });
+});
+
+onUnmounted(() => {
+  appUnmounted = true;
+  if (unlistenTauriFocus) unlistenTauriFocus();
+  window.removeEventListener("focus", onWindowFocusRegain);
+  document.removeEventListener("visibilitychange", onVisibilityRegain);
 });
 </script>
 

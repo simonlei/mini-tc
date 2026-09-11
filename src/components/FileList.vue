@@ -1030,13 +1030,29 @@ function restoreByNames(names) {
   activeIndex.value = firstIdx;
   anchorIndex.value = firstIdx;
   emitSelection();
+  // Bring the restored row back into view. After a re-list the row can sit
+  // outside the viewport (or the user may have scrolled away before switching
+  // out), which reads as "my selection is gone" when they come back to the
+  // window — the highlight is there, just off-screen.
+  nextTick(() => scrollToRow(firstIdx));
 }
 
 // Shift keyboard focus onto the list container so arrow-key navigation works
-// immediately (e.g. right after a preview closes and the list regains
-// visibility). The container is the `tabindex="0"` .file-list div.
+// immediately (e.g. right after a preview closes, or when the window regains
+// focus after an external tool such as 7-Zip has been on screen). The container
+// is the `tabindex="0"` .file-list div.
 function focusList() {
-  nextTick(() => { listContainer.value?.focus(); });
+  nextTick(() => {
+    const el = listContainer.value;
+    if (!el) return;
+    el.focus();
+    // The webview may not own system focus yet when this runs (an external
+    // window closing can emit the event a hair early), and focus() on a
+    // non-focused document is silently dropped. Retry once on the next frame.
+    if (document.activeElement !== el) {
+      requestAnimationFrame(() => listContainer.value?.focus());
+    }
+  });
 }
 
 // ── Drag-and-drop move ──
