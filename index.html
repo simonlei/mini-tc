@@ -4,8 +4,123 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mini TC</title>
+    <style>
+      /* Splash renders before Vue mounts; fade out as soon as #app becomes
+         non-empty. #app has display:flex (height 100%) from style.css, so a
+         single child triggers the transition. */
+      html, body { background: #0d1117; }
+      #splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: radial-gradient(ellipse at center,
+                    #14202e 0%, #0a0e14 60%, #06080c 100%);
+        color: #c9d1d9;
+        font-family: "Consolas", "Cascadia Mono", "Menlo", monospace;
+        z-index: 9999;
+        transition: opacity 0.6s ease, visibility 0.6s ease;
+      }
+      #splash.hide {
+        opacity: 0;
+        visibility: hidden;
+      }
+      /* The dual-panel mark: two slim rectangles flanking a center axis,
+         echoing mini-tc's twin-pane layout without copying a real logo. */
+      .splash-mark {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        opacity: 0;
+        animation: splash-fade-in 0.5s ease 0.05s forwards;
+      }
+      .splash-mark-bar {
+        width: 56px;
+        height: 90px;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+        position: relative;
+        overflow: hidden;
+      }
+      .splash-mark-bar::after {
+        content: "";
+        position: absolute;
+        inset: 12px 8px auto 8px;
+        height: 4px;
+        border-radius: 2px;
+        background: #58a6ff;
+        opacity: 0.55;
+      }
+      .splash-mark-bar.right::after {
+        background: #3fb950;
+        opacity: 0.55;
+      }
+      .splash-mark-axis {
+        width: 6px;
+        height: 70px;
+        background: linear-gradient(180deg,
+                    transparent 0%, #30363d 50%, transparent 100%);
+        border-radius: 3px;
+      }
+      .splash-name {
+        font-size: 16px;
+        font-weight: 600;
+        letter-spacing: 4px;
+        color: #e6edf3;
+        opacity: 0;
+        animation: splash-fade-in 0.4s ease 0.25s forwards;
+      }
+      .splash-name .accent { color: #58a6ff; }
+      .splash-tag {
+        font-size: 11px;
+        color: #8b949e;
+        letter-spacing: 2px;
+        opacity: 0;
+        animation: splash-fade-in 0.4s ease 0.4s forwards;
+      }
+      /* Three-dot loader; staggered fade mimics TTY/telnet boot logs. */
+      .splash-dots {
+        display: flex;
+        gap: 6px;
+        margin-top: 6px;
+        opacity: 0;
+        animation: splash-fade-in 0.4s ease 0.55s forwards;
+      }
+      .splash-dots span {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #58a6ff;
+        animation: splash-pulse 1.2s ease-in-out infinite;
+      }
+      .splash-dots span:nth-child(2) { animation-delay: 0.15s; background: #8b949e; }
+      .splash-dots span:nth-child(3) { animation-delay: 0.30s; background: #3fb950; }
+      @keyframes splash-fade-in {
+        to { opacity: 1; }
+      }
+      @keyframes splash-pulse {
+        0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+        30% { opacity: 1; transform: translateY(-3px); }
+      }
+    </style>
   </head>
   <body>
+    <div id="splash" aria-hidden="true">
+      <div class="splash-mark">
+        <div class="splash-mark-bar left"></div>
+        <div class="splash-mark-axis"></div>
+        <div class="splash-mark-bar right"></div>
+      </div>
+      <div class="splash-name">mini<span class="accent">·</span>tc</div>
+      <div class="splash-tag">FILE&nbsp;&nbsp;MANAGER</div>
+      <div class="splash-dots" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
