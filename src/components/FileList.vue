@@ -240,6 +240,17 @@ watch(
   }
 );
 
+// Classify a name's first meaningful char so non-ASCII (CJK) names sort AFTER
+// digits and Latin letters — matching Explorer: 0..9 < a-z < 中文. Hyphens are
+// stripped first so "-1a.txt" is classified by its "1" (digit), not the dash.
+function nameClass(name) {
+  const ch = name.replace(/-/g, "")[0];
+  if (!ch) return 2;
+  if (ch >= "0" && ch <= "9") return 0;
+  if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) return 1;
+  return 2;
+}
+
 // Sort entries based on current sort settings
 const sortedEntries = computed(() => {
   const list = [...props.entries];
@@ -254,11 +265,21 @@ const sortedEntries = computed(() => {
 
     let cmp = 0;
     if (col === "name") {
-      // Natural sort: digit runs compare by numeric value (so "1a.jpg" <
-      // "2c.jpg" < "10b.jpg"), case/accent-insensitive via sensitivity:"base"
-      // (replaces the old toLowerCase()). The directory-first check above still
-      // runs first, so dirs keep sorting before files regardless of name order.
-      cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+      // Sort by char class first (digit < Latin < CJK/other) so Chinese names
+      // land after English ones; within a class, ignore hyphens and use natural
+      // numeric ordering. Fall back to the raw name so ties are deterministic.
+      // The directory-first check above still runs first, so dirs keep sorting
+      // before files regardless of name order.
+      const ca = nameClass(a.name);
+      const cb = nameClass(b.name);
+      if (ca !== cb) {
+        cmp = ca - cb;
+      } else {
+        const ka = a.name.replace(/-/g, "");
+        const kb = b.name.replace(/-/g, "");
+        cmp = ka.localeCompare(kb, undefined, { numeric: true, sensitivity: "base" });
+        if (cmp === 0) cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+      }
     } else if (col === "size") {
       cmp = a.size - b.size;
       // For size sort, directories go first regardless
