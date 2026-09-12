@@ -1,6 +1,12 @@
 # mini-tc
 
-> 基于 Tauri 2 + Vue 3 的跨平台双栏文件管理器，致敬 Total Commander。
+<p align="center">
+  <img src="mini-tc-poster_assets/8193b8d0-miora_text_to_image-1789187746977-0-407594159234.jpg" alt="mini-tc — A cross-platform dual-pane file manager" width="900" />
+</p>
+
+<p align="center"><em>基于 Tauri 2 + Vue 3 的跨平台双栏文件管理器，致敬 Total Commander。</em></p>
+
+---
 
 ## 功能
 
