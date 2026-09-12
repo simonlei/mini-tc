@@ -16,6 +16,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Drag files OUT of the window to external apps (Explorer, QQ, etc.) as real
+# native file drops. drag-rs writes CF_HDROP on Windows and
+# NSFilenamesPboardType on macOS. Linux GTK requires a non-winit window
+# handle, so cross-app drag-out is unsupported on Linux (the runtime warns).
+tauri-plugin-drag = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 trash = "5"
@@ -24,3 +29,17 @@ trash = "5"
 # the CI `rust:slim` image still builds). `cut` (move) semantics are Windows-only
 # (Preferred DropEffect); other platforms paste as copy.
 arboard = "3"
+
+# In-process patch of the `drag` crate (vendored at src-tauri/vendor/drag) it
+# depends on. The upstream crate advertises only a single DROPEFFECT (MOVE *or*
+# COPY); that's fine against Explorer, but our own wry webview drop target
+# returns a fixed DROPEFFECT_COPY for CF_HDROP, which made the allowed-effects
+# intersection empty for in-window drops — the cursor showed the forbidden
+# icon throughout the second panel and Drop() was never called, so
+# tauri://drag-drop never fired. The fork advertises `COPY | MOVE` so both
+# win32 targets (wry + Explorer) accept the drop. This patch affects Windows
+# only; the macOS/Linux branches are untouched.
+[patch.crates-io]
+drag = { path = "vendor/drag" }
+
+[workspace]

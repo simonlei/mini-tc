@@ -97,13 +97,15 @@ setup_msvc() {
   export LIB="${MSVC_WIN}\\lib\\x64;${SDK_WIN}\\Lib\\${SDK_VER}\\um\\x64;${SDK_WIN}\\Lib\\${SDK_VER}\\ucrt\\x64"
 }
 
-# ---- 确保 npm 依赖已安装（本地 tauri CLI 可用） ----
+# ---- 确保 npm 依赖已安装 ----
+# 无条件跑 npm install：幂等（已同步时几秒即过），且能装上后续新加的依赖。
+# 旧逻辑（tauri CLI 存在就跳过）会漏掉首次安装后新增的依赖。
 ensure_deps() {
-  if [ -x "${PROJECT_ROOT}/node_modules/.bin/tauri" ]; then
-    return 0
+  echo ">> 检查/安装 npm 依赖..."
+  if ! npm install; then
+    echo "[ERROR] npm install 失败，请检查网络 / registry 设置。" >&2
+    exit 1
   fi
-  echo "[1/3] 安装 npm 依赖 (本地 tauri CLI 缺失)..."
-  npm install
 }
 
 # ---- 各操作 ----

@@ -154,3 +154,35 @@ export async function addToArchive(sources, baseDir, archiveName, toolExe, synta
     syntax,
   });
 }
+
+/// Start a native OS drag-out operation: hand the given absolute file paths to
+/// drag-rs, which writes a real CF_HDROP (Windows) / NSFilenamesPboardType
+/// (macOS) so Explorer / Finder / QQ / 7-Zip etc. can receive them as files
+/// (not text). `mode` is "move" (DROPEFFECT_MOVE — recipient moves the file)
+/// or "copy" (DROPEFFECT_COPY). When the drop completes, `startDrag`
+/// resolves with the drop outcome.
+///
+/// The `image` argument drag-rs requires is intentionally an INVALID PNG,
+/// smuggled through the only string form the plugin accepts: a
+/// "data:image/png;base64," data URI (the Rust side's Base64Image deserializer
+/// rejects anything else, and non-strings fail IPC deserialization entirely).
+/// The payload here is a single 0x00 byte ("AA==") — valid base64, but not a
+/// decodable PNG. On Windows, drag-rs's `get_drag_image` returns None for an
+/// undecodable buffer, which skips the `IDragSourceHelper::InitializeFromBitmap`
+/// call entirely. Without that call, the OS auto-renders file icons from the
+/// CF_HDROP itself (the same way Explorer behaves when dragging files out of
+/// it: multiple files show a "multi-file" thumbnail + count, single files show
+/// the source file's icon). If we passed a real icon, drag-rs would override
+/// that with our custom bitmap and the OS default would never show.
+const DRAG_INVALID_IMAGE = "data:image/png;base64,AA==";
+export async function startNativeDrag({ paths, mode = "move" } = {}) {
+  if (!Array.isArray(paths) || paths.length === 0) return;
+  // Dynamic import keeps the bundle cheap if the host hasn't installed the
+  // plugin yet (e.g. dev.bat started before `npm install` ran).
+  const { startDrag } = await import("@crabnebula/tauri-plugin-drag");
+  await startDrag({
+    item: paths,
+    icon: DRAG_INVALID_IMAGE,
+    mode,
+  });
+}

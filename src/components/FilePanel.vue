@@ -1,5 +1,5 @@
 <template>
-  <div class="file-panel" :class="{ active: isActive }" @click="$emit('activate')">
+  <div class="file-panel" :class="{ active: isActive }" :data-panel-id="panelId" @click="$emit('activate')">
     <!-- Tab bar -->
     <TabBar
       :tabs="tabs"
@@ -40,7 +40,6 @@
       @open="onOpen"
       @rename="onRename"
       @ctx-menu="onCtxMenu"
-      @drop-move="onDropMove"
       @pending-select-resolved="pendingSelectName = null"
     />
 
@@ -905,12 +904,6 @@ function fallbackCopy(text, done) {
 // Expose selectedEntry and currentPath for parent access (preview feature)
 const fileListRef = ref(null);
 
-// Forward a drag-and-drop move request to the app, which owns `move_items` and
-// the two-panel refresh.
-function onDropMove(payload) {
-  emit("drop-move", payload);
-}
-
 defineExpose({
   selectedEntry,
   selectedEntries,
@@ -926,6 +919,8 @@ defineExpose({
   focusList: () => fileListRef.value?.focusList(),
   setCutNames,
   clearCut,
+  // Forward drag-target highlighting (App.vue drives this from tauri://drag-*).
+  setDragHighlight: (target) => fileListRef.value?.setDragHighlight(target),
 });
 </script>
 
