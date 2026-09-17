@@ -131,13 +131,18 @@ export async function getArchiveTools() {
 /// `toolExe` + `syntax` (from `getArchiveTools`). `mode` is "here" (extract
 /// into targetDir) or "to_folder" (extract into a new sub-folder named after
 /// the archive). Resolves to `{ success, message }`.
-export async function extractArchive(archive, targetDir, toolExe, syntax, mode) {
+/// `wait` only affects GUI tools: when true the call blocks until the tool's
+/// window closes (bounded), so a batch of archives can be extracted strictly
+/// one after another instead of stacking every dialog at once. CLI tools
+/// always run to completion.
+export async function extractArchive(archive, targetDir, toolExe, syntax, mode, wait = false) {
   return invoke("extract_archive", {
     archive,
     targetDir,
     toolExe,
     syntax,
     mode,
+    wait,
   });
 }
 

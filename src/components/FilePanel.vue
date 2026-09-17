@@ -652,6 +652,20 @@ function closeCtxMenu() {
   ctxMenu.value = { ...ctxMenu.value, visible: false };
 }
 
+// Which entries an "extract" action applies to. When the right-clicked row is
+// part of a multi-selection, every selected archive is extracted (in listing
+// order); otherwise just the right-clicked archive. Non-archives inside the
+// selection are skipped.
+function extractTargets(entry) {
+  const sel = selectedEntries.value || [];
+  const inSelection = entry && sel.some((e) => e.name === entry.name);
+  const pool = inSelection && sel.length > 1 ? sel : entry ? [entry] : [];
+  const order = new Map(entries.value.map((e, i) => [e.name, i]));
+  return pool
+    .filter((e) => e && !e.is_dir && isArchiveName(e.name))
+    .sort((a, b) => (order.get(a.name) ?? 0) - (order.get(b.name) ?? 0));
+}
+
 // Build the menu items for the given entry (null = empty background).
 function buildMenuItems(entry) {
   const items = [];
@@ -670,7 +684,8 @@ function buildMenuItems(entry) {
   items.push({ label: "重命名", action: "rename" });
   items.push({ label: "复制路径", action: "copy-path" });
 
-  if (isArchiveName(entry.name)) {
+  const extractSet = extractTargets(entry);
+  if (extractSet.length > 0) {
     items.push({ separator: true });
     if (archiveTools.value.length === 0) {
       items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
@@ -678,13 +693,18 @@ function buildMenuItems(entry) {
       // Extraction goes through each tool's GUI, which prompts for a password
       // on encrypted archives and lets the user pick the destination. Only the
       // GUI entries are listed (one per tool) to avoid duplicates.
+      // When several archives are selected, every one of them is extracted in
+      // listing order — the count is shown so it's obvious the action is a
+      // batch, not a single file.
+      const suffix = extractSet.length > 1 ? `（依次解压 ${extractSet.length} 个）` : "";
       for (const tool of archiveTools.value) {
         if (!tool.syntax.endsWith("-gui")) continue;
         items.push({
-          label: `用 ${tool.name} 解压`,
+          label: `用 ${tool.name} 解压${suffix}`,
           action: "extract",
           tool,
           mode: "to_folder",
+          targets: extractSet,
         });
       }
     }
@@ -759,9 +779,13 @@ async function handleCtxSelect(item) {
     case "rename":
       fileListRef.value?.startRenameByEntry?.(entry);
       break;
-    case "extract":
-      await doExtract(entry, item.tool, item.mode);
+    case "extract": {
+      // Batch case: the menu item carries the full set of selected archives
+      // (see extractTargets); fall back to the right-clicked row alone.
+      const targets = item.targets?.length ? item.targets : extractTargets(entry);
+      await doExtract(targets, item.tool, item.mode);
       break;
+    }
     case "add-to-archive":
       await doAddToArchive();
       break;
@@ -850,28 +874,57 @@ async function doAddToArchive() {
   }
 }
 
-// Run an external extractor on the archive and refresh the panel afterwards.
-async function doExtract(entry, tool, mode) {
+// Run an external extractor over one or more archives and refresh the panel
+// afterwards. `targets` is extracted strictly in order: GUI tools are waited
+// on (bounded) so only one tool window is open at a time, and CLI tools run to
+// completion before the next archive starts.
+async function doExtract(targets, tool, mode) {
   const path = activeTab.value?.path;
   if (!path) return;
-  const fullArchive = await joinPath(path, entry.name);
-  try {
-    const res = await extractArchive(fullArchive, path, tool.exe, tool.syntax, mode);
-    if (res && res.success) {
-      if (tool.syntax === "7z-gui") {
-        // The 7-Zip GUI extracts asynchronously in its own window (and prompts
-        // for a password when needed); don't refresh immediately.
-        showToast(res.message, "success");
+  const list = (targets || []).filter(Boolean);
+  if (list.length === 0) return;
+
+  const isGui = tool?.syntax === "7z-gui" || tool?.syntax === "winrar-gui";
+  // Only make the backend wait when there is actually a queue behind it, so a
+  // single archive still returns immediately like before.
+  const wait = isGui && list.length > 1;
+
+  let done = 0;
+  let lastMessage = "";
+  const failed = [];
+  // A batch can take a while (password prompts included), so say what's
+  // happening up front instead of leaving the UI silent until the last file.
+  if (list.length > 1) showToast(`正在依次解压 ${list.length} 个压缩包…`, "info");
+
+  for (const entry of list) {
+    const fullArchive = await joinPath(path, entry.name);
+    try {
+      const res = await extractArchive(fullArchive, path, tool.exe, tool.syntax, mode, wait);
+      if (res && res.success) {
+        done++;
+        lastMessage = res.message || "";
       } else {
-        showToast(res.message, "success");
-        refresh();
+        failed.push(entry.name);
       }
-    } else {
-      showToast("解压失败", "error");
+    } catch (e) {
+      console.error("[doExtract] failed:", entry.name, e);
+      failed.push(entry.name);
     }
-  } catch (e) {
-    showToast("解压失败：\n" + String(e), "error");
   }
+
+  if (list.length === 1) {
+    if (done === 1) showToast(lastMessage || "已解压", "success");
+    else showToast(`解压失败：${list[0].name}`, "error");
+  } else {
+    const parts = [`已解压 ${done}/${list.length} 个压缩包`];
+    if (failed.length) parts.push(`失败：${failed.join("、")}`);
+    showToast(parts.join("\n"), failed.length ? "error" : "success");
+  }
+
+  // GUI tools work in their own window (and may prompt for a password), so
+  // nothing new shows up until they are finished — unless we waited for them,
+  // in which case the results are already on disk. CLI tools are synchronous.
+  if (done > 0 && (!isGui || wait)) refresh();
 }
 
 // Copy text to the OS clipboard, falling back to a hidden textarea + execCommand

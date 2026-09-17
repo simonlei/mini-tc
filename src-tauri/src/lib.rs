@@ -2016,6 +2016,11 @@ pub struct ExtractResult {
     pub message: String,
 }
 
+/// Upper bound on how long `extract_archive` blocks while waiting for a GUI
+/// archive tool to finish (10 min). Only a safety valve against a tool window
+/// that never closes — it must never stall a batch extraction forever.
+const GUI_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Run an external archive tool to extract `archive` into `target_dir`.
 ///
 /// - `mode == "here"`: extract directly into `target_dir`.
@@ -2024,6 +2029,10 @@ pub struct ExtractResult {
 ///   automatically.
 /// `tool_exe` + `syntax` come from `get_archive_tools` so this command stays
 /// agnostic to which tool is installed.
+/// `wait` only matters for GUI tools: when true we block until the tool's
+/// window exits (bounded by `GUI_WAIT_LIMIT`) before returning, which lets the
+/// frontend extract several archives strictly one after another instead of
+/// stacking all dialogs at once. CLI tools always run to completion.
 #[tauri::command]
 fn extract_archive(
     archive: String,
@@ -2031,6 +2040,7 @@ fn extract_archive(
     tool_exe: String,
     syntax: String,
     mode: String,
+    wait: Option<bool>,
 ) -> Result<ExtractResult, String> {
     let archive_path = Path::new(&archive);
     if !archive_path.exists() {
@@ -2120,7 +2130,28 @@ fn extract_archive(
             "7-Zip"
         };
         match cmd.spawn() {
-            Ok(_) => {
+            Ok(mut child) => {
+                // When extracting several archives in one go, block here until
+                // the tool's window closes so the next archive is only started
+                // after the previous one finished (the frontend passes
+                // `wait: true` for batches). Single-archive extraction keeps
+                // returning immediately.
+                if wait.unwrap_or(false) {
+                    let deadline = std::time::Instant::now() + GUI_WAIT_LIMIT;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = child.kill();
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
                 return Ok(ExtractResult {
                     success: true,
                     message: format!("已调用 {} 图形界面解压到: {}", gui_name, target_str),
