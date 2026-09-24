@@ -41,7 +41,7 @@ internal static class PreviewService
     /// </summary>
     private static readonly HashSet<string> NativeVideoExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        "MP4", "M4V", "MOV", "MKV", "AVI", "WMV", "ASF", "3GP", "TS", "M2TS", "WEBM",
+        "MP4", "M4V", "MOV", "MKV", "AVI", "WMV", "ASF", "3GP", "TS", "M2TS", "WEBM", "OGG",
         "MPG", "MPEG", "VOB", "MTS",
     };
 

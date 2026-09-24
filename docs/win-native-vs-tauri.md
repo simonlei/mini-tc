@@ -72,11 +72,13 @@
 
 `ShortcutService.cs:66-69` 原样保留了 Tauri 为 macOS 设计的默认绑定 `Meta+Backspace`（删除）与 `Shift+Meta+Backspace`（永久删除）。在 Windows 上 `Meta` 显示为 `Win`（`ShortcutService.cs:428`），即 `Win+Backspace` / `Shift+Win+Backspace` 会触发**不可恢复的永久删除**。这两个组合在 Windows 上没有系统占用，但从 macOS 语义平移过来的默认值在 Windows 上语义陌生且无确认弹窗——建议要么在 Windows 侧剔除这两个默认值，要么在加载旧配置时做一次迁移清理。
 
+> **决策（2026-09-24）**：Backspace-删除是 macOS 约定，Windows 端不兼容。已在 `ShortcutService.cs` 的 `list.delete` / `list.deletePermanent` 默认值中**移除** `Meta+Backspace` 与 `Shift+Meta+Backspace`（保留 `Delete` / `Ctrl+Backspace` 与 `Shift+Delete` / `Ctrl+Shift+Backspace`）。`NormalizeCombo` 解析器仍保留 Meta 别名以便用户手动绑定，仅删默认值。契约测试 `DefaultBindingsMatchTheWebBuild` 同步更新。旧版 `shortcuts.json` 若曾显式把这两个组合存为 override 才会残留，属用户主动自定义，不在本次清理范围。
+
 ---
 
 ## 建议优先级
 
 1. 补 `.ogg` 到 `NativeVideoExtensions`（B3，一行改动，纯遗漏）。
 2. 明确 B1 / B2 的产品决策：若 PDF / docx 预览是必需能力，需引入 PDFium 或保留 WebView2 宿主；若接受现状，应在根目录 `README.md` 的功能列表里同步标注 Windows 端不支持，避免与「本工程仅服务 macOS」的说明冲突。
-3. 决定 D 项的 `Win+Backspace` 永久删除默认值是否保留。
+3. ~~决定 D 项的 `Win+Backspace` 永久删除默认值是否保留。~~ **已决策（2026-09-24）：直接移除这两个 Mac 起源默认值，不保留。**
 4. 剩余 B5–B9 可按体验优化排期。

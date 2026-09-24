@@ -363,6 +363,7 @@ public partial class FilePanelView : UserControl
                     }
 
                     FileList.ScrollIntoView(firstMatch);
+                    FocusEntry(firstMatch);
                 }
             }
             finally
@@ -372,6 +373,39 @@ public partial class FilePanelView : UserControl
 
             OnSelectionChanged(this, null!);
         });
+    }
+
+    /// <summary>
+    /// Parks keyboard focus on the row for <paramref name="entry"/> so the arrow
+    /// keys keep moving from the restored row instead of snapping back to the top
+    /// of the list. The restore runs right after the rows are regenerated, but a
+    /// row can still be unrealised under UI virtualization (e.g. the folder we
+    /// came from after ".."), so fall back to a post-layout pass when its
+    /// container isn't ready yet.
+    /// </summary>
+    private void FocusEntry(FileEntry entry)
+    {
+        if (entry is null)
+        {
+            return;
+        }
+
+        FileList.Focus();
+
+        if (FileList.ItemContainerGenerator.ContainerFromItem(entry) is ListViewItem container)
+        {
+            container.Focus();
+            return;
+        }
+
+        // Not yet realised (virtualization): wait for layout, then focus it.
+        FileList.Dispatcher.InvokeAsync(() =>
+        {
+            if (FileList.ItemContainerGenerator.ContainerFromItem(entry) is ListViewItem realized)
+            {
+                realized.Focus();
+            }
+        }, System.Windows.Threading.DispatcherPriority.Loaded);
     }
 
     internal void FocusList()

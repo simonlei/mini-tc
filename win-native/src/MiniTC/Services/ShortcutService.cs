@@ -63,10 +63,15 @@ internal static class ShortcutService
         new("list.extendFirst", ShortcutScope.FileList, "扩展到首项", null, ["Shift+Home"]),
         new("list.extendLast", ShortcutScope.FileList, "扩展到末项", null, ["Shift+End"]),
         new("list.dirSize", ShortcutScope.FileList, "计算目录大小", "对选中的目录统计占用空间", ["Space"]),
+        // On Windows Meta maps to the Win key, so the web build's Mac-origin
+        // "Meta+Backspace" (trash) and "Shift+Meta+Backspace" (permanent delete)
+        // defaults would fire unrecoverable permanent deletion with no confirm
+        // dialog. Those are intentionally dropped on Windows; Backspace-delete is
+        // a macOS convention we don't carry over.
         new("list.delete", ShortcutScope.FileList, "删除", "移入回收站",
-            ["Delete", "Ctrl+Backspace", "Meta+Backspace"]),
+            ["Delete", "Ctrl+Backspace"]),
         new("list.deletePermanent", ShortcutScope.FileList, "永久删除", "不经过回收站，直接抹除（不可恢复）",
-            ["Shift+Delete", "Ctrl+Shift+Backspace", "Shift+Meta+Backspace"]),
+            ["Shift+Delete", "Ctrl+Shift+Backspace"]),
         new("list.rename", ShortcutScope.FileList, "重命名", null, ["F2"]),
         new("list.newFolder", ShortcutScope.FileList, "新建文件夹", null, ["F7"]),
         new("list.refresh", ShortcutScope.FileList, "刷新", null, ["F5"]),

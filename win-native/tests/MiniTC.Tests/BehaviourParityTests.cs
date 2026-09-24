@@ -115,11 +115,14 @@ public class ShortcutComboTests
     [Fact]
     public void DefaultBindingsMatchTheWebBuild()
     {
-        // These three carry multiple defaults and a specific modifier order.
+        // These carry multiple defaults and a specific modifier order. Note the
+        // web build's Mac-origin "Meta+Backspace" / "Shift+Meta+Backspace" defaults
+        // are intentionally dropped on Windows (Meta = Win key → unrecoverable
+        // permanent delete with no confirm), so they are absent here.
         Assert.Equal(["Ctrl+Q"], ShortcutService.GetBindings("preview.toggle"));
-        Assert.Equal(["Delete", "Ctrl+Backspace", "Meta+Backspace"],
+        Assert.Equal(["Delete", "Ctrl+Backspace"],
             ShortcutService.GetBindings("list.delete"));
-        Assert.Equal(["Shift+Delete", "Ctrl+Shift+Backspace", "Shift+Meta+Backspace"],
+        Assert.Equal(["Shift+Delete", "Ctrl+Shift+Backspace"],
             ShortcutService.GetBindings("list.deletePermanent"));
     }
 
