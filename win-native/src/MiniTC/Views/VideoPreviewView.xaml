@@ -1,0 +1,148 @@
+<UserControl x:Class="MiniTC.Views.VideoPreviewView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:MiniTC.Views"
+             Focusable="True">
+
+  <UserControl.Resources>
+    <views:DurationConverter x:Key="Duration" />
+  </UserControl.Resources>
+
+  <Border Background="#FF0B0B0B" BorderBrush="{DynamicResource Brush.Stroke.Default}"
+          BorderThickness="1" CornerRadius="{DynamicResource Radius.Layer}">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+
+      <!-- ============ Header ============ -->
+      <Border x:Name="HeaderBar" Grid.Row="0" Padding="10,6" Background="#FF161616">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+
+          <Border Grid.Column="0" Padding="6,1" CornerRadius="3" Margin="0,0,8,0"
+                  Background="{DynamicResource Brush.Accent.Muted}">
+            <TextBlock Text="VIDEO" FontSize="10" FontWeight="SemiBold" Foreground="White" />
+          </Border>
+
+          <TextBlock Grid.Column="1" x:Name="TitleText" Foreground="White"
+                     VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+
+          <Button Grid.Column="2" Content="&#xE711;" Style="{StaticResource Button.Icon}"
+                  Foreground="White" Click="OnCloseClick" ToolTip="关闭预览 (Esc)" />
+        </Grid>
+      </Border>
+
+      <!-- ============ Video surface ============ -->
+      <Grid Grid.Row="1" Background="Black" ClipToBounds="True"
+            MouseWheel="OnSurfaceMouseWheel"
+            MouseLeftButtonDown="OnSurfaceClick"
+            MouseMove="OnSurfaceMouseMove">
+
+        <MediaElement x:Name="Player" LoadedBehavior="Manual" UnloadedBehavior="Manual"
+                      Stretch="Uniform" ScrubbingEnabled="True"
+                      MediaOpened="OnMediaOpened"
+                      MediaEnded="OnMediaEnded"
+                      MediaFailed="OnMediaFailed" />
+
+        <!-- Subtitle overlay: Media Foundation cannot render sidecar files. -->
+        <TextBlock x:Name="SubtitleText" VerticalAlignment="Bottom" HorizontalAlignment="Center"
+                   Margin="24,0,24,28" TextAlignment="Center" TextWrapping="Wrap"
+                   FontSize="20" FontWeight="SemiBold" Foreground="White"
+                   IsHitTestVisible="False">
+          <TextBlock.Effect>
+            <DropShadowEffect BlurRadius="5" ShadowDepth="1" Color="Black" Opacity="0.95" />
+          </TextBlock.Effect>
+        </TextBlock>
+
+        <!-- Centre play badge when paused -->
+        <Border x:Name="PlayBadge" Width="64" Height="64" CornerRadius="32"
+                Background="#88000000" HorizontalAlignment="Center" VerticalAlignment="Center"
+                IsHitTestVisible="False">
+          <TextBlock Text="&#xE768;" FontFamily="{DynamicResource Font.Icons}" FontSize="26"
+                     Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        </Border>
+
+        <!-- Fallback for formats Media Foundation has no decoder for -->
+        <Grid x:Name="FallbackHost" Background="#FF101010" Visibility="Collapsed">
+          <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="24">
+            <TextBlock Text="&#xE714;" FontFamily="{DynamicResource Font.Icons}" FontSize="36"
+                       HorizontalAlignment="Center" Foreground="#FF9A9A9A" />
+            <TextBlock x:Name="FallbackText" Margin="0,14,0,0" MaxWidth="340" TextWrapping="Wrap"
+                       TextAlignment="Center" Foreground="#FFBFBFBF" />
+            <Button Content="用系统播放器打开" Margin="0,16,0,0" HorizontalAlignment="Center"
+                    Style="{StaticResource Button.Accent}" Click="OnOpenExternalClick" />
+          </StackPanel>
+        </Grid>
+      </Grid>
+
+      <!-- ============ Controls ============ -->
+      <Border Grid.Row="2" Background="#FF161616" Padding="10,4,10,6"
+              MouseEnter="OnControlsMouseEnter" MouseLeave="OnControlsMouseLeave">
+        <StackPanel>
+          <!-- The timeline stays visible at all times; only the button row auto-hides. -->
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Column="0" x:Name="PositionText" Text="0:00" Foreground="#FFBFBFBF"
+                       FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0" />
+
+            <Slider Grid.Column="1" x:Name="Timeline" Style="{StaticResource Slider.Fluent}"
+                    Minimum="0" Maximum="1" SmallChange="1" LargeChange="10"
+                    Thumb.DragStarted="OnTimelineDragStarted"
+                    Thumb.DragCompleted="OnTimelineDragCompleted"
+                    PreviewMouseLeftButtonUp="OnTimelineClick" />
+
+            <TextBlock Grid.Column="2" x:Name="DurationText" Text="0:00" Foreground="#FFBFBFBF"
+                       FontSize="11" VerticalAlignment="Center" Margin="8,0,0,0" />
+          </Grid>
+
+          <!-- Button row -->
+          <Grid x:Name="ButtonRow" Margin="0,4,0,0">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+              <Button x:Name="PlayButton" Content="&#xE768;" Style="{StaticResource Button.Icon}"
+                      Foreground="White" Click="OnPlayPauseClick" ToolTip="播放 / 暂停 (Space)" />
+              <Button Content="&#xE892;" Style="{StaticResource Button.Icon}" Foreground="White"
+                      Click="OnBack10Click" ToolTip="快退 10 秒" />
+              <Button Content="&#xE893;" Style="{StaticResource Button.Icon}" Foreground="White"
+                      Click="OnForward10Click" ToolTip="快进 10 秒" />
+
+              <Button x:Name="MuteButton" Content="&#xE767;" Style="{StaticResource Button.Icon}"
+                      Foreground="White" Margin="8,0,0,0" Click="OnMuteClick" ToolTip="静音 (M)" />
+              <Slider x:Name="VolumeSlider" Style="{StaticResource Slider.Fluent}" Width="80"
+                      Minimum="0" Maximum="1" Value="1" VerticalAlignment="Center"
+                      ValueChanged="OnVolumeChanged" ToolTip="音量（滚轮可调）" />
+            </StackPanel>
+
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+              <ComboBox x:Name="SubtitleBox" Width="130" Margin="0,0,6,0"
+                        SelectionChanged="OnSubtitleChanged" ToolTip="字幕轨 (C)" />
+              <Button Content="&#xE76B;" Style="{StaticResource Button.Icon}" Foreground="White"
+                      Click="OnSubtitleOffsetBackClick" ToolTip="字幕提前 0.5 秒" />
+              <TextBlock x:Name="OffsetText" Text="0.0s" Foreground="#FFBFBFBF" FontSize="11"
+                         VerticalAlignment="Center" Width="38" TextAlignment="Center" />
+              <Button Content="&#xE76C;" Style="{StaticResource Button.Icon}" Foreground="White"
+                      Click="OnSubtitleOffsetForwardClick" ToolTip="字幕延后 0.5 秒" />
+
+              <ComboBox x:Name="RateBox" Width="72" Margin="6,0,0,0"
+                        SelectionChanged="OnRateChanged" ToolTip="播放速度" />
+
+              <Button Content="&#xE740;" Style="{StaticResource Button.Icon}" Foreground="White"
+                      Margin="6,0,0,0" Click="OnFullscreenClick" ToolTip="全屏 (F)" />
+            </StackPanel>
+          </Grid>
+        </StackPanel>
+      </Border>
+    </Grid>
+  </Border>
+</UserControl>

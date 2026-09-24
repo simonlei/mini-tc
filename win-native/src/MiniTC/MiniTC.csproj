@@ -1,0 +1,54 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>false</UseWindowsForms>
+    <LangVersion>12</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>MiniTC</RootNamespace>
+    <AssemblyName>MiniTC</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\minitc.ico</ApplicationIcon>
+
+    <!-- Stays on the plain net8.0-windows TFM on purpose: we reach Windows
+         through P/Invoke only, so pulling in the WinRT projections (and their
+         restore cost) would buy nothing. Win10 1809 is the effective floor,
+         enforced at runtime by WindowTheming's build checks. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <Product>MiniTC</Product>
+    <Company>MiniTC</Company>
+    <Description>A lightweight native Windows dual-pane file manager</Description>
+
+    <!-- Startup latency: R2R removes most JIT work on the hot path. -->
+    <TieredPGO>true</TieredPGO>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.12" />
+    <PackageReference Include="Velopack" Version="1.2.158" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\minitc.ico" Condition="Exists('Assets\minitc.ico')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The behaviour worth testing (sort order, combo parsing, path expansion)
+         lives in internal helpers; expose them to the test project only. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>MiniTC.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

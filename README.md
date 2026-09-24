@@ -4,7 +4,17 @@
   <img src="mini-tc-poster_assets/8193b8d0-miora_text_to_image-1789187746977-0-407594159234.jpg" alt="mini-tc — A cross-platform dual-pane file manager" width="900" />
 </p>
 
-<p align="center"><em>基于 Tauri 2 + Vue 3 的跨平台双栏文件管理器，致敬 Total Commander。</em></p>
+<p align="center"><em>双栏文件管理器，致敬 Total Commander。</em></p>
+
+---
+
+> ## ⚠️ Windows 用户请看 [`win-native/`](win-native/README.md)
+>
+> 为解决启动慢与本地适配问题，**Windows 端已重写为 WPF + .NET 8 原生实现**，见 [`win-native/`](win-native/README.md)：
+> 冷启动约 340 ms（原先需等 WebView2 初始化 + 1.2s splash）、文件操作改用 Shell `IFileOperation`（与资源管理器行为一致）、原生 Fluent 界面（跟随系统深浅色，兼容 Win10 1809+ 与 Win11）。
+> 配置目录 `~/.minitc` 完全兼容，升级无需迁移。
+>
+> **本工程（Tauri + Vue）自此仅服务 macOS**，以下文档描述的是该实现。
 
 ---
 

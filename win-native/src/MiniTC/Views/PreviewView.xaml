@@ -1,0 +1,118 @@
+<UserControl x:Class="MiniTC.Views.PreviewView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:MiniTC.Views">
+
+  <UserControl.Resources>
+    <views:PreviewKindConverter x:Key="PreviewKind" />
+    <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+  </UserControl.Resources>
+
+  <Border Background="{DynamicResource Brush.Layer.Background}"
+          BorderBrush="{DynamicResource Brush.Stroke.Default}"
+          BorderThickness="1" CornerRadius="{DynamicResource Radius.Layer}">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+
+      <!-- ============ Header ============ -->
+      <Border Grid.Row="0" Padding="10,6" BorderThickness="0,0,0,1"
+              BorderBrush="{DynamicResource Brush.Stroke.Default}">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+
+          <Border Grid.Column="0" Padding="6,1" CornerRadius="3" Margin="0,0,8,0"
+                  Background="{DynamicResource Brush.Accent.Muted}">
+            <TextBlock x:Name="TypeBadge" Text="TEXT" FontSize="10" FontWeight="SemiBold" />
+          </Border>
+
+          <TextBlock Grid.Column="1" Text="{Binding PreviewName}" VerticalAlignment="Center"
+                     TextTrimming="CharacterEllipsis" />
+
+          <Button Grid.Column="2" Content="&#xE711;" Style="{StaticResource Button.Icon}"
+                  Click="OnCloseClick" ToolTip="关闭预览 (Esc)" />
+        </Grid>
+      </Border>
+
+      <!-- ============ Body ============ -->
+      <Grid Grid.Row="1">
+
+        <!-- Text -->
+        <ScrollViewer x:Name="TextHost" VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Auto"
+                      Background="{DynamicResource Brush.Preview.Canvas}"
+                      Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Text}">
+          <TextBox x:Name="TextBody" IsReadOnly="True" BorderThickness="0"
+                   Background="Transparent" Padding="12"
+                   FontFamily="{DynamicResource Font.Mono}" FontSize="12"
+                   TextWrapping="NoWrap"
+                   VerticalScrollBarVisibility="Disabled"
+                   HorizontalScrollBarVisibility="Disabled"
+                   AcceptsReturn="True" />
+        </ScrollViewer>
+
+        <!-- Image -->
+        <Grid Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Image}"
+              Background="{DynamicResource Brush.Preview.Canvas}">
+          <Image x:Name="ImageBody" Stretch="Uniform" StretchDirection="DownOnly"
+                 Margin="8" RenderOptions.BitmapScalingMode="HighQuality" />
+        </Grid>
+
+        <!-- Unsupported -->
+        <Grid Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Unsupported}">
+          <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="24">
+            <TextBlock Text="&#xE8A5;" FontFamily="{DynamicResource Font.Icons}" FontSize="36"
+                       HorizontalAlignment="Center"
+                       Foreground="{DynamicResource Brush.Text.Tertiary}" />
+            <TextBlock Text="暂不支持预览该格式" Margin="0,14,0,0" HorizontalAlignment="Center"
+                       Foreground="{DynamicResource Brush.Text.Secondary}" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,16,0,0">
+              <Button x:Name="AsTextButton" Content="按文本预览" Click="OnPreviewAsTextClick"
+                      Style="{StaticResource Button.Subtle}"
+                      BorderBrush="{DynamicResource Brush.Stroke.Strong}" />
+              <Button Content="用系统程序打开" Margin="8,0,0,0" Click="OnOpenExternalClick"
+                      Style="{StaticResource Button.Subtle}"
+                      BorderBrush="{DynamicResource Brush.Stroke.Strong}" />
+            </StackPanel>
+          </StackPanel>
+        </Grid>
+
+        <!-- Error -->
+        <Grid x:Name="ErrorHost" Visibility="Collapsed"
+              Background="{DynamicResource Brush.Layer.Background}">
+          <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="24">
+            <TextBlock Text="&#xE783;" FontFamily="{DynamicResource Font.Icons}" FontSize="32"
+                       HorizontalAlignment="Center" Foreground="{DynamicResource Brush.Danger}" />
+            <TextBlock x:Name="ErrorText" Margin="0,12,0,0" MaxWidth="320" TextWrapping="Wrap"
+                       TextAlignment="Center" Foreground="{DynamicResource Brush.Text.Secondary}" />
+          </StackPanel>
+        </Grid>
+
+        <!-- Loading -->
+        <Grid x:Name="LoadingHost" Visibility="Collapsed"
+              Background="{DynamicResource Brush.Layer.Background}">
+          <TextBlock Text="载入中…" VerticalAlignment="Center" HorizontalAlignment="Center"
+                     Foreground="{DynamicResource Brush.Text.Tertiary}" />
+        </Grid>
+      </Grid>
+
+      <!-- ============ Footer ============ -->
+      <Border Grid.Row="2" Padding="10,4" BorderThickness="0,1,0,0"
+              BorderBrush="{DynamicResource Brush.Stroke.Default}">
+        <Grid>
+          <TextBlock x:Name="FooterInfo" Style="{StaticResource Text.Secondary}" />
+          <Button x:Name="CopyAllButton" Content="复制全部" HorizontalAlignment="Right"
+                  Padding="8,2" Click="OnCopyAllClick" Visibility="Collapsed"
+                  Style="{StaticResource Button.Subtle}" />
+        </Grid>
+      </Border>
+    </Grid>
+  </Border>
+</UserControl>

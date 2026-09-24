@@ -1,0 +1,22 @@
+<Window x:Class="MiniTC.Views.InputDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MiniTC" SizeToContent="Height" Width="420"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Background="{DynamicResource Brush.App.Background}"
+        FontFamily="{DynamicResource Font.Ui}"
+        FontSize="{DynamicResource Font.Size.Body}">
+  <StackPanel Margin="18">
+    <TextBlock x:Name="PromptText" Margin="0,0,0,8" />
+
+    <TextBox x:Name="ValueBox" Padding="8,6" KeyDown="OnValueKeyDown" />
+
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button Content="确定" Style="{StaticResource Button.Accent}" MinWidth="88"
+              Click="OnConfirmClick" IsDefault="True" />
+      <Button Content="取消" MinWidth="88" Margin="8,0,0,0"
+              Click="OnCancelClick" IsCancel="True" Padding="16,5" />
+    </StackPanel>
+  </StackPanel>
+</Window>
