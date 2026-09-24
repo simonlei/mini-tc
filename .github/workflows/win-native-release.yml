@@ -116,11 +116,20 @@ jobs:
           COS_REGION: ${{ secrets.COS_REGION }}
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
           COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+          # AWS CLI >= 2.22 (botocore >= 1.36) adds CRC32 request checksums as
+          # *trailing headers* in aws-chunked encoding. Each UploadPart then
+          # carries no Content-Length, and COS answers MissingContentLength.
+          # Only the 11 MB Setup.exe crosses the 8 MB multipart threshold, which
+          # is why the small feed files upload fine and this one fails.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           if [ -z "${COS_BUCKET:-}" ]; then
             echo "COS secrets not configured; skipping feed publish."
             exit 0
           fi
+
+          aws --version
 
           aws configure set aws_access_key_id "$COS_SECRET_ID"
           aws configure set aws_secret_access_key "$COS_SECRET_KEY"
@@ -129,6 +138,8 @@ jobs:
           # chunked payload signing omits Content-Length, which COS requires.
           aws configure set s3.addressing_style virtual
           aws configure set s3.payload_signing_enabled false
+          # Keep multipart uploads small so a failed part costs little to retry.
+          aws configure set default.s3.multipart_chunksize 8MB
           aws configure set s3.max_concurrent_requests 2
           aws configure set default.retry_mode standard
           aws configure set default.max_attempts 8

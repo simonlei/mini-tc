@@ -106,7 +106,9 @@ cd win-native
 ./scripts/build-release.ps1 -Version 0.2.0 -SelfContained   # 约 90 MB，无任何前置依赖
 ```
 
-产物在 `artifacts/releases/`：安装包、便携包、`*.nupkg`（含增量）与 `releases.win.json` 更新清单。整个目录上传到 `<CDN>/win-native/` 即完成发布。
+产物在 `artifacts/releases/`：`MiniTC-win-Setup.exe` 安装包、`MiniTC-<版本>-full.nupkg` 更新包，以及更新清单 `releases.win.json` / `assets.win.json` / `RELEASES`。整个目录上传到 `<CDN>/win-native/` 即完成发布。
+
+> 不出便携包（`--noPortable`）：解压版无法自更新（`UpdateService.IsInstalled` 为 false），只会被当成「便携版，更新不可用」。
 
 CI 走 `.github/workflows/win-native-release.yml`，推送 `win-v*` tag 触发（与 mac 端的 `v*` tag 互不干扰），复用现有 `COS_*` secrets。
 

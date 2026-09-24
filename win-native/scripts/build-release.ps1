@@ -97,7 +97,10 @@ $packArgs = @(
   '--packTitle', 'MiniTC',
   '--packAuthors', 'MiniTC',
   '--outputDir', $releaseDir,
-  '--channel', $Channel
+  '--channel', $Channel,
+  # We only ship the installer; the portable zip can't self-update
+  # (UpdateService.IsInstalled is false for it), so it only confuses users.
+  '--noPortable'
 )
 
 $icon = Join-Path $root 'src/MiniTC/Assets/minitc.ico'
