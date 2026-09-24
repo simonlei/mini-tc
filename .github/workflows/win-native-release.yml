@@ -65,10 +65,16 @@ jobs:
       - name: Build release
         working-directory: win-native
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SELF_CONTAINED: ${{ inputs.self_contained }}
         run: |
-          $args = @('-Version', '${{ steps.version.outputs.version }}')
-          if ('${{ inputs.self_contained }}' -eq 'true') { $args += '-SelfContained' }
-          ./scripts/build-release.ps1 @args
+          # Hashtable splatting: an array splat binds values positionally, so
+          # the literal '-Version' would be passed as the Version value.
+          # $args is also a reserved automatic variable, hence $buildArgs.
+          $buildArgs = @{ Version = $env:RELEASE_VERSION }
+          if ($env:RELEASE_SELF_CONTAINED -eq 'true') { $buildArgs.SelfContained = $true }
+          ./scripts/build-release.ps1 @buildArgs
 
       - name: Upload artifacts to GitHub Release
         env:
