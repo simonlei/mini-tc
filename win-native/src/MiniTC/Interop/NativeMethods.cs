@@ -38,9 +38,10 @@ internal static class NativeMethods
     internal static extern bool DestroyIcon(IntPtr hIcon);
 
     /// <summary>
-    /// The exact comparison Explorer uses for file names: case-insensitive and
-    /// digit-runs compared by value ("2c" &lt; "10b"). Reusing it keeps our sort
-    /// order identical to the shell instead of approximating it.
+    /// The exact comparison Windows Explorer uses for file names: case-insensitive
+    /// and digit runs compared by value ("2" &lt; "10"). Routing the native name
+    /// sort through it makes mini-tc's order identical to the shell instead of
+    /// approximating it.
     /// </summary>
     [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     internal static extern int StrCmpLogicalW(string psz1, string psz2);

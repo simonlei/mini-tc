@@ -6,10 +6,11 @@ namespace MiniTC.Services;
 /// <summary>
 /// Reproduces the sort order users already rely on:
 /// <list type="bullet">
+///   <item>the synthetic ".." row is pinned to the top</item>
 ///   <item>directories before files, in every column</item>
-///   <item>hyphens ignored, so "-1a.txt" sorts as "1a.txt"</item>
-///   <item>char classes ordered digit &lt; Latin &lt; CJK, so 0.txt &lt; a.txt &lt; 推特.txt</item>
-///   <item>digit runs compared numerically, so 1a &lt; 2c &lt; 10b</item>
+///   <item>file names are ordered exactly like Windows Explorer, via the same
+///         <c>StrCmpLogicalW</c> the shell uses — case-insensitive and with digit
+///         runs compared by value ("2" &lt; "10", ".accelerate" before "1-50").</item>
 /// </list>
 /// </summary>
 internal sealed class FileEntryComparer(SortColumn column, bool ascending) : IComparer<FileEntry>
@@ -47,55 +48,17 @@ internal sealed class FileEntryComparer(SortColumn column, bool ascending) : ICo
             SortColumn.Size => a.Size.CompareTo(b.Size),
             SortColumn.Type => string.Compare(a.Extension, b.Extension, StringComparison.OrdinalIgnoreCase),
             SortColumn.Modified => a.Modified.CompareTo(b.Modified),
-            _ => CompareNames(a.Name, b.Name),
+            _ => NativeMethods.StrCmpLogicalW(a.Name, b.Name),
         };
 
+        // Stable secondary key: when sorting by anything other than name,
+        // break ties with the Explorer-style name order so the result is
+        // deterministic and matches the shell.
         if (cmp == 0 && column != SortColumn.Name)
         {
-            cmp = CompareNames(a.Name, b.Name);
+            cmp = NativeMethods.StrCmpLogicalW(a.Name, b.Name);
         }
 
         return ascending ? cmp : -cmp;
     }
-
-    internal static int CompareNames(string left, string right)
-    {
-        var classLeft = NameClass(left);
-        var classRight = NameClass(right);
-
-        if (classLeft != classRight)
-        {
-            return classLeft - classRight;
-        }
-
-        var keyLeft = StripHyphens(left);
-        var keyRight = StripHyphens(right);
-
-        var cmp = NativeMethods.StrCmpLogicalW(keyLeft, keyRight);
-        return cmp != 0 ? cmp : NativeMethods.StrCmpLogicalW(left, right);
-    }
-
-    /// <summary>0 = digit, 1 = Latin letter, 2 = anything else (CJK, symbols).</summary>
-    private static int NameClass(string name)
-    {
-        foreach (var ch in name)
-        {
-            if (ch == '-')
-            {
-                continue;
-            }
-
-            if (ch is >= '0' and <= '9')
-            {
-                return 0;
-            }
-
-            return (ch is >= 'a' and <= 'z') || (ch is >= 'A' and <= 'Z') ? 1 : 2;
-        }
-
-        return 2;
-    }
-
-    private static string StripHyphens(string value)
-        => value.Contains('-') ? value.Replace("-", string.Empty) : value;
 }

@@ -16,7 +16,7 @@ public partial class FilePanelView : UserControl
     /// <summary>Marks a drag that originated inside this application.</summary>
     private const string InternalDragFormat = "MiniTC.InternalDrag";
 
-    private readonly Dictionary<string, string> _headerTitles = new(StringComparer.Ordinal);
+    private readonly Dictionary<GridViewColumn, string> _baseTitles = new();
 
     private MainViewModel _shell = null!;
     private PanelViewModel _panel = null!;
@@ -95,25 +95,41 @@ public partial class FilePanelView : UserControl
             return;
         }
 
+        _baseTitles.Clear();
         foreach (var column in grid.Columns)
         {
-            if (column.Header is GridViewColumnHeader { Tag: string tag } header)
+            if (column.Header is string title)
             {
-                _headerTitles[tag] = header.Content?.ToString() ?? tag;
+                _baseTitles[column] = title;
             }
         }
     }
 
     private void OnColumnHeaderClick(object sender, RoutedEventArgs e)
     {
-        if (sender is not GridViewColumnHeader { Tag: string tag })
+        // Click is a bubbling routed event raised by the generated header
+        // container; it reaches the ListView handler, so the real source is the
+        // GridViewColumnHeader the user clicked (not the ListView `sender`).
+        var header = e.OriginalSource as GridViewColumnHeader
+                     ?? FindAncestor<GridViewColumnHeader>(e.OriginalSource);
+
+        if (header?.Column is not { } column)
         {
             return;
         }
 
-        _panel.SetSort(Enum.Parse<SortColumn>(tag));
+        _panel.SetSort(ColumnToSort(column));
         ApplySortIndicators();
     }
+
+    private SortColumn ColumnToSort(GridViewColumn column) => column switch
+    {
+        _ when ReferenceEquals(column, NameColumn) => SortColumn.Name,
+        _ when ReferenceEquals(column, SizeColumn) => SortColumn.Size,
+        _ when ReferenceEquals(column, TypeColumn) => SortColumn.Type,
+        _ when ReferenceEquals(column, ModifiedColumn) => SortColumn.Modified,
+        _ => SortColumn.Name,
+    };
 
     private void ApplySortIndicators()
     {
@@ -122,17 +138,16 @@ public partial class FilePanelView : UserControl
             return;
         }
 
-        var activeTag = _panel.SortColumn.ToString();
+        var active = _panel.SortColumn;
 
         foreach (var column in grid.Columns)
         {
-            if (column.Header is not GridViewColumnHeader { Tag: string tag } header)
+            if (!_baseTitles.TryGetValue(column, out var title))
             {
                 continue;
             }
 
-            var title = _headerTitles.GetValueOrDefault(tag, tag);
-            header.Content = tag == activeTag
+            column.Header = ColumnToSort(column) == active
                 ? title + (_panel.Ascending ? "  \u2191" : "  \u2193")
                 : title;
         }

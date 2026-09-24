@@ -194,12 +194,11 @@
                   AllowDrop="True"
                   DragOver="OnListDragOver"
                   DragLeave="OnListDragLeave"
-                  Drop="OnListDrop">
+                  Drop="OnListDrop" GridViewColumnHeader.Click="OnColumnHeaderClick">
           <ListView.View>
             <GridView AllowsColumnReorder="False"
                       ColumnHeaderContainerStyle="{StaticResource GridViewColumnHeader.Fluent}">
-              <GridViewColumn x:Name="NameColumn" Width="320">
-                <GridViewColumnHeader Content="名称" Tag="Name" Click="OnColumnHeaderClick" />
+              <GridViewColumn x:Name="NameColumn" Width="320" Header="名称">
                 <GridViewColumn.CellTemplate>
                   <DataTemplate DataType="{x:Type models:FileEntry}">
                     <Grid>
@@ -224,8 +223,7 @@
                 </GridViewColumn.CellTemplate>
               </GridViewColumn>
 
-              <GridViewColumn Width="90">
-                <GridViewColumnHeader Content="大小" Tag="Size" Click="OnColumnHeaderClick" />
+              <GridViewColumn x:Name="SizeColumn" Width="90" Header="大小">
                 <GridViewColumn.CellTemplate>
                   <DataTemplate DataType="{x:Type models:FileEntry}">
                     <TextBlock Text="{Binding SizeText}" HorizontalAlignment="Right"
@@ -235,8 +233,7 @@
                 </GridViewColumn.CellTemplate>
               </GridViewColumn>
 
-              <GridViewColumn Width="80">
-                <GridViewColumnHeader Content="类型" Tag="Type" Click="OnColumnHeaderClick" />
+              <GridViewColumn x:Name="TypeColumn" Width="80" Header="类型">
                 <GridViewColumn.CellTemplate>
                   <DataTemplate DataType="{x:Type models:FileEntry}">
                     <TextBlock Text="{Binding TypeText}" TextTrimming="CharacterEllipsis"
@@ -245,8 +242,7 @@
                 </GridViewColumn.CellTemplate>
               </GridViewColumn>
 
-              <GridViewColumn Width="130">
-                <GridViewColumnHeader Content="修改时间" Tag="Modified" Click="OnColumnHeaderClick" />
+              <GridViewColumn x:Name="ModifiedColumn" Width="130" Header="修改时间">
                 <GridViewColumn.CellTemplate>
                   <DataTemplate DataType="{x:Type models:FileEntry}">
                     <TextBlock Text="{Binding ModifiedText}"
