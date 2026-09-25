@@ -59,10 +59,14 @@
         </ScrollViewer>
 
         <!-- Image -->
-        <Grid Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Image}"
-              Background="{DynamicResource Brush.Preview.Canvas}">
+        <Grid x:Name="ImageHost"
+              Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Image}"
+              Background="{DynamicResource Brush.Preview.Canvas}"
+              SizeChanged="OnImageHostSizeChanged">
+          <!-- LowQuality, not HighQuality: the preview always scales *down*, where
+               Fant resampling costs real CPU time and buys nothing visible. -->
           <Image x:Name="ImageBody" Stretch="Uniform" StretchDirection="DownOnly"
-                 Margin="8" RenderOptions.BitmapScalingMode="HighQuality" />
+                 Margin="8" RenderOptions.BitmapScalingMode="LowQuality" />
         </Grid>
 
         <!-- PDF -->

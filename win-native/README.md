@@ -93,7 +93,7 @@ win-native/
 | 类型 | 实现 |
 |---|---|
 | 文本 | `txt/md/json/log` + 用户自定义后缀；2 MB 上限，`.log` 超限只读末尾 512 KB；BOM → 严格 UTF-8 → GBK 逐级嗅探（原版一律 lossy UTF-8）；`.json` 自动 2 空格缩进美化（解析失败回退原文并提示「JSON 格式错误」） |
-| 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除）；**GIF 走逐帧动画**——WPF 不会自己播放 GIF（`Image` 无论 Freeze 与否都只显示首帧），故解码全部帧后用 `ObjectAnimationUsingKeyFrames` 驱动 `Image.Source` 循环播放，每帧延迟读自 `/grctlext/Delay`；**每帧需先合成到完整画布**——GIF 帧通常只含与上一帧的差异、尺寸小于画布且有偏移和透明色，直接播放会让未覆盖区域透明（深色预览背景下即大片黑块），故按 `/imgdesc/Left`/`Top` 定位绘制，并依 `/grctlext/Disposal` 还原上一帧；已是完整帧、无透明且无需还原的 GIF 免合成，超 500 帧或总像素超 32M 降级为首帧。解码在后台线程进行并缓存（切回已看过的图秒开），宽于 1600 px 的静态图解码时即缩放（footer 仍显示原始尺寸），源文件始终不锁 |
+| 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除）；**GIF 走逐帧动画**——WPF 不会自己播放 GIF（`Image` 无论 Freeze 与否都只显示首帧），故解码全部帧后用 `ObjectAnimationUsingKeyFrames` 驱动 `Image.Source` 循环播放，每帧延迟读自 `/grctlext/Delay`；**每帧需先合成到完整画布**——GIF 帧通常只含与上一帧的差异、尺寸小于画布且有偏移和透明色，直接播放会让未覆盖区域透明（深色预览背景下即大片黑块），故按 `/imgdesc/Left`/`Top` 定位绘制，并依 `/grctlext/Disposal` 还原上一帧；已是完整帧、无透明且无需还原的 GIF 免合成，超 500 帧或总像素超 32M 降级为首帧。源文件始终不锁。**加载性能**：选中一个文件会连续触发多个属性变更，故加载统一走 60 ms 防抖（快速浏览时只为停下的那张图解码一次；命中缓存则立即显示、不等防抖）；静态图按预览列实际宽度解码（量化到 512/768/1024/1280/1600 档，含 DPI 与 1.25 倍余量），缓存为 LRU 8 张——早先是「满 4 张就整体清空」，浏览几张后回头看等于重新解码 |
 | 视频 | LibVLC（`LibVLCSharp.WPF` 的 `VideoView`）；常驻进度条、按钮行 3 秒自动隐藏、±5/±30 秒、倍速、音量滚轮、播完自动续播下一个、全屏。外挂字幕（同目录探测 / 手动加载 / ±0.5 秒偏移）已随引擎替换暂时移除 |
 | PDF | PdfiumViewer 原生渲染（不引 WebView2），翻页、适应宽度 / 实际大小，显示「第 X / Y 页」（对齐 WebView 版 `convertFileSrc`+`<iframe>` 的内联预览） |
 | DOCX | `DocumentFormat.OpenXml` 解析 OOXML 包，在进程内渲染 WPF `FlowDocument`：标题分级、粗体/斜体/下划线/删除线、超链接、项目符号与编号列表（解析 numbering.xml）、基础表格；图片不内联（对齐 WebView 版 mammoth 默认行为），页脚标注「图片未内联渲染」 |
