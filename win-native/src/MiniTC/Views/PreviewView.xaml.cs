@@ -21,7 +21,18 @@ public partial class PreviewView : UserControl
     private int _pdfTotalPages;
     private bool _pdfFit = true;
     private CancellationTokenSource? _pdfRenderCts;
-    private Stream? _gifStream;
+
+    // Preview caches: decoding an image costs enough that revisiting one should
+    // not have to pay for it again.
+    private static readonly Dictionary<string, LoadedImage> StillCache = new(StringComparer.OrdinalIgnoreCase);
+    private const int StillCacheLimit = 4;
+
+    /// <summary>
+    /// Images wider than this are scaled down while decoding. The preview column is
+    /// only a few hundred pixels wide, so decoding at full size is wasted work.
+    /// </summary>
+    private const int MaxDecodeWidth = 1600;
+    private static (string Key, LoadedImage Image)? _animationCache;
 
     public PreviewView()
     {
@@ -50,10 +61,6 @@ public partial class PreviewView : UserControl
     {
         _loadCts?.Cancel();
         _pdfRenderCts?.Cancel();
-        // A GIF animation holds a live stream; drop it on every (re)load so the
-        // previous preview cannot keep the file locked or leak the MemoryStream.
-        _gifStream?.Dispose();
-        _gifStream = null;
         // A running animation outranks the local Source value, so it has to be
         // stopped explicitly — setting Source = null alone leaves the previous GIF
         // still playing over whatever gets loaded next.
@@ -80,9 +87,7 @@ public partial class PreviewView : UserControl
 
         TypeBadge.Text = kind switch
         {
-            PreviewKind.Image => string.Equals(Path.GetExtension(path).TrimStart('.'), "gif", StringComparison.OrdinalIgnoreCase)
-                ? "GIF"
-                : "IMAGE",
+            PreviewKind.Image => IsGif(path) ? "GIF" : "IMAGE",
             PreviewKind.Pdf => "PDF",
             PreviewKind.Docx => "DOCX",
             PreviewKind.Text => Path.GetExtension(path).TrimStart('.').ToUpperInvariant() is { Length: > 0 } ext
@@ -101,7 +106,7 @@ public partial class PreviewView : UserControl
         switch (kind)
         {
             case PreviewKind.Image:
-                LoadImage(path);
+                await LoadImageAsync(path, cts.Token);
                 break;
 
             case PreviewKind.Text:
@@ -127,94 +132,217 @@ public partial class PreviewView : UserControl
         }
     }
 
-    private void LoadImage(string path)
+    private sealed record LoadedImage(
+        BitmapSource First,
+        GifTimeline? Animation,
+        int OriginalWidth = 0,
+        int OriginalHeight = 0);
+
+    /// <summary>
+    /// Decoding happens on a thread-pool thread: a large photo or an animated GIF
+    /// takes a noticeable moment, and doing that inline freezes the whole window.
+    /// Results are cached so coming back to an image is instant.
+    /// </summary>
+    private async Task LoadImageAsync(string path, CancellationToken token)
     {
-        if (string.Equals(Path.GetExtension(path).TrimStart('.'), "gif", StringComparison.OrdinalIgnoreCase))
+        var key = CacheKey(path);
+
+        if (TryGetCached(key, out var cached))
         {
-            LoadAnimatedGif(path);
+            ApplyImage(cached);
             return;
         }
 
+        var animated = IsGif(path);
+        if (animated)
+        {
+            // Composing every frame is the slow part — say so rather than showing a
+            // blank panel. Still images usually decode quickly enough to skip this.
+            LoadingHost.Visibility = Visibility.Visible;
+        }
+
         try
         {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-
-            // Load fully into memory so the file stays unlocked and can be
-            // renamed or deleted while the preview is open.
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
-            bitmap.UriSource = new Uri(path);
-            bitmap.EndInit();
-            bitmap.Freeze();
-
-            ImageBody.Source = bitmap;
-            FooterInfo.Text = $"{bitmap.PixelWidth} × {bitmap.PixelHeight} · {FileEntry.FormatBytes(_shell.PreviewSize)}";
-        }
-        catch (Exception ex)
-        {
-            ImageBody.Source = null;
-            ShowError($"无法解码图片：{ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// WPF cannot play a GIF on its own, so decode every frame and drive
-    /// <see cref="Image.SourceProperty"/> with a discrete key-frame timeline.
-    /// </summary>
-    private void LoadAnimatedGif(string path)
-    {
-        try
-        {
-            _gifStream?.Dispose();
-            _gifStream = new MemoryStream(File.ReadAllBytes(path));
-
-            var timeline = GifAnimationService.Decode(_gifStream);
-            var frames = timeline.Frames;
-
-            if (frames.Count == 0)
+            var loaded = await Task.Run(() => DecodeImage(path), token);
+            if (token.IsCancellationRequested)
             {
-                throw new InvalidDataException("GIF 没有可显示的帧");
-            }
-
-            var first = frames[0];
-            var size = $"{first.PixelWidth} × {first.PixelHeight}";
-
-            if (!timeline.IsAnimated || timeline.TooManyFrames)
-            {
-                // Single frame, or far too many to compose into memory at once: show
-                // a still image instead of ballooning memory on a pathological GIF.
-                ImageBody.Source = first;
-                FooterInfo.Text = timeline.TooManyFrames
-                    ? $"GIF 共 {timeline.SourceFrameCount} 帧（过多，仅显示首帧） · {FileEntry.FormatBytes(_shell.PreviewSize)}"
-                    : $"{size} · {FileEntry.FormatBytes(_shell.PreviewSize)}";
                 return;
             }
 
-            var animation = new ObjectAnimationUsingKeyFrames();
-            var elapsed = TimeSpan.Zero;
-            for (var i = 0; i < frames.Count; i++)
-            {
-                animation.KeyFrames.Add(new DiscreteObjectKeyFrame(frames[i], KeyTime.FromTimeSpan(elapsed)));
-                elapsed += timeline.Delays[i];
-            }
-
-            animation.Duration = timeline.TotalDuration;
-            animation.RepeatBehavior = RepeatBehavior.Forever;
-
-            ImageBody.Source = first;
-            ImageBody.BeginAnimation(Image.SourceProperty, animation);
-
-            FooterInfo.Text = $"GIF 动画 · {frames.Count} 帧 · {size} · {FileEntry.FormatBytes(_shell.PreviewSize)}";
+            Remember(key, loaded, animated);
+            ApplyImage(loaded);
+        }
+        catch (OperationCanceledException)
+        {
         }
         catch (Exception ex)
         {
             ImageBody.BeginAnimation(Image.SourceProperty, null);
-            _gifStream?.Dispose();
-            _gifStream = null;
             ImageBody.Source = null;
             ShowError($"无法解码图片：{ex.Message}");
         }
+        finally
+        {
+            if (animated)
+            {
+                LoadingHost.Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs off the UI thread. Everything handed back is frozen, so it can cross
+    /// the thread boundary safely.
+    /// </summary>
+    private static LoadedImage DecodeImage(string path)
+    {
+        if (IsGif(path))
+        {
+            // Read fully into memory: the file then stays unlocked, and the decoded
+            // frames no longer depend on the stream.
+            using var stream = new MemoryStream(File.ReadAllBytes(path));
+            var timeline = GifAnimationService.Decode(stream);
+            if (timeline.Frames.Count == 0)
+            {
+                throw new InvalidDataException("GIF 没有可显示的帧");
+            }
+
+            return new LoadedImage(timeline.Frames[0], timeline);
+        }
+
+        // Read just the header first. Decoding a 6000px-wide photo at full size to
+        // show it in a preview column is the main reason large images feel slow, so
+        // oversized ones are scaled down during decode instead of after it. The real
+        // dimensions are kept for the footer.
+        var (originalWidth, originalHeight) = ReadImageSize(path);
+
+        var bitmap = new BitmapImage();
+        bitmap.BeginInit();
+
+        // Load fully into memory so the file stays unlocked and can be
+        // renamed or deleted while the preview is open.
+        bitmap.CacheOption = BitmapCacheOption.OnLoad;
+        bitmap.UriSource = new Uri(path);
+        if (originalWidth > MaxDecodeWidth)
+        {
+            bitmap.DecodePixelWidth = MaxDecodeWidth;
+        }
+
+        bitmap.EndInit();
+        bitmap.Freeze();
+
+        return new LoadedImage(bitmap, null, originalWidth, originalHeight);
+    }
+
+    /// <summary>Cheap header-only read of an image's real pixel size.</summary>
+    private static (int Width, int Height) ReadImageSize(string path)
+    {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
+            if (decoder.Frames.Count > 0)
+            {
+                return (decoder.Frames[0].PixelWidth, decoder.Frames[0].PixelHeight);
+            }
+        }
+        catch (Exception)
+        {
+            // Header unreadable: fall back to whatever the decoded bitmap reports.
+        }
+
+        return (0, 0);
+    }
+
+    private void ApplyImage(LoadedImage loaded)
+    {
+        var timeline = loaded.Animation;
+        var first = loaded.First;
+        var width = loaded.OriginalWidth > 0 ? loaded.OriginalWidth : first.PixelWidth;
+        var height = loaded.OriginalHeight > 0 ? loaded.OriginalHeight : first.PixelHeight;
+        var size = $"{width} × {height}";
+        var fileSize = FileEntry.FormatBytes(_shell.PreviewSize);
+
+        if (timeline is null || !timeline.IsAnimated || timeline.CompositionSkipped)
+        {
+            ImageBody.Source = first;
+            FooterInfo.Text = timeline is { CompositionSkipped: true }
+                ? $"GIF 共 {timeline.SourceFrameCount} 帧（过大，仅显示首帧） · {fileSize}"
+                : $"{size} · {fileSize}";
+            return;
+        }
+
+        // WPF cannot play a GIF on its own, so drive Image.Source along a timeline
+        // built from the composed frames.
+        var animation = new ObjectAnimationUsingKeyFrames();
+        var elapsed = TimeSpan.Zero;
+        for (var i = 0; i < timeline.Frames.Count; i++)
+        {
+            animation.KeyFrames.Add(new DiscreteObjectKeyFrame(timeline.Frames[i], KeyTime.FromTimeSpan(elapsed)));
+            elapsed += timeline.Delays[i];
+        }
+
+        animation.Duration = timeline.TotalDuration;
+        animation.RepeatBehavior = RepeatBehavior.Forever;
+
+        ImageBody.Source = first;
+        ImageBody.BeginAnimation(Image.SourceProperty, animation);
+
+        FooterInfo.Text = $"GIF 动画 · {timeline.Frames.Count} 帧 · {size} · {fileSize}";
+    }
+
+    private static bool IsGif(string path)
+        => string.Equals(Path.GetExtension(path).TrimStart('.'), "gif", StringComparison.OrdinalIgnoreCase);
+
+    private static string CacheKey(string path)
+    {
+        try
+        {
+            // Fold in the write time and size so an edited file is never served
+            // from a stale cache entry.
+            var info = new FileInfo(path);
+            return $"{path}|{info.LastWriteTimeUtc.Ticks}|{info.Length}";
+        }
+        catch (Exception)
+        {
+            return path;
+        }
+    }
+
+    private static bool TryGetCached(string key, out LoadedImage loaded)
+    {
+        if (StillCache.TryGetValue(key, out var still))
+        {
+            loaded = still;
+            return true;
+        }
+
+        if (_animationCache is { } cached && string.Equals(cached.Key, key, StringComparison.OrdinalIgnoreCase))
+        {
+            loaded = cached.Image;
+            return true;
+        }
+
+        loaded = null!;
+        return false;
+    }
+
+    private static void Remember(string key, LoadedImage loaded, bool animated)
+    {
+        if (animated)
+        {
+            // Only the most recent animated GIF is kept: composed frames are large,
+            // and holding several is an easy way to eat hundreds of megabytes.
+            _animationCache = (key, loaded);
+            return;
+        }
+
+        if (StillCache.Count >= StillCacheLimit)
+        {
+            StillCache.Clear();
+        }
+
+        StillCache[key] = loaded;
     }
 
     private async Task LoadTextAsync(string path, CancellationToken token)

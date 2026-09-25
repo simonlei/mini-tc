@@ -15,14 +15,10 @@ internal sealed record GifTimeline(
     IReadOnlyList<BitmapSource> Frames,
     IReadOnlyList<TimeSpan> Delays,
     TimeSpan TotalDuration,
-    int SourceFrameCount)
+    int SourceFrameCount,
+    bool CompositionSkipped)
 {
     internal bool IsAnimated => Frames.Count > 1;
-
-    /// <summary>
-    /// True when the GIF has so many frames that composing them all was skipped.
-    /// </summary>
-    internal bool TooManyFrames => SourceFrameCount > GifAnimationService.MaxFrames;
 }
 
 /// <summary>
@@ -46,6 +42,12 @@ internal static class GifAnimationService
     /// </summary>
     internal const int MaxFrames = 500;
 
+    /// <summary>
+    /// Composing keeps one full-size bitmap per frame, so cap the total pixel count
+    /// (~128 MB at 4 bytes each) rather than the frame count alone.
+    /// </summary>
+    private const long MaxComposedPixels = 32_000_000;
+
     private static readonly TimeSpan DefaultDelay = TimeSpan.FromMilliseconds(100);
 
     internal static GifTimeline Decode(Stream stream)
@@ -63,11 +65,40 @@ internal static class GifAnimationService
             total += delay;
         }
 
-        var frames = source.Count > MaxFrames
-            ? new List<BitmapSource> { source[0] }
-            : Compose(decoder, source);
+        if (source.Count == 0)
+        {
+            return new GifTimeline([], delays, total, 0, false);
+        }
 
-        return new GifTimeline(frames, delays, total, source.Count);
+        // The frames travel back to the UI thread, so freeze them first.
+        foreach (var frame in source)
+        {
+            if (frame.CanFreeze)
+            {
+                frame.Freeze();
+            }
+        }
+
+        var width = Math.Max(1, QueryUInt16(decoder.Metadata, "/logscrdesc/Width") ?? source[0].PixelWidth);
+        var height = Math.Max(1, QueryUInt16(decoder.Metadata, "/logscrdesc/Height") ?? source[0].PixelHeight);
+
+        // Composing means keeping one full-size bitmap per frame, so bail out on a
+        // GIF large enough to blow up memory and show its first frame instead.
+        if (source.Count > MaxFrames || (long)source.Count * width * height > MaxComposedPixels)
+        {
+            return new GifTimeline([source[0]], delays, total, source.Count, true);
+        }
+
+        // Plenty of GIFs are stored unoptimised: every frame already covers the whole
+        // canvas at the origin, with nothing transparent and nothing to restore. Those
+        // are complete pictures as they come out of the decoder, so composing them
+        // would only burn time re-rendering the same thing for every frame.
+        if (!NeedsComposition(source, width, height))
+        {
+            return new GifTimeline(source, delays, total, source.Count, false);
+        }
+
+        return new GifTimeline(Compose(decoder, source, width, height), delays, total, source.Count, false);
     }
 
     /// <summary>
@@ -85,15 +116,10 @@ internal static class GifAnimationService
     /// </summary>
     private static IReadOnlyList<BitmapSource> Compose(
         BitmapDecoder decoder,
-        IReadOnlyList<BitmapFrame> source)
+        IReadOnlyList<BitmapFrame> source,
+        int width,
+        int height)
     {
-        if (source.Count == 0)
-        {
-            return [];
-        }
-
-        var width = Math.Max(1, QueryUInt16(decoder.Metadata, "/logscrdesc/Width") ?? source[0].PixelWidth);
-        var height = Math.Max(1, QueryUInt16(decoder.Metadata, "/logscrdesc/Height") ?? source[0].PixelHeight);
         var full = new Rect(0, 0, width, height);
 
         var background = new SolidColorBrush(ResolveBackground(decoder, source));
@@ -140,6 +166,41 @@ internal static class GifAnimationService
         }
 
         return composed;
+    }
+
+    /// <summary>
+    /// Whether the frames need composing at all. Each one already being a full-canvas
+    /// frame at the origin, with no transparent pixels and nothing to restore, means
+    /// the decoder's output is directly playable.
+    /// </summary>
+    private static bool NeedsComposition(IReadOnlyList<BitmapFrame> source, int width, int height)
+    {
+        foreach (var frame in source)
+        {
+            if (frame.PixelWidth != width || frame.PixelHeight != height)
+            {
+                return true;
+            }
+
+            if ((QueryUInt16(frame.Metadata, "/imgdesc/Left") ?? 0) != 0 ||
+                (QueryUInt16(frame.Metadata, "/imgdesc/Top") ?? 0) != 0)
+            {
+                return true;
+            }
+
+            if (QueryBool(frame.Metadata, "/grctlext/TransparencyFlag") == true)
+            {
+                return true;
+            }
+
+            // Disposal 2 and 3 rewrite parts of the canvas, so those need composing.
+            if ((QueryByte(frame.Metadata, "/grctlext/Disposal") ?? 0) >= 2)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -207,6 +268,23 @@ internal static class GifAnimationService
         try
         {
             if (metadata is BitmapMetadata md && md.GetQuery(path) is byte value)
+            {
+                return value;
+            }
+        }
+        catch (Exception)
+        {
+            // Missing or malformed metadata: treated as absent.
+        }
+
+        return null;
+    }
+
+    private static bool? QueryBool(ImageMetadata? metadata, string path)
+    {
+        try
+        {
+            if (metadata is BitmapMetadata md && md.GetQuery(path) is bool value)
             {
                 return value;
             }
