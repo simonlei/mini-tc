@@ -9,6 +9,10 @@
 
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+
+    <!-- NU1701 comes from PdfiumViewer (net20) flowing in through the
+         ProjectReference; harmless, so keep the test build output clean too. -->
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

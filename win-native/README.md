@@ -95,6 +95,7 @@ win-native/
 | 文本 | `txt/md/json/log` + 用户自定义后缀；2 MB 上限，`.log` 超限只读末尾 512 KB；BOM → 严格 UTF-8 → GBK 逐级嗅探（原版一律 lossy UTF-8）；`.json` 自动 2 空格缩进美化（解析失败回退原文并提示「JSON 格式错误」） |
 | 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除） |
 | 视频 | Media Foundation；常驻进度条、按钮行 3 秒自动隐藏、±5/±30 秒、倍速、音量滚轮、字幕（同目录探测 / 手动加载 / ±0.5 秒偏移）、播完自动续播下一个、全屏 |
+| PDF | PdfiumViewer 原生渲染（不引 WebView2），翻页、适应宽度 / 实际大小，显示「第 X / Y 页」（对齐 WebView 版 `convertFileSrc`+`<iframe>` 的内联预览） |
 
 PDF 与 doc/docx 未做内联渲染（需引入 native PDFium 或 OOXML 解析，体积与启动成本不划算），选中时提供「用系统程序打开」。
 

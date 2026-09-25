@@ -65,6 +65,33 @@
                  Margin="8" RenderOptions.BitmapScalingMode="HighQuality" />
         </Grid>
 
+        <!-- PDF -->
+        <Grid x:Name="PdfHost" Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Pdf}"
+              Background="{DynamicResource Brush.Preview.Canvas}"
+              SizeChanged="OnPdfHostSizeChanged">
+          <ScrollViewer x:Name="PdfScroll" Margin="8"
+                        VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+            <Image x:Name="PdfBody" Stretch="Uniform"
+                   HorizontalAlignment="Left" VerticalAlignment="Top"
+                   RenderOptions.BitmapScalingMode="HighQuality" />
+          </ScrollViewer>
+          <Border VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,10"
+                  Background="{DynamicResource Brush.Layer.Background}" BorderBrush="{DynamicResource Brush.Stroke.Default}"
+                  BorderThickness="1" CornerRadius="{DynamicResource Radius.Layer}" Padding="6,4">
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="PdfPrevButton" Content="&#xE76B;" Style="{StaticResource Button.Icon}"
+                      Click="OnPdfPrevClick" ToolTip="上一页" />
+              <TextBlock x:Name="PdfPageLabel" VerticalAlignment="Center" Margin="8,0"
+                         Style="{StaticResource Text.Secondary}" />
+              <Button x:Name="PdfNextButton" Content="&#xE76C;" Style="{StaticResource Button.Icon}"
+                      Click="OnPdfNextClick" ToolTip="下一页" />
+              <Rectangle Width="1" Margin="8,0" Fill="{DynamicResource Brush.Stroke.Default}" />
+              <Button x:Name="PdfFitButton" Content="适应宽度" Style="{StaticResource Button.Subtle}"
+                      Click="OnPdfFitClick" />
+            </StackPanel>
+          </Border>
+        </Grid>
+
         <!-- Unsupported -->
         <Grid Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Unsupported}">
           <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="24">

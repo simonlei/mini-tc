@@ -1,6 +1,10 @@
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Windows.Media.Imaging;
+using PdfiumViewer;
+using System.Drawing;
+using System.Drawing.Imaging;
 
 namespace MiniTC.Services;
 
@@ -10,6 +14,7 @@ public enum PreviewKind
     Text,
     Image,
     Video,
+    Pdf,
     Unsupported,
 }
 
@@ -33,6 +38,11 @@ internal static class PreviewService
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         "JPG", "JPEG", "PNG", "GIF", "BMP", "WEBP", "TIF", "TIFF", "ICO", "JFIF", "HEIC", "AVIF",
+    };
+
+    private static readonly HashSet<string> PdfExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "PDF",
     };
 
     /// <summary>
@@ -65,6 +75,8 @@ internal static class PreviewService
 
     internal static bool IsImage(string extension) => ImageExtensions.Contains(extension);
 
+    internal static bool IsPdf(string extension) => PdfExtensions.Contains(extension);
+
     internal static bool IsVideo(string extension)
         => NativeVideoExtensions.Contains(extension) || ExternalOnlyVideoExtensions.Contains(extension);
 
@@ -81,6 +93,11 @@ internal static class PreviewService
         if (IsVideo(extension))
         {
             return PreviewKind.Video;
+        }
+
+        if (IsPdf(extension))
+        {
+            return PreviewKind.Pdf;
         }
 
         return IsTextExtension(extension) ? PreviewKind.Text : PreviewKind.Unsupported;
@@ -150,6 +167,85 @@ internal static class PreviewService
 
         var lines = text.Length == 0 ? 0 : text.AsSpan().Count('\n') + 1;
         return new TextPreview(text, lines, info.Length, encodingName, truncated, note);
+    }
+
+    // ---- PDF rendering (B1) --------------------------------------------
+    // PdfiumViewer renders a page to a GDI+ Bitmap; we convert it to a frozen
+    // WPF BitmapSource so it can be handed to the UI thread after the background
+    // render. This keeps the Win10/11 WebView2 dependency out of the native build.
+
+    internal sealed record PdfPage(BitmapSource Image, int Page, int Total);
+
+    internal static Task<PdfPage> LoadPdfPageAsync(string path, int page, double? fitWidth, CancellationToken token = default)
+        => Task.Run(() => RenderPdfPage(path, page, fitWidth), token);
+
+    private static PdfPage RenderPdfPage(string path, int page, double? fitWidth)
+    {
+        using var doc = PdfDocument.Load(path);
+        var total = doc.PageCount;
+        if (total <= 0)
+        {
+            // Some encrypted/empty docs report 0 pages; surface it instead of
+            // indexing PageSizes[0] (which would throw an unguarded exception).
+            throw new InvalidDataException("PDF 没有可渲染的页面");
+        }
+
+        var index = Math.Clamp(page, 0, total - 1);
+        var size = doc.PageSizes[index];
+        if (size.Width <= 0 || size.Height <= 0 || !float.IsFinite(size.Width) || !float.IsFinite(size.Height))
+        {
+            // Degenerate page boxes would turn into Infinity/NaN ratios and feed a
+            // non-finite dimension into pdfium's native renderer, which can crash.
+            throw new InvalidDataException("PDF 页面尺寸无效，无法渲染");
+        }
+
+        const float dpi = 96f;
+        int width, height;
+        if (fitWidth is { } w && w > 0 && double.IsFinite(w))
+        {
+            // Fit-to-width: render at the host's pixel width so the bitmap is crisp.
+            var ratio = size.Height / size.Width;
+            width = (int)Math.Max(1, Math.Round(w));
+            height = (int)Math.Max(1, Math.Round(w * ratio));
+        }
+        else
+        {
+            // Actual size: roughly 1 point = 1 pixel (72 dpi → 96 dpi scale).
+            width = (int)Math.Max(1, Math.Round(size.Width * dpi / 72f));
+            height = (int)Math.Max(1, Math.Round(size.Height * dpi / 72f));
+        }
+
+        // Clamp to a sane maximum so an absurd page box cannot make pdfium allocate
+        // a multi-gigabyte bitmap (another native-crash vector).
+        const int maxDimension = 12000;
+        width = Math.Clamp(width, 1, maxDimension);
+        height = Math.Clamp(height, 1, maxDimension);
+
+        // Use the (page, width, height, dpiX, dpiY, forPrinting) overload: the
+        // pixels must be passed explicitly. The shorter Render(int, float, float,
+        // bool) overload takes *DPI* as its 2nd/3rd arguments — and since int
+        // converts to float implicitly, a call like Render(index, w, h, false)
+        // silently binds to it. That renders the page at its point size (595x842
+        // for A4) and stamps our requested width on as the bitmap's DPI, so WPF
+        // displays it at 595 / (1100/96) ≈ 52 px wide — the "tiny PDF" bug.
+        // Keeping dpi at 96 makes the bitmap's DPI metadata match its pixels.
+        using var bitmap = doc.Render(index, width, height, dpi, dpi, false);
+        return new PdfPage(ToBitmapSource(bitmap), index, total);
+    }
+
+    private static BitmapSource ToBitmapSource(Image bitmap)
+    {
+        using var ms = new MemoryStream();
+        bitmap.Save(ms, ImageFormat.Png);
+        ms.Seek(0, SeekOrigin.Begin);
+
+        var src = new BitmapImage();
+        src.BeginInit();
+        src.CacheOption = BitmapCacheOption.OnLoad;
+        src.StreamSource = ms;
+        src.EndInit();
+        src.Freeze();
+        return src;
     }
 
     private static string FileSizeText(long bytes) => Models.FileEntry.FormatBytes(bytes);

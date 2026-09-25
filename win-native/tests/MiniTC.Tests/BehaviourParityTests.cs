@@ -245,6 +245,9 @@ public class PreviewClassificationTests
         // RMVB has no Media Foundation demuxer and must fall back.
         Assert.True(PreviewService.IsExternalOnlyVideo("RMVB"));
 
+        // PDF is now rendered inline via PdfiumViewer (B1); the WebView build had to punt it.
+        Assert.Equal(PreviewKind.Pdf, PreviewService.Classify("PDF"));
+
         Assert.Equal(PreviewKind.Unsupported, PreviewService.Classify("XYZ"));
     }
 }

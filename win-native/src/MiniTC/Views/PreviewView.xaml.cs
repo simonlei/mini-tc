@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using MiniTC.Models;
 using MiniTC.Services;
 using MiniTC.ViewModels;
@@ -13,6 +14,11 @@ public partial class PreviewView : UserControl
 {
     private MainViewModel _shell = null!;
     private CancellationTokenSource? _loadCts;
+
+    private int _pdfCurrentPage;
+    private int _pdfTotalPages;
+    private bool _pdfFit = true;
+    private CancellationTokenSource? _pdfRenderCts;
 
     public PreviewView()
     {
@@ -40,6 +46,7 @@ public partial class PreviewView : UserControl
     private async Task LoadAsync()
     {
         _loadCts?.Cancel();
+        _pdfRenderCts?.Cancel();
         var cts = new CancellationTokenSource();
         _loadCts = cts;
 
@@ -50,6 +57,7 @@ public partial class PreviewView : UserControl
         if (!_shell.PreviewVisible || _shell.PreviewPath is null)
         {
             ImageBody.Source = null;
+            PdfBody.Source = null;
             TextBody.Text = string.Empty;
             return;
         }
@@ -60,6 +68,7 @@ public partial class PreviewView : UserControl
         TypeBadge.Text = kind switch
         {
             PreviewKind.Image => "IMAGE",
+            PreviewKind.Pdf => "PDF",
             PreviewKind.Text => Path.GetExtension(path).TrimStart('.').ToUpperInvariant() is { Length: > 0 } ext
                 ? ext
                 : "TEXT",
@@ -80,8 +89,13 @@ public partial class PreviewView : UserControl
                 await LoadTextAsync(path, cts.Token);
                 break;
 
+            case PreviewKind.Pdf:
+                await LoadPdfAsync(path, cts.Token);
+                break;
+
             default:
                 ImageBody.Source = null;
+                PdfBody.Source = null;
                 TextBody.Text = string.Empty;
                 FooterInfo.Text = _shell.PreviewSize > 0 ? FileEntry.FormatBytes(_shell.PreviewSize) : string.Empty;
                 break;
@@ -149,6 +163,178 @@ public partial class PreviewView : UserControl
         finally
         {
             LoadingHost.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private async Task LoadPdfAsync(string path, CancellationToken token)
+    {
+        LoadingHost.Visibility = Visibility.Visible;
+        try
+        {
+            _pdfCurrentPage = 0;
+
+            // The host may not be laid out yet when the first PDF is previewed
+            // (it was just switched to visible), so FitWidth() would fall back to
+            // 800px and the page would not follow the column width. Wait for a
+            // layout pass first — the same guard RenderCurrentPdfPage uses.
+            if (PdfHost.ActualWidth <= 0)
+            {
+                await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
+            }
+
+            // Honour the current fit mode. Forcing `_pdfFit = true` here silently
+            // discarded the user's 适应宽度/实际大小 choice on every reload and
+            // made the toggle look dead (the fallback width is close to the
+            // "actual size" width, so both modes rendered nearly identically).
+            var page = await PreviewService.LoadPdfPageAsync(path, _pdfCurrentPage, _pdfFit ? FitWidth() : null, token);
+            if (token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            _pdfTotalPages = page.Total;
+            PdfBody.Source = page.Image;
+            // Pin the element to the rendered pixel size. The bitmap can carry a
+            // non-96 DPI (display scaling), which would shrink the Image control's
+            // natural size below the column width and make the page look tiny.
+            PdfBody.Width = page.Image.PixelWidth;
+            PdfBody.Height = page.Image.PixelHeight;
+            UpdatePdfChrome();
+            AsTextButton.Visibility = Visibility.Collapsed;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            PdfBody.Source = null;
+            ShowError($"无法预览 PDF：{ex.Message}");
+        }
+        finally
+        {
+            LoadingHost.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private double FitWidth()
+    {
+        // The host may have just become visible and not yet received a measure
+        // pass, so its ActualWidth can still be 0 on the first render — force a
+        // layout so we measure the real column width instead of the 800 fallback.
+        if (PdfHost.ActualWidth <= 0)
+        {
+            PdfHost.UpdateLayout();
+        }
+
+        var w = PdfHost.ActualWidth;
+        if (w <= 0 || !double.IsFinite(w))
+        {
+            w = 800;
+        }
+
+        // Account for the 8px ScrollViewer margin on each side so the rendered
+        // bitmap fills the client area exactly (no stray horizontal scrollbar).
+        return Math.Max(64, w - 16);
+    }
+
+    private void UpdatePdfChrome()
+    {
+        FooterInfo.Text = $"第 {_pdfCurrentPage + 1} / {_pdfTotalPages} 页 · {FileEntry.FormatBytes(_shell.PreviewSize)}";
+        PdfPageLabel.Text = $"{_pdfCurrentPage + 1} / {_pdfTotalPages}";
+        PdfPrevButton.IsEnabled = _pdfCurrentPage > 0;
+        PdfNextButton.IsEnabled = _pdfCurrentPage < _pdfTotalPages - 1;
+        PdfFitButton.Content = _pdfFit ? "适应宽度" : "实际大小";
+    }
+
+    private async void RenderCurrentPdfPage()
+    {
+        if (_shell.PreviewPath is null)
+        {
+            return;
+        }
+
+        // When the host has just been switched to visible it has not been laid
+        // out yet, so its ActualWidth is still 0 and FitWidth() would fall back
+        // to 800px — producing a page that does not follow the column width.
+        // Yield until a layout pass has run, then measure the real width.
+        if (PdfHost.ActualWidth <= 0)
+        {
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
+            if (_shell.PreviewPath is null || _shell.PreviewKind != PreviewKind.Pdf)
+            {
+                return;
+            }
+        }
+
+        // Serialize PDF renders: a new request (resize / page flip / fit toggle)
+        // cancels the previous one so pdfium is never driven concurrently from
+        // multiple thread-pool tasks — concurrent native renders can crash the
+        // process with an AccessViolationException that `catch (Exception)` cannot
+        // observe.
+        _pdfRenderCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _pdfRenderCts = cts;
+
+        try
+        {
+            var page = await PreviewService.LoadPdfPageAsync(_shell.PreviewPath, _pdfCurrentPage, _pdfFit ? FitWidth() : null, cts.Token);
+            if (cts.Token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            _pdfTotalPages = page.Total;
+            PdfBody.Source = page.Image;
+            // Pin the element to the rendered pixel size. The bitmap can carry a
+            // non-96 DPI (display scaling), which would shrink the Image control's
+            // natural size below the column width and make the page look tiny.
+            PdfBody.Width = page.Image.PixelWidth;
+            PdfBody.Height = page.Image.PixelHeight;
+            UpdatePdfChrome();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!cts.Token.IsCancellationRequested)
+            {
+                PdfBody.Source = null;
+                ShowError($"无法预览 PDF：{ex.Message}");
+            }
+        }
+    }
+
+    private void OnPdfPrevClick(object sender, RoutedEventArgs e)
+    {
+        if (_pdfCurrentPage > 0)
+        {
+            _pdfCurrentPage--;
+            RenderCurrentPdfPage();
+        }
+    }
+
+    private void OnPdfNextClick(object sender, RoutedEventArgs e)
+    {
+        if (_pdfCurrentPage < _pdfTotalPages - 1)
+        {
+            _pdfCurrentPage++;
+            RenderCurrentPdfPage();
+        }
+    }
+
+    private void OnPdfFitClick(object sender, RoutedEventArgs e)
+    {
+        _pdfFit = !_pdfFit;
+        UpdatePdfChrome();
+        RenderCurrentPdfPage();
+    }
+
+    private void OnPdfHostSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (_pdfFit && _shell.PreviewKind == PreviewKind.Pdf && _shell.PreviewPath is not null)
+        {
+            RenderCurrentPdfPage();
         }
     }
 
