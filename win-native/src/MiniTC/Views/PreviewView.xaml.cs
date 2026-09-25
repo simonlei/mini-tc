@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using MiniTC.Models;
@@ -53,6 +54,10 @@ public partial class PreviewView : UserControl
         // previous preview cannot keep the file locked or leak the MemoryStream.
         _gifStream?.Dispose();
         _gifStream = null;
+        // A running animation outranks the local Source value, so it has to be
+        // stopped explicitly — setting Source = null alone leaves the previous GIF
+        // still playing over whatever gets loaded next.
+        ImageBody.BeginAnimation(Image.SourceProperty, null);
         var cts = new CancellationTokenSource();
         _loadCts = cts;
 
@@ -154,11 +159,8 @@ public partial class PreviewView : UserControl
     }
 
     /// <summary>
-    /// WPF's <see cref="BitmapImage"/> only animates a GIF while the source is not
-    /// frozen and decoded on demand. The static path above calls Freeze() and forces
-    /// OnLoad — both of which collapse the GIF to its first frame. Here we read the
-    /// bytes into a kept-alive MemoryStream and hand WPF an un-frozen, on-demand
-    /// BitmapImage so the frames actually advance.
+    /// WPF cannot play a GIF on its own, so decode every frame and drive
+    /// <see cref="Image.SourceProperty"/> with a discrete key-frame timeline.
     /// </summary>
     private void LoadAnimatedGif(string path)
     {
@@ -167,19 +169,48 @@ public partial class PreviewView : UserControl
             _gifStream?.Dispose();
             _gifStream = new MemoryStream(File.ReadAllBytes(path));
 
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.StreamSource = _gifStream;
-            // Leave CacheOption at its default (on-demand): OnLoad decodes a single
-            // frame and the animation never advances.
-            bitmap.EndInit();
-            // Intentionally NOT frozen — freezing a BitmapImage kills GIF playback.
+            var timeline = GifAnimationService.Decode(_gifStream);
+            var frames = timeline.Frames;
 
-            ImageBody.Source = bitmap;
-            FooterInfo.Text = $"GIF 动画 · {FileEntry.FormatBytes(_shell.PreviewSize)}";
+            if (frames.Count == 0)
+            {
+                throw new InvalidDataException("GIF 没有可显示的帧");
+            }
+
+            var first = frames[0];
+            var size = $"{first.PixelWidth} × {first.PixelHeight}";
+            var tooMany = frames.Count > GifAnimationService.MaxFrames;
+
+            if (!timeline.IsAnimated || tooMany)
+            {
+                // Single frame, or far too many to decode into memory at once: show
+                // a still image instead of ballooning memory on a pathological GIF.
+                ImageBody.Source = first;
+                FooterInfo.Text = tooMany
+                    ? $"GIF 共 {frames.Count} 帧（过多，仅显示首帧） · {FileEntry.FormatBytes(_shell.PreviewSize)}"
+                    : $"{size} · {FileEntry.FormatBytes(_shell.PreviewSize)}";
+                return;
+            }
+
+            var animation = new ObjectAnimationUsingKeyFrames();
+            var elapsed = TimeSpan.Zero;
+            for (var i = 0; i < frames.Count; i++)
+            {
+                animation.KeyFrames.Add(new DiscreteObjectKeyFrame(frames[i], KeyTime.FromTimeSpan(elapsed)));
+                elapsed += timeline.Delays[i];
+            }
+
+            animation.Duration = timeline.TotalDuration;
+            animation.RepeatBehavior = RepeatBehavior.Forever;
+
+            ImageBody.Source = first;
+            ImageBody.BeginAnimation(Image.SourceProperty, animation);
+
+            FooterInfo.Text = $"GIF 动画 · {frames.Count} 帧 · {size} · {FileEntry.FormatBytes(_shell.PreviewSize)}";
         }
         catch (Exception ex)
         {
+            ImageBody.BeginAnimation(Image.SourceProperty, null);
             _gifStream?.Dispose();
             _gifStream = null;
             ImageBody.Source = null;
