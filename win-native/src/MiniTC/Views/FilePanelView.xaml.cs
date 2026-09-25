@@ -31,6 +31,12 @@ public partial class FilePanelView : UserControl
     {
         InitializeComponent();
         Loaded += OnLoaded;
+
+        // Mouse side buttons (XButton1 = Back, XButton2 = Forward) are handled
+        // on the panel root so the button acts on whichever pane the cursor
+        // happens to be over — no need to focus it first.
+        MouseDown += OnPanelMouseDown;
+        MouseUp += OnPanelMouseUp;
     }
 
     public static readonly DependencyProperty IsActiveProperty = DependencyProperty.Register(
@@ -57,6 +63,48 @@ public partial class FilePanelView : UserControl
         PanelBorder.BorderBrush = IsActive
             ? (Brush)FindResource("Brush.Accent")
             : (Brush)FindResource("Brush.Stroke.Default");
+    }
+
+    // ---- Mouse side buttons (back / forward) -------------------------------
+
+    /// <summary>
+    /// Swallows the extended mouse buttons so the OS never treats them as a
+    /// window back/forward navigation. Mirrors the web build, which calls
+    /// <c>preventDefault()</c> on mousedown for buttons 3 and 4.
+    /// </summary>
+    private void OnPanelMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton == MouseButton.XButton1 || e.ChangedButton == MouseButton.XButton2)
+        {
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// The Back button (XButton1) navigates the pane one level up — the same
+    /// action as Backspace / "list.parent". The handler lives on the panel root,
+    /// so pressing it over either pane affects that pane, with the expectation
+    /// that hover already points at the intended one. We make the pane active so
+    /// the cursor and preview follow the navigation.
+    /// </summary>
+    private async void OnPanelMouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.XButton1)
+        {
+            return;
+        }
+
+        e.Handled = true;
+
+        // At a drive root there is nowhere to go back to.
+        if (!_panel.HasParent)
+        {
+            return;
+        }
+
+        _shell.SetActivePanel(_panel.PanelId);
+        await _panel.NavigateParentAsync();
+        FocusList();
     }
 
     internal void Initialize(MainViewModel shell, PanelViewModel panel)

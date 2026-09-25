@@ -6,6 +6,7 @@
 - [x] **不支持预览格式时占位提示** — 若选中文件为不支持预览的格式（不在 `PREVIEWABLE_EXTENSIONS` 内），在另一侧面板直接展示「暂不支持预览该格式」，而不是静默无反应（涉及 `togglePreview` 及两处 `watch`）
 - [x] **路径栏支持 Windows 占位符与 ~ 家目录** — 在 PathBar 的可编辑路径输入中支持展开：`%LOCALAPPDATA%\Netease` 等 `%VAR%` 环境变量，以及 `~` 代表当前用户根目录（`C:\Users\<user>`）。需在 `onEnter` 提交 `navigate` 前先做展开（建议后端或前端统一解析），否则 `pathExists` 会判定为不存在而报红
 - [x] **支持鼠标返回键导航** — 部分鼠标侧键即「后退键」（`mousedown`/`mouseup` 中 `e.button === 3`，对应 XButton1）。在文件列表区域监听该键，触发与 Backspace 相同的「退回上一级目录」逻辑（注意区分左右面板，仅对当前活动面板生效）
+  - win-native 实现：`FilePanelView.xaml.cs` 在面板根 `UserControl` 订阅 `MouseDown`/`MouseUp`：`XButton1`/`XButton2` 在 `MouseDown` 即 `e.Handled = true` 吞掉（防系统/资源管理器后退-前进导航），`XButton1`（`MouseButton.XButton1`）在 `MouseUp` 时若该面板 `HasParent` 为真则 `SetActivePanel` + `NavigateParentAsync` + `FocusList`（与 Backspace 同逻辑）。处理挂在面板根，鼠标悬停哪一栏即回退哪一栏，无需先聚焦。
 - [x] **文件名模糊搜索** — 在某一栏直接输入文字时，默认按该文字对当前目录下的文件/文件夹名做模糊匹配并实时过滤列表（而非触发其他快捷键）。需处理：输入态与导航快捷键的冲突（例如仅在未聚焦输入框时启用，或提供独立搜索框）、区分大小写/子目录递归与否、清空即恢复全部列表
 - [x] **支持 ctrl+c / ctrl+v / ctrl+x 剪贴板操作** — 在文件列表中选中条目后，可通过快捷键执行复制（ctrl+c）、粘贴（ctrl+v）、剪切（ctrl+x）。复制/剪切将当前选中项写入内存剪贴板（记录源路径+操作类型），粘贴时在**当前活动面板（用户当前选中的目录）**目录执行拷贝/移动。已在 App.vue 全局 keydown 拦截并 preventDefault（输入框焦点时放行，文本编辑正常）；粘贴后目标面板+活动面板都 refresh；复制保留剪贴板可重复粘贴，剪切粘贴后清空；后端 `copy_items`/`move_items` 递归处理目录，跨卷 move 用 copy+delete 兜底；目标已存在/源不存在则跳过并聚合错误，前端用 toast 反馈成功/失败
 - [x] **Ctrl/Shift 多选文件** — 在文件列表中支持 `Ctrl`+点击 进行不连续多选、`Shift`+点击 进行连续范围多选，从而可一次性选中多个文件/文件夹，配合上述 ctrl+c / ctrl+x / ctrl+v 进行批量拷贝/剪切与粘贴。需处理：选中态的视觉高亮、活动面板 vs 另一侧面板的选中隔离、与模糊搜索过滤态共存、剪切态（移动）对多项的标记、全选/取消等便捷操作
