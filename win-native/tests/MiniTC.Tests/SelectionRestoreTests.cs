@@ -56,18 +56,48 @@ public class SelectionRestoreTests
     public void ReloadNeverAsksTheListToJumpToTheFirstRow()
     {
         var panel = Populated("a.txt", "b.txt");
-        panel.SelectedEntries.Add(panel.Entries[1]);
 
         // Names that vanished by the time the listing lands (they were deleted):
         // nothing may be highlighted, least of all row 0.
         var vanished = panel.BuildSelectionRequest(["gone.txt"], isReload: true);
         Assert.Equal(["gone.txt"], vanished.Names);
         Assert.False(vanished.AllowFirstRow);
+    }
 
-        // Same thing with no explicit target at all.
-        var anonymous = panel.BuildSelectionRequest(null, isReload: true);
-        Assert.Equal(["b.txt"], anonymous.Names);
-        Assert.False(anonymous.AllowFirstRow);
+    /// <summary>
+    /// Rebuilding the rows makes the list view report "everything was
+    /// deselected" synchronously, so by the time the pane asks what to
+    /// highlight, SelectedEntries is already empty. The cursor has to survive
+    /// that - otherwise every re-list (window re-activated, F5) after a delete
+    /// ends up highlighting nothing.
+    /// </summary>
+    [Fact]
+    public void ReloadUsesThePaneCursorNotTheWipedSelection()
+    {
+        var panel = Populated("a.txt", "b.txt", "c.txt");
+        panel.SetCursorFromView([panel.Entries[1]]);
+
+        // What ApplyView() does to the list view's selection mirror.
+        panel.SelectedEntries.Clear();
+
+        var request = panel.BuildSelectionRequest(null, isReload: true);
+
+        Assert.Equal(["b.txt"], request.Names);
+        Assert.False(request.AllowFirstRow);
+    }
+
+    [Fact]
+    public void NavigatingElsewhereForgetsTheOldCursor()
+    {
+        var panel = Populated("a.txt", "b.txt");
+        panel.SetCursorFromView([panel.Entries[0]]);
+
+        var request = panel.BuildSelectionRequest(null, isReload: false);
+        Assert.Empty(request.Names);
+        Assert.True(request.AllowFirstRow);
+
+        // The old folder's cursor must not resurface in the new one.
+        Assert.Empty(panel.BuildSelectionRequest(null, isReload: true).Names);
     }
 
     [Fact]
@@ -93,8 +123,9 @@ public class SelectionRestoreTests
 
         Assert.Equal(["b.txt"], request.Names);
 
-        // Consumed once, so it cannot leak into an unrelated later listing.
-        Assert.Equal(["a.txt"], panel.BuildSelectionRequest(null, isReload: true).Names);
+        // Consumed once: a later re-list has no pending target left, but the
+        // cursor now sits where the delete put it, so that is what comes back.
+        Assert.Equal(["b.txt"], panel.BuildSelectionRequest(null, isReload: true).Names);
     }
 
     [Fact]

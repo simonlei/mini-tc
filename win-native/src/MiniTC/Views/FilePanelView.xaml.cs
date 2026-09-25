@@ -317,7 +317,11 @@ public partial class FilePanelView : UserControl
 
     private void OnSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_syncingSelection)
+        // Rebuilding the rows makes the list view report "everything was
+        // deselected" before the pane has had a chance to put the cursor back.
+        // That is a side effect of the listing, not the user clearing anything,
+        // so it must not overwrite what the pane remembers.
+        if (_syncingSelection || _panel.IsRelisting)
         {
             return;
         }
@@ -331,6 +335,7 @@ public partial class FilePanelView : UserControl
             }
         }
 
+        _panel.SetCursorFromView(FileList.SelectedItems.OfType<FileEntry>());
         _panel.UpdateStatus();
 
         // Keep an open preview in step with the highlighted file.
@@ -345,63 +350,82 @@ public partial class FilePanelView : UserControl
     {
         Dispatcher.InvokeAsync(() =>
         {
-            _syncingSelection = true;
-            try
+            var applied = ApplySelection(request);
+
+            // Only now may the pane listen to selection changes again: the
+            // rows it just asked for are in place.
+            _panel.NotifyListingApplied();
+
+            if (applied)
             {
-                var wanted = request.Names.Count > 0
-                    ? new HashSet<string>(request.Names, StringComparer.OrdinalIgnoreCase)
-                    : null;
-
-                var matches = new List<FileEntry>();
-
-                if (wanted is not null)
-                {
-                    foreach (var entry in _panel.Entries)
-                    {
-                        if (!entry.IsParent && wanted.Contains(entry.Name))
-                        {
-                            matches.Add(entry);
-                        }
-                    }
-                }
-
-                if (matches.Count == 0 && request.AllowFirstRow)
-                {
-                    // Real navigation (or the first listing): start at the top so
-                    // the arrow keys have somewhere to go.
-                    matches.AddRange(_panel.Entries.Where(entry => !entry.IsParent).Take(1));
-
-                    if (matches.Count == 0 && _panel.Entries.Count > 0)
-                    {
-                        matches.Add(_panel.Entries[0]);
-                    }
-                }
-
-                // Nothing matched and the pane did not move → leave the current
-                // selection alone instead of snapping the cursor to row 0.
-                if (matches.Count == 0)
-                {
-                    return;
-                }
-
-                FileList.SelectedItems.Clear();
-
-                foreach (var entry in matches)
-                {
-                    FileList.SelectedItems.Add(entry);
-                }
-
-                var first = matches[0];
-                FileList.ScrollIntoView(first);
-                FocusEntry(first);
+                OnSelectionChanged(this, null!);
             }
-            finally
-            {
-                _syncingSelection = false;
-            }
-
-            OnSelectionChanged(this, null!);
         });
+    }
+
+    /// <summary>
+    /// Highlights the rows named by <paramref name="request"/>. Returns false
+    /// when there was nothing to highlight, in which case the list is left
+    /// exactly as it is.
+    /// </summary>
+    private bool ApplySelection(SelectionRequest request)
+    {
+        _syncingSelection = true;
+        try
+        {
+            var wanted = request.Names.Count > 0
+                ? new HashSet<string>(request.Names, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            var matches = new List<FileEntry>();
+
+            if (wanted is not null)
+            {
+                foreach (var entry in _panel.Entries)
+                {
+                    if (!entry.IsParent && wanted.Contains(entry.Name))
+                    {
+                        matches.Add(entry);
+                    }
+                }
+            }
+
+            if (matches.Count == 0 && request.AllowFirstRow)
+            {
+                // Real navigation (or the first listing): start at the top so
+                // the arrow keys have somewhere to go.
+                matches.AddRange(_panel.Entries.Where(entry => !entry.IsParent).Take(1));
+
+                if (matches.Count == 0 && _panel.Entries.Count > 0)
+                {
+                    matches.Add(_panel.Entries[0]);
+                }
+            }
+
+            // Nothing matched and the pane did not move → leave the current
+            // selection alone instead of snapping the cursor to row 0.
+            if (matches.Count == 0)
+            {
+                return false;
+            }
+
+            FileList.SelectedItems.Clear();
+
+            foreach (var entry in matches)
+            {
+                FileList.SelectedItems.Add(entry);
+            }
+
+            var first = matches[0];
+            FileList.ScrollIntoView(first);
+            FocusEntry(first);
+
+            return true;
+        }
+        finally
+        {
+            _syncingSelection = false;
+        }
     }
 
     /// <summary>

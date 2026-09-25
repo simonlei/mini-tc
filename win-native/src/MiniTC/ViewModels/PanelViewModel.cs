@@ -14,6 +14,10 @@ namespace MiniTC.ViewModels;
 public sealed partial class PanelViewModel : ObservableObject
 {
     private readonly List<FileEntry> _allEntries = [];
+
+    /// <summary>Names the cursor should sit on, owned by the pane itself.</summary>
+    private string[] _cursor = [];
+
     private CancellationTokenSource? _loadCts;
     private CancellationTokenSource? _saveTabsCts;
 
@@ -46,6 +50,14 @@ public sealed partial class PanelViewModel : ObservableObject
 
     /// <summary>Kept in sync with the list view's native multi-selection.</summary>
     public ObservableCollection<FileEntry> SelectedEntries { get; } = [];
+
+    /// <summary>
+    /// True while a listing has replaced the rows but the view has not yet
+    /// restored the cursor. Rebuilding the collection makes the list view report
+    /// "everything was deselected" synchronously, and that is a side effect of
+    /// the listing rather than the user clearing anything.
+    /// </summary>
+    internal bool IsRelisting { get; private set; }
 
     [ObservableProperty]
     private TabViewModel? _activeTab;
@@ -260,6 +272,7 @@ public sealed partial class PanelViewModel : ObservableObject
 
         ArmPendingSelection(selectAfter);
 
+        IsRelisting = true;
         IsLoading = true;
         ErrorMessage = null;
 
@@ -286,8 +299,17 @@ public sealed partial class PanelViewModel : ObservableObject
             FilterQuery = string.Empty;
             IsFiltering = false;
 
+            IsRelisting = true;
             ApplyView();
             SelectionRequested?.Invoke(BuildSelectionRequest(selectAfter, isReload));
+
+            // Nothing is listening (headless tests): do not leave the pane
+            // deaf to the user's own selection changes.
+            if (SelectionRequested is null)
+            {
+                IsRelisting = false;
+            }
+
             ScheduleSaveTabs();
         }
         catch (OperationCanceledException)
@@ -296,6 +318,9 @@ public sealed partial class PanelViewModel : ObservableObject
         }
         catch (Exception ex)
         {
+            IsRelisting = false;
+            _cursor = [];
+
             ErrorMessage = ex is DirectoryNotFoundException or UnauthorizedAccessException
                 ? ex.Message
                 : $"无法打开目录：{ex.Message}";
@@ -353,8 +378,11 @@ public sealed partial class PanelViewModel : ObservableObject
         }
         else if (isReload)
         {
-            // Nobody expressed an intent: keep whatever is highlighted now.
-            targets = SelectedEntries.Where(e => !e.IsParent).Select(e => e.Name).ToArray();
+            // Nobody expressed an intent: keep the cursor where it was. It has
+            // to come from the pane's own memory - ApplyView() above already
+            // made the list view report "nothing selected", so reading
+            // SelectedEntries here would always come back empty.
+            targets = _cursor;
         }
         else
         {
@@ -364,8 +392,20 @@ public sealed partial class PanelViewModel : ObservableObject
         }
 
         _pendingSelect = null;
+        _cursor = targets;
+
         return new SelectionRequest(targets, allowFirstRow);
     }
+
+    /// <summary>
+    /// Remembers where the cursor is so a later re-list (window re-activated,
+    /// F5, the other pane showing the same folder) can put it back.
+    /// </summary>
+    internal void SetCursorFromView(IEnumerable<FileEntry> entries)
+        => _cursor = entries.Where(e => !e.IsParent).Select(e => e.Name).ToArray();
+
+    /// <summary>Called by the view once it has applied a listing's selection.</summary>
+    internal void NotifyListingApplied() => IsRelisting = false;
 
     internal Task NavigateToAsync(string path) => LoadAsync(path);
 
@@ -528,7 +568,10 @@ public sealed partial class PanelViewModel : ObservableObject
     // ---- Selection helpers -------------------------------------------------
 
     internal void RequestSelection(IReadOnlyList<string> names)
-        => SelectionRequested?.Invoke(new SelectionRequest(names, false));
+    {
+        _cursor = [.. names];
+        SelectionRequested?.Invoke(new SelectionRequest(names, false));
+    }
 
     internal FileEntry? FindByName(string name)
         => Entries.FirstOrDefault(e => !e.IsParent
