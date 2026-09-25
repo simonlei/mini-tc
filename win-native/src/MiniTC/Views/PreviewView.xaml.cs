@@ -179,15 +179,14 @@ public partial class PreviewView : UserControl
 
             var first = frames[0];
             var size = $"{first.PixelWidth} × {first.PixelHeight}";
-            var tooMany = frames.Count > GifAnimationService.MaxFrames;
 
-            if (!timeline.IsAnimated || tooMany)
+            if (!timeline.IsAnimated || timeline.TooManyFrames)
             {
-                // Single frame, or far too many to decode into memory at once: show
+                // Single frame, or far too many to compose into memory at once: show
                 // a still image instead of ballooning memory on a pathological GIF.
                 ImageBody.Source = first;
-                FooterInfo.Text = tooMany
-                    ? $"GIF 共 {frames.Count} 帧（过多，仅显示首帧） · {FileEntry.FormatBytes(_shell.PreviewSize)}"
+                FooterInfo.Text = timeline.TooManyFrames
+                    ? $"GIF 共 {timeline.SourceFrameCount} 帧（过多，仅显示首帧） · {FileEntry.FormatBytes(_shell.PreviewSize)}"
                     : $"{size} · {FileEntry.FormatBytes(_shell.PreviewSize)}";
                 return;
             }

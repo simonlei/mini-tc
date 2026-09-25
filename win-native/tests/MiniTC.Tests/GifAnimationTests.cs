@@ -49,6 +49,21 @@ public class GifAnimationTests
         Assert.False(timeline.IsAnimated);
     }
 
+    [Fact]
+    public void FramesAreComposedOntoOneCanvas()
+    {
+        // Encoded at 8x8, 6x6 and 4x4. Played raw those are three different sizes,
+        // and everything they do not cover stays transparent — which is what showed
+        // up as black patches. Composing puts every frame on the full canvas.
+        using var stream = BuildGif(5, 10, 2);
+
+        var timeline = GifAnimationService.Decode(stream);
+
+        var sizes = timeline.Frames.Select(f => (f.PixelWidth, f.PixelHeight)).Distinct().ToList();
+        Assert.Single(sizes);
+        Assert.Equal((8, 8), sizes[0]);
+    }
+
     /// <summary>
     /// Encodes a real GIF, then patches the per-frame delay straight into each
     /// Graphic Control Extension. GifBitmapEncoder ignores /grctlext/Delay on save —
@@ -58,9 +73,13 @@ public class GifAnimationTests
     private static MemoryStream BuildGif(params ushort[] delayHundredths)
     {
         var encoder = new GifBitmapEncoder();
-        foreach (var delay in delayHundredths)
+        for (var i = 0; i < delayHundredths.Length; i++)
         {
-            encoder.Frames.Add(BitmapFrame.Create(SolidFrame(8, 8), null, new BitmapMetadata("gif"), null));
+            // Shrink each frame on purpose: a real GIF only stores the pixels that
+            // changed, so its frames are smaller than the canvas and sit at an
+            // offset. That is what makes composing necessary — and observable.
+            var size = 8 - (i * 2);
+            encoder.Frames.Add(BitmapFrame.Create(SolidFrame(size, size), null, new BitmapMetadata("gif"), null));
         }
 
         var encoded = new MemoryStream();
