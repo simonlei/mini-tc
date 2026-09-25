@@ -56,9 +56,11 @@
 
 ## C. 仍待修复 / 缺失（Tauri 有、native 无）—— 实现候选项
 
+> **进度**：C1（docx 内联预览）已于 **2026-09-25 实现**并落地（见下方标注 + commit `23bda72`），剩余 C2–C5 待排期。
+
 | # | 严重度 | 差异 | Tauri 证据 | win-native 现状 |
 |---|---|---|---|---|
-| C1（原 B2） | 中 | **docx 内联预览丢失**（mammoth 转 HTML + 消毒）；`.doc` 友好提示也没有 | `src/components/FilePreview.vue`（`docx` 分支：mammoth 读字节 → HTML 注入） | `PreviewService` 的 `PreviewKind` 仅 `None/Text/Image/Video/Pdf/Unsupported`，无 `Docx`；`PreviewView` 无对应分支。`.docx` 落 `Unsupported`。 |
+| C1（原 B2） | ✅ 已实现 | **docx 内联预览**（2026-09-25 补齐）：`DocumentFormat.OpenXml` v3 读 OOXML → 渲染 WPF `FlowDocument`（标题分级 / 粗斜体下划线删除线 / 超链接 / 项目符号与编号列表 / 基础表格；图片不内联，对齐 mammoth 默认）。超链接点击用默认浏览器打开。 | `src/components/FilePreview.vue`（`docx` 分支：mammoth 读字节 → HTML 注入） | `PreviewService` 新增 `PreviewKind.Docx` + `IsDocx`；新增 `Services/DocxPreviewService.cs`；`Views/PreviewView.xaml.cs` 接入 `FlowDocumentScrollViewer`。`.docx` 现可内联预览；`.doc` 仍 `Unsupported`。 |
 | C2（原 B4） | 中 | **SVG 图片预览丢失** | `src/App.vue` 图片集合含 `svg` | `PreviewService.ImageExtensions`（`JPG…AVIF`）不含 `SVG`。注意：WPF 不原生渲染 SVG，实现需引入 `SharpVectors` 之类库或 WebView 宿主。 |
 | C3（原 B6） | 低 | **Tab 列表无内存缓存 / 预加载**，切 Tab 会重新列目录并显示 Loading | `src/components/FilePanel.vue`（面板状态缓存） | `ViewModels/TabViewModel.cs` 仅存 `Path` + 排序状态，无条目缓存；切 Tab 由 `PanelViewModel` 重新列目录。 |
 | C4（原 B7） | 低 | **中键行为全无**：中键关 Tab、中键（XButton1）返回上一级 | `src/components/TabBar.vue`、`src/components/FileList.vue` | 全仓无中键 / XButton 处理（`Views/MainWindow.xaml.cs`、`FilePanelView` 均无）。 |
@@ -90,6 +92,6 @@
 
 ## 建议优先级（更新于 2026-09-25）
 
-1. **C1 docx 内联预览（中）**、**C2 SVG 预览（中，需引入 SVG 渲染库）**、**C3 Tab 缓存（低）**、**C4 中键交互（低）**、**C5 预览源清空自动退出（低）** 为当前仅存的「Tauri 有、native 无」缺口，可按价值与工作量排期实现。
+1. **C2 SVG 预览（中，需引入 SVG 渲染库）**、**C3 Tab 缓存（低）**、**C4 中键交互（低）**、**C5 预览源清空自动退出（低）** 为当前仅存的「Tauri 有、native 无」缺口，可按价值与工作量排期实现。**C1 docx 内联预览已于 2026-09-25 实现**（见 C 节标注）。
 2. 初版 B1 / B3 / B5 已修复，从缺口清单移除；新增 A15（字幕）、A16（类型列）为两侧对等能力，初版文档遗漏，已补入 A 节。
 3. ~~决定 E 项的 `Win+Backspace` 永久删除默认值是否保留。~~ **已决策（2026-09-24）：直接移除这两个 Mac 起源默认值，不保留。**
