@@ -17,6 +17,14 @@ public sealed partial class PanelViewModel : ObservableObject
     private CancellationTokenSource? _loadCts;
     private CancellationTokenSource? _saveTabsCts;
 
+    /// <summary>
+    /// Selection target waiting to be applied by the next listing. It outranks
+    /// whatever each caller captured on its own, exactly like the web build's
+    /// pending-select name: a snapshot taken before a delete still points at
+    /// rows that delete removed.
+    /// </summary>
+    private string[]? _pendingSelect;
+
     public PanelViewModel(string panelId)
     {
         PanelId = panelId;
@@ -67,9 +75,36 @@ public sealed partial class PanelViewModel : ObservableObject
     private string _statusText = string.Empty;
 
     /// <summary>Raised after a listing completes so the view can restore selection.</summary>
-    internal event Action<IReadOnlyList<string>>? SelectionRequested;
+    internal event Action<SelectionRequest>? SelectionRequested;
 
     internal event Action? ListingChanged;
+
+    /// <summary>
+    /// True when <paramref name="path"/> points at the directory already loaded,
+    /// i.e. the listing is a reload rather than real navigation into another
+    /// folder.
+    /// </summary>
+    internal bool IsCurrentDirectory(string path)
+        => CurrentPath.Length > 0
+           && string.Equals(
+               TrimSeparator(PathUtil.Expand(path)),
+               TrimSeparator(CurrentPath),
+               StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Drops trailing separators so "C:\dir" and "C:\dir\" compare equal while a
+    /// bare drive root ("C:\") keeps its one and only slash.
+    /// </summary>
+    private static string TrimSeparator(string path)
+    {
+        var trimmed = path;
+        while (trimmed.Length > 3 && (trimmed[^1] == '\\' || trimmed[^1] == '/'))
+        {
+            trimmed = trimmed[..^1];
+        }
+
+        return trimmed;
+    }
 
     public SortColumn SortColumn => ActiveTab?.SortColumn ?? SortColumn.Name;
 
@@ -219,6 +254,12 @@ public sealed partial class PanelViewModel : ObservableObject
         var cts = new CancellationTokenSource();
         _loadCts = cts;
 
+        // Captured before CurrentPath moves below: it decides whether the view
+        // may invent a selection when the requested names are gone.
+        var isReload = IsCurrentDirectory(expanded);
+
+        ArmPendingSelection(selectAfter);
+
         IsLoading = true;
         ErrorMessage = null;
 
@@ -246,7 +287,7 @@ public sealed partial class PanelViewModel : ObservableObject
             IsFiltering = false;
 
             ApplyView();
-            SelectionRequested?.Invoke(selectAfter ?? []);
+            SelectionRequested?.Invoke(BuildSelectionRequest(selectAfter, isReload));
             ScheduleSaveTabs();
         }
         catch (OperationCanceledException)
@@ -271,6 +312,61 @@ public sealed partial class PanelViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Remembers an explicit selection target until some listing applies it, so a
+    /// reload started while a file operation was still running highlights the row
+    /// that operation meant to leave the cursor on. Anonymous refreshes never
+    /// arm one: they only preserve whatever survives.
+    /// </summary>
+    internal void ArmPendingSelection(IReadOnlyList<string>? selectAfter)
+    {
+        if (selectAfter is { Count: > 0 })
+        {
+            _pendingSelect = [.. selectAfter];
+        }
+    }
+
+    /// <summary>
+    /// Decides which rows the view should highlight once a listing lands.
+    ///
+    /// The target is resolved <em>here</em>, right before it is handed over,
+    /// rather than when the load started: another load may have been queued in
+    /// between (window re-activated, F5), and anything captured earlier can
+    /// already point at rows a concurrent delete removed.
+    /// </summary>
+    internal SelectionRequest BuildSelectionRequest(IReadOnlyList<string>? selectAfter, bool isReload)
+    {
+        string[] targets;
+        var allowFirstRow = false;
+
+        if (isReload && _pendingSelect is { Length: > 0 } pending)
+        {
+            // An operation (delete, rename, new folder) asked for rows that no
+            // listing has applied yet - most likely because this listing
+            // superseded the very reload that operation started.
+            targets = pending;
+        }
+        else if (selectAfter is not null)
+        {
+            targets = [.. selectAfter];
+            allowFirstRow = !isReload;
+        }
+        else if (isReload)
+        {
+            // Nobody expressed an intent: keep whatever is highlighted now.
+            targets = SelectedEntries.Where(e => !e.IsParent).Select(e => e.Name).ToArray();
+        }
+        else
+        {
+            // Real navigation: the view starts at the top of the new folder.
+            targets = [];
+            allowFirstRow = true;
+        }
+
+        _pendingSelect = null;
+        return new SelectionRequest(targets, allowFirstRow);
+    }
+
     internal Task NavigateToAsync(string path) => LoadAsync(path);
 
     internal Task NavigateIntoAsync(FileEntry entry)
@@ -292,11 +388,13 @@ public sealed partial class PanelViewModel : ObservableObject
         await LoadAsync(parent, [leaving]).ConfigureAwait(true);
     }
 
-    internal async Task RefreshAsync()
-    {
-        var keep = SelectedEntries.Select(e => e.Name).ToArray();
-        await LoadAsync(CurrentPath, keep).ConfigureAwait(true);
-    }
+    /// <summary>
+    /// Re-lists the current directory and keeps whatever is highlighted at the
+    /// moment the listing lands. Passing no explicit target matters: a snapshot
+    /// taken up here would be stale by the time the listing applies if anything
+    /// else moved the cursor in between (a delete finishing, notably).
+    /// </summary>
+    internal Task RefreshAsync() => LoadAsync(CurrentPath);
 
     internal Task RefreshDrivesAsync() => LoadDrivesAsync();
 
@@ -429,7 +527,8 @@ public sealed partial class PanelViewModel : ObservableObject
 
     // ---- Selection helpers -------------------------------------------------
 
-    internal void RequestSelection(IReadOnlyList<string> names) => SelectionRequested?.Invoke(names);
+    internal void RequestSelection(IReadOnlyList<string> names)
+        => SelectionRequested?.Invoke(new SelectionRequest(names, false));
 
     internal FileEntry? FindByName(string name)
         => Entries.FirstOrDefault(e => !e.IsParent

@@ -341,45 +341,59 @@ public partial class FilePanelView : UserControl
     }
 
     /// <summary>Restores selection by name after a refresh, then scrolls it into view.</summary>
-    private void OnSelectionRequested(IReadOnlyList<string> names)
+    private void OnSelectionRequested(SelectionRequest request)
     {
         Dispatcher.InvokeAsync(() =>
         {
             _syncingSelection = true;
             try
             {
-                FileList.SelectedItems.Clear();
+                var wanted = request.Names.Count > 0
+                    ? new HashSet<string>(request.Names, StringComparer.OrdinalIgnoreCase)
+                    : null;
 
-                FileEntry? firstMatch = null;
+                var matches = new List<FileEntry>();
 
-                if (names.Count > 0)
+                if (wanted is not null)
                 {
-                    var wanted = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
-
                     foreach (var entry in _panel.Entries)
                     {
                         if (!entry.IsParent && wanted.Contains(entry.Name))
                         {
-                            FileList.SelectedItems.Add(entry);
-                            firstMatch ??= entry;
+                            matches.Add(entry);
                         }
                     }
                 }
 
-                // Nothing matched (first load, or the target is gone): start at the top.
-                firstMatch ??= _panel.Entries.FirstOrDefault(entry => !entry.IsParent)
-                               ?? _panel.Entries.FirstOrDefault();
-
-                if (firstMatch is not null)
+                if (matches.Count == 0 && request.AllowFirstRow)
                 {
-                    if (FileList.SelectedItems.Count == 0)
-                    {
-                        FileList.SelectedItems.Add(firstMatch);
-                    }
+                    // Real navigation (or the first listing): start at the top so
+                    // the arrow keys have somewhere to go.
+                    matches.AddRange(_panel.Entries.Where(entry => !entry.IsParent).Take(1));
 
-                    FileList.ScrollIntoView(firstMatch);
-                    FocusEntry(firstMatch);
+                    if (matches.Count == 0 && _panel.Entries.Count > 0)
+                    {
+                        matches.Add(_panel.Entries[0]);
+                    }
                 }
+
+                // Nothing matched and the pane did not move → leave the current
+                // selection alone instead of snapping the cursor to row 0.
+                if (matches.Count == 0)
+                {
+                    return;
+                }
+
+                FileList.SelectedItems.Clear();
+
+                foreach (var entry in matches)
+                {
+                    FileList.SelectedItems.Add(entry);
+                }
+
+                var first = matches[0];
+                FileList.ScrollIntoView(first);
+                FocusEntry(first);
             }
             finally
             {
