@@ -63,6 +63,11 @@ public partial class MainWindow : Window
         UpdatePreviewSlots();
         LeftPanelView.IsActive = true;
         LeftPanelView.FocusList();
+
+        // Warm the video engine on a background thread now that the directory
+        // listing is done, so the first video preview does not have to pay the
+        // ~0.8 s native plugin load inline.
+        VlcEngine.Prewarm();
     }
 
     // ---- View model reactions ---------------------------------------------

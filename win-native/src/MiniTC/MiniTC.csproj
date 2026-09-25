@@ -61,6 +61,18 @@
          native payload — it simply walks the document body (paragraphs, runs,
          lists via numbering.xml, tables) and builds rich text in-process. -->
     <PackageReference Include="DocumentFormat.OpenXml" Version="3.1.1" />
+
+    <!-- Video inline preview: LibVLC replaces WPF's MediaElement. MediaElement
+         runs on Media Foundation *and* requires the "Windows Media Player /
+         Media Feature Pack" optional feature — without it even a plain H.264
+         (avc1) MP4 refuses to play. LibVLC ships its own decoders (HEVC, RMVB,
+         FLV, ...), so no OS optional feature is needed.
+         LibVLCSharp.WPF is only the managed binding; the native libvlc.dll /
+         libvlccore.dll come from VideoLAN.LibVLC.Windows, which drops win-x64,
+         win-x86 and win-arm64 builds into bin/**/libvlc/. Omitting it throws
+         "Unable to load DLL 'libvlc'" at runtime. -->
+    <PackageReference Include="LibVLCSharp.WPF" Version="3.10.1" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.24" />
   </ItemGroup>
 
   <ItemGroup>

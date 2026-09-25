@@ -10,7 +10,7 @@ WPF + .NET 8 重写的双栏文件管理器，取代原 Tauri 2 + Vue 实现。m
 | 文件复制 / 移动 | 约 700 行自研 Rust 引擎（跨卷、合并、冲突、提权全部手写） | Shell `IFileOperation`，行为与资源管理器逐字节一致 |
 | 剪贴板 / 拖放 | 手写 `DROPFILES` 封送 + vendored `drag-rs` 补丁 | `DataObject` / `DoDragDrop` 原生支持 |
 | 图标 | emoji 占位 | `SHGetFileInfo` 真实 Shell 图标 |
-| 视频 | WebView 解码，mkv/HEVC 靠启发式判定黑屏后回退 | Media Foundation，mkv/avi 直接播，失败有明确事件 |
+| 视频 | WebView 解码，mkv/HEVC 靠启发式判定黑屏后回退 | LibVLC 内嵌解码，自带 HEVC / RMVB / FLV 等解码器，不依赖系统媒体功能包 |
 | 界面 | 4 套自制主题 | Fluent 配色，跟随系统深浅色与强调色 |
 
 ## 环境要求
@@ -94,11 +94,17 @@ win-native/
 |---|---|
 | 文本 | `txt/md/json/log` + 用户自定义后缀；2 MB 上限，`.log` 超限只读末尾 512 KB；BOM → 严格 UTF-8 → GBK 逐级嗅探（原版一律 lossy UTF-8）；`.json` 自动 2 空格缩进美化（解析失败回退原文并提示「JSON 格式错误」） |
 | 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除） |
-| 视频 | Media Foundation；常驻进度条、按钮行 3 秒自动隐藏、±5/±30 秒、倍速、音量滚轮、字幕（同目录探测 / 手动加载 / ±0.5 秒偏移）、播完自动续播下一个、全屏 |
+| 视频 | LibVLC（`LibVLCSharp.WPF` 的 `VideoView`）；常驻进度条、按钮行 3 秒自动隐藏、±5/±30 秒、倍速、音量滚轮、播完自动续播下一个、全屏。外挂字幕（同目录探测 / 手动加载 / ±0.5 秒偏移）已随引擎替换暂时移除 |
 | PDF | PdfiumViewer 原生渲染（不引 WebView2），翻页、适应宽度 / 实际大小，显示「第 X / Y 页」（对齐 WebView 版 `convertFileSrc`+`<iframe>` 的内联预览） |
 | DOCX | `DocumentFormat.OpenXml` 解析 OOXML 包，在进程内渲染 WPF `FlowDocument`：标题分级、粗体/斜体/下划线/删除线、超链接、项目符号与编号列表（解析 numbering.xml）、基础表格；图片不内联（对齐 WebView 版 mammoth 默认行为），页脚标注「图片未内联渲染」 |
 
 DOCX 现可内联预览（C1）。`.doc`（旧版二进制格式）仍不支持，选中时提供「用系统程序打开」。PDF 走 PdfiumViewer 原生渲染，不引 WebView2。
+
+**视频预览不依赖 Windows Media Player。** 原先的 `MediaElement` 走 Media Foundation，而 WPF 的 `MediaElement` 要求系统装上「Windows Media Player / 媒体功能包」这个可选功能——没装的机器上连普通 H.264(avc1) 的 mp4 都放不出来。现在改用 LibVLC，解码器随包自带（HEVC、RMVB、FLV 等均可播），无需任何系统可选功能。两个已知取舍：
+
+- `VideoView` 内部是 `WindowsFormsHost`，存在 WPF airspace 限制——WPF 子元素画不到视频上面。按 LibVLCSharp 官方解法，**叠加内容放在 `VideoView` 内部**（会被渲染到视频之上的独立透明窗口）。覆盖层背景的 alpha 必须大于 0（`#00000000` 不行），否则视频区域永远收不到鼠标事件。播放失败的兜底面板仍是**隐藏视频面**而不是盖在上面。
+- 引擎实例全应用共享（`Services/VlcEngine.cs`）：加载原生插件实测约 **780 ms**，而 `Play()` 到出首帧只要 10–60 ms——慢的几乎全是这一次性初始化，且它是按 LibVLC 实例计的，左右两栏不能各建一个。窗口加载完成后会在后台线程 `Prewarm()` 预热，首次预览基本无感。
+- 外挂字幕渲染暂未接入（`SubtitleService` 保留，将来可用 `AddSlave(MediaSlaveType.Subtitle, …)` 接回）。
 
 ## 发布
 

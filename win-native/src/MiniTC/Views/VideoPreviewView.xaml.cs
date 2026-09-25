@@ -5,6 +5,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Threading;
+using LibVLCSharp.Shared;
 using MiniTC.Models;
 using MiniTC.Services;
 using MiniTC.ViewModels;
@@ -19,13 +20,16 @@ public partial class VideoPreviewView : UserControl
     private readonly DispatcherTimer _tick = new() { Interval = TimeSpan.FromMilliseconds(200) };
     private readonly DispatcherTimer _hideControls = new() { Interval = ControlsHideDelay };
 
+    private MediaPlayer? _mediaPlayer;
+    private Media? _media;
+
     private MainViewModel _shell = null!;
     private VideoConfig _config = new();
 
     /// <summary>
     /// False until InitializeComponent finishes. BAML applies Slider.Value
     /// before it assigns the generated field, so the ValueChanged handler can
-    /// fire while VolumeSlider/Player are still null.
+    /// fire while VolumeSlider/RateBox are still null.
     /// </summary>
     private bool _ready;
 
@@ -34,9 +38,6 @@ public partial class VideoPreviewView : UserControl
     private bool _suppressConfigWrite;
     private bool _hoveringControls;
     private bool _fellBack;
-    private bool _autoplayPending;
-    private double _subtitleOffset;
-    private List<SubtitleCue>? _cues;
 
     /// <summary>Raised when the player wants the shell to toggle fullscreen.</summary>
     internal event Action<bool>? FullscreenRequested;
@@ -46,6 +47,29 @@ public partial class VideoPreviewView : UserControl
     public VideoPreviewView()
     {
         InitializeComponent();
+
+        // Bind the MediaPlayer to the surface up front. VideoView hosts a Win32
+        // window internally (WindowsFormsHost) and LibVLCSharp's docs are
+        // explicit that the MediaPlayer should be attached before the control is
+        // loaded - assigning it lazily on first playback is a known cause of a
+        // permanently black surface.
+        var libVlc = VlcEngine.Current;
+        _mediaPlayer = new MediaPlayer(libVlc);
+
+        // LibVLC raises these from its own threads, so everything that touches
+        // the UI is marshalled back through the dispatcher.
+        _mediaPlayer.Playing += (_, _) => Post(OnPlayingCore);
+        _mediaPlayer.Paused += (_, _) => Post(OnPausedCore);
+        _mediaPlayer.EndReached += (_, _) => Post(OnEndReachedCore);
+        _mediaPlayer.EncounteredError += (_, _) => Post(OnErrorCore);
+
+        _mediaPlayer.LengthChanged += (_, args) =>
+        {
+            var length = args.Length;
+            Post(() => ApplyDuration(length));
+        };
+
+        VideoSurface.MediaPlayer = _mediaPlayer;
 
         _tick.Tick += OnTick;
         _hideControls.Tick += OnHideControlsTick;
@@ -91,11 +115,15 @@ public partial class VideoPreviewView : UserControl
         try
         {
             VolumeSlider.Value = Math.Clamp(_config.Volume, 0, 1);
-            Player.Volume = VolumeSlider.Value;
-            Player.IsMuted = _config.Muted;
 
             var rateIndex = Array.FindIndex(Rates, r => Math.Abs(r - _config.Rate) < 0.001);
             RateBox.SelectedIndex = rateIndex >= 0 ? rateIndex : Array.IndexOf(Rates, 1.0);
+
+            if (_mediaPlayer is not null)
+            {
+                _mediaPlayer.Mute = _config.Muted;
+                _mediaPlayer.Volume = (int)Math.Round(VolumeSlider.Value * 100);
+            }
 
             UpdateMuteGlyph();
         }
@@ -113,7 +141,7 @@ public partial class VideoPreviewView : UserControl
         }
 
         _config.Volume = VolumeSlider.Value;
-        _config.Muted = Player.IsMuted;
+        _config.Muted = _mediaPlayer?.Mute ?? _config.Muted;
         _config.Rate = Rates[Math.Max(0, RateBox.SelectedIndex)];
 
         _ = ConfigStore.SaveAsync("video-config", _config);
@@ -134,6 +162,10 @@ public partial class VideoPreviewView : UserControl
         }
     }
 
+    // ---- Engine ------------------------------------------------------------
+
+    private void Post(Action action) => Dispatcher.BeginInvoke(action);
+
     // ---- Loading -----------------------------------------------------------
 
     private void Load(string path)
@@ -142,47 +174,18 @@ public partial class VideoPreviewView : UserControl
 
         TitleText.Text = Path.GetFileName(path);
         _fellBack = false;
-        _subtitleOffset = 0;
-        OffsetText.Text = "0.0s";
+
         FallbackHost.Visibility = Visibility.Collapsed;
-        SubtitleText.Text = string.Empty;
+        VideoSurface.Visibility = Visibility.Visible;
 
-        var extension = PathUtil.ExtensionOf(path);
+        _media = new Media(VlcEngine.Current, new Uri(path));
+        _mediaPlayer!.Play(_media);
 
-        // Containers with no Media Foundation demuxer never even get loaded.
-        if (PreviewService.IsExternalOnlyVideo(extension))
-        {
-            ShowFallback($"{extension} 容器没有可用的系统解码器，请用外部播放器打开。");
-            return;
-        }
-
-        Player.Source = new Uri(path);
-        Player.Play();
         _isPlaying = true;
         UpdatePlayGlyph();
 
         _tick.Start();
         RestartControlsTimer();
-
-        _ = LoadSubtitlesAsync(path);
-    }
-
-    private async Task LoadSubtitlesAsync(string path)
-    {
-        var tracks = await SubtitleService.DetectAsync(path);
-
-        SubtitleBox.Items.Clear();
-        SubtitleBox.Items.Add("无字幕");
-
-        foreach (var track in tracks)
-        {
-            SubtitleBox.Items.Add(track);
-        }
-
-        SubtitleBox.Items.Add("载入字幕文件…");
-
-        // Auto-enable the first sidecar whose name matches the video.
-        SubtitleBox.SelectedIndex = tracks.Count > 0 ? 1 : 0;
     }
 
     private void Teardown()
@@ -190,15 +193,14 @@ public partial class VideoPreviewView : UserControl
         _tick.Stop();
         _hideControls.Stop();
 
-        if (Player.Source is not null)
-        {
-            Player.Stop();
-            Player.Close();
-            Player.Source = null;
-        }
-
         _isPlaying = false;
-        _cues = null;
+        PlayBadge.Visibility = Visibility.Collapsed;
+
+        _mediaPlayer?.Stop();
+        _media?.Dispose();
+        _media = null;
+
+        Timeline.Value = 0;
         ButtonRow.Visibility = Visibility.Visible;
         UpdatePlayGlyph();
     }
@@ -207,51 +209,64 @@ public partial class VideoPreviewView : UserControl
     {
         _fellBack = true;
         _tick.Stop();
+        _hideControls.Stop();
+        _isPlaying = false;
+
+        _mediaPlayer?.Stop();
+
+        // Hide the native surface instead of covering it: WPF content cannot
+        // paint on top of LibVLCSharp's HWND.
+        VideoSurface.Visibility = Visibility.Collapsed;
         FallbackText.Text = message;
         FallbackHost.Visibility = Visibility.Visible;
-        PlayBadge.Visibility = Visibility.Collapsed;
+
+        ButtonRow.Visibility = Visibility.Visible;
+        UpdatePlayGlyph();
     }
 
     // ---- Media events ------------------------------------------------------
 
-    private void OnMediaOpened(object sender, RoutedEventArgs e)
+    private void ApplyDuration(long milliseconds)
     {
-        var duration = Player.NaturalDuration.HasTimeSpan
-            ? Player.NaturalDuration.TimeSpan.TotalSeconds
-            : 0;
-
+        var duration = milliseconds / 1000.0;
         Timeline.Maximum = duration > 0 ? duration : 1;
         DurationText.Text = FormatTime(duration);
-
-        // An audio-only decode result means the video track was unsupported
-        // (typically HEVC without the platform extension).
-        if (Player.NaturalVideoWidth == 0 || Player.NaturalVideoHeight == 0)
-        {
-            ShowFallback("系统无法解码该视频轨（常见于 H.265/HEVC），请用外部播放器打开。");
-            return;
-        }
-
-        Player.SpeedRatio = Rates[Math.Max(0, RateBox.SelectedIndex)];
-        Player.Volume = VolumeSlider.Value;
-
-        if (_autoplayPending)
-        {
-            _autoplayPending = false;
-            Player.Play();
-            _isPlaying = true;
-            UpdatePlayGlyph();
-        }
     }
 
-    private void OnMediaFailed(object sender, ExceptionRoutedEventArgs e)
-        => ShowFallback($"无法播放该文件：{e.ErrorException?.Message ?? "缺少解码器"}");
+    private void OnPlayingCore()
+    {
+        _isPlaying = true;
+
+        // LibVLC resets rate/volume per media, so re-apply the persisted values
+        // once playback actually starts.
+        if (_mediaPlayer is not null)
+        {
+            _mediaPlayer.SetRate((float)Rates[Math.Max(0, RateBox.SelectedIndex)]);
+            _mediaPlayer.Volume = (int)Math.Round(VolumeSlider.Value * 100);
+            _mediaPlayer.Mute = _config.Muted;
+        }
+
+        UpdatePlayGlyph();
+        RestartControlsTimer();
+    }
+
+    private void OnPausedCore()
+    {
+        _isPlaying = false;
+        ButtonRow.Visibility = Visibility.Visible;
+        _hideControls.Stop();
+        UpdatePlayGlyph();
+    }
+
+    private void OnErrorCore()
+        => ShowFallback("LibVLC 无法播放该文件（文件可能已损坏，或编码不受支持）。");
 
     /// <summary>
     /// Plays the next video in the pane's current visual order. Deliberately
     /// reuses the list order instead of re-sorting, so auto-advance always
     /// matches what the user sees.
     /// </summary>
-    private void OnMediaEnded(object sender, RoutedEventArgs e)
+    private void OnEndReachedCore()
     {
         _isPlaying = false;
         UpdatePlayGlyph();
@@ -269,7 +284,6 @@ public partial class VideoPreviewView : UserControl
             return;
         }
 
-        _autoplayPending = true;
         source.RequestSelection([next.Name]);
         _shell.SetPreviewTarget(next);
     }
@@ -278,12 +292,12 @@ public partial class VideoPreviewView : UserControl
 
     private void OnTick(object? sender, EventArgs e)
     {
-        if (_fellBack)
+        if (_fellBack || _mediaPlayer is null)
         {
             return;
         }
 
-        var position = Player.Position.TotalSeconds;
+        var position = _mediaPlayer.Time / 1000.0;
 
         if (!_isScrubbing)
         {
@@ -291,7 +305,6 @@ public partial class VideoPreviewView : UserControl
         }
 
         PositionText.Text = FormatTime(position);
-        UpdateSubtitle(position);
     }
 
     private void OnTimelineDragStarted(object sender, DragStartedEventArgs e) => _isScrubbing = true;
@@ -312,18 +325,25 @@ public partial class VideoPreviewView : UserControl
 
     private void Seek(double seconds)
     {
-        if (_fellBack)
+        if (_fellBack || _mediaPlayer is null)
         {
             return;
         }
 
         var clamped = Math.Clamp(seconds, 0, Timeline.Maximum);
-        Player.Position = TimeSpan.FromSeconds(clamped);
+        _mediaPlayer.Time = (long)Math.Round(clamped * 1000);
         PositionText.Text = FormatTime(clamped);
-        UpdateSubtitle(clamped);
     }
 
-    private void Skip(double delta) => Seek(Player.Position.TotalSeconds + delta);
+    private void Skip(double delta)
+    {
+        if (_mediaPlayer is null)
+        {
+            return;
+        }
+
+        Seek(_mediaPlayer.Time / 1000.0 + delta);
+    }
 
     private static string FormatTime(double seconds)
     {
@@ -344,21 +364,21 @@ public partial class VideoPreviewView : UserControl
 
     internal void TogglePlay()
     {
-        if (_fellBack)
+        if (_fellBack || _mediaPlayer is null || _media is null)
         {
             return;
         }
 
         if (_isPlaying)
         {
-            Player.Pause();
+            _mediaPlayer.Pause();
             _isPlaying = false;
             ButtonRow.Visibility = Visibility.Visible;
             _hideControls.Stop();
         }
         else
         {
-            Player.Play();
+            _mediaPlayer.Play();
             _isPlaying = true;
             RestartControlsTimer();
         }
@@ -369,7 +389,9 @@ public partial class VideoPreviewView : UserControl
     private void UpdatePlayGlyph()
     {
         PlayButton.Content = _isPlaying ? "\uE769" : "\uE768";
-        PlayBadge.Visibility = _isPlaying || _fellBack ? Visibility.Collapsed : Visibility.Visible;
+        PlayBadge.Visibility = !_isPlaying && !_fellBack && _media is not null
+            ? Visibility.Visible
+            : Visibility.Collapsed;
     }
 
     private void OnBack10Click(object sender, RoutedEventArgs e) => Skip(-10);
@@ -378,13 +400,20 @@ public partial class VideoPreviewView : UserControl
 
     private void OnMuteClick(object sender, RoutedEventArgs e)
     {
-        Player.IsMuted = !Player.IsMuted;
+        if (_mediaPlayer is null)
+        {
+            return;
+        }
+
+        _mediaPlayer.Mute = !_mediaPlayer.Mute;
         UpdateMuteGlyph();
         SaveConfig();
     }
 
     private void UpdateMuteGlyph()
-        => MuteButton.Content = Player.IsMuted || VolumeSlider.Value <= 0 ? "\uE74F" : "\uE767";
+        => MuteButton.Content = (_mediaPlayer?.Mute ?? false) || VolumeSlider.Value <= 0
+            ? "\uE74F"
+            : "\uE767";
 
     private void OnVolumeChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
@@ -393,11 +422,14 @@ public partial class VideoPreviewView : UserControl
             return;
         }
 
-        Player.Volume = e.NewValue;
-
-        if (e.NewValue > 0 && Player.IsMuted)
+        if (_mediaPlayer is not null)
         {
-            Player.IsMuted = false;
+            _mediaPlayer.Volume = (int)Math.Round(e.NewValue * 100);
+
+            if (e.NewValue > 0 && _mediaPlayer.Mute)
+            {
+                _mediaPlayer.Mute = false;
+            }
         }
 
         UpdateMuteGlyph();
@@ -411,7 +443,7 @@ public partial class VideoPreviewView : UserControl
             return;
         }
 
-        Player.SpeedRatio = Rates[RateBox.SelectedIndex];
+        _mediaPlayer?.SetRate((float)Rates[RateBox.SelectedIndex]);
         SaveConfig();
     }
 
@@ -489,102 +521,6 @@ public partial class VideoPreviewView : UserControl
         RestartControlsTimer();
     }
 
-    // ---- Subtitles ---------------------------------------------------------
-
-    private void UpdateSubtitle(double position)
-    {
-        if (_cues is null)
-        {
-            if (SubtitleText.Text.Length > 0)
-            {
-                SubtitleText.Text = string.Empty;
-            }
-
-            return;
-        }
-
-        var cue = SubtitleService.CueAt(_cues, position + _subtitleOffset);
-        var text = cue?.Text ?? string.Empty;
-
-        if (SubtitleText.Text != text)
-        {
-            SubtitleText.Text = text;
-        }
-    }
-
-    private void OnSubtitleChanged(object sender, SelectionChangedEventArgs e)
-    {
-        switch (SubtitleBox.SelectedItem)
-        {
-            case SubtitleTrack track:
-                _cues = track.Cues;
-                break;
-
-            case string label when label.StartsWith("载入", StringComparison.Ordinal):
-                BrowseForSubtitle();
-                break;
-
-            default:
-                _cues = null;
-                SubtitleText.Text = string.Empty;
-                break;
-        }
-    }
-
-    private void BrowseForSubtitle()
-    {
-        var dialog = new Microsoft.Win32.OpenFileDialog
-        {
-            Title = "选择字幕文件",
-            Filter = "字幕文件|*.srt;*.vtt;*.ass;*.ssa|所有文件|*.*",
-        };
-
-        if (dialog.ShowDialog() != true)
-        {
-            SubtitleBox.SelectedIndex = _cues is null ? 0 : 1;
-            return;
-        }
-
-        var track = SubtitleService.TryLoad(dialog.FileName);
-
-        if (track is null)
-        {
-            _shell.ShowToast("无法解析该字幕文件", ToastKind.Error);
-            SubtitleBox.SelectedIndex = 0;
-            return;
-        }
-
-        // Insert before the trailing "load file" entry and select it.
-        SubtitleBox.Items.Insert(SubtitleBox.Items.Count - 1, track);
-        SubtitleBox.SelectedItem = track;
-    }
-
-    /// <summary>Toggles between the first sidecar track and no subtitles (C key).</summary>
-    internal void ToggleSubtitle()
-    {
-        if (SubtitleBox.Items.Count <= 2)
-        {
-            return;
-        }
-
-        SubtitleBox.SelectedIndex = SubtitleBox.SelectedIndex > 0 ? 0 : 1;
-    }
-
-    private void OnSubtitleOffsetBackClick(object sender, RoutedEventArgs e) => AdjustOffset(0.5);
-
-    private void OnSubtitleOffsetForwardClick(object sender, RoutedEventArgs e) => AdjustOffset(-0.5);
-
-    /// <summary>
-    /// A positive offset pulls cues earlier (we look ahead in the cue list), so
-    /// the "subtitle earlier" button adds to it.
-    /// </summary>
-    private void AdjustOffset(double delta)
-    {
-        _subtitleOffset = Math.Round(_subtitleOffset + delta, 2);
-        OffsetText.Text = $"{-_subtitleOffset:0.0}s";
-        UpdateSubtitle(Player.Position.TotalSeconds);
-    }
-
     // ---- Shell wiring ------------------------------------------------------
 
     private void OnCloseClick(object sender, RoutedEventArgs e)
@@ -630,17 +566,23 @@ public partial class VideoPreviewView : UserControl
                 return true;
 
             case "video.mute":
-                Player.IsMuted = !Player.IsMuted;
-                UpdateMuteGlyph();
-                SaveConfig();
+                if (_mediaPlayer is not null)
+                {
+                    _mediaPlayer.Mute = !_mediaPlayer.Mute;
+                    UpdateMuteGlyph();
+                    SaveConfig();
+                }
+
                 return true;
 
             case "video.fullscreen":
                 ToggleFullscreen();
                 return true;
 
+            // Sidecar subtitle rendering was dropped with the switch to LibVLC;
+            // the binding still exists, so swallow it instead of letting it leak
+            // into the file-list scope.
             case "video.subtitle":
-                ToggleSubtitle();
                 return true;
 
             case "video.prevFile":

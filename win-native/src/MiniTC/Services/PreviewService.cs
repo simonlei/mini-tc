@@ -62,7 +62,12 @@ internal static class PreviewService
         "MPG", "MPEG", "VOB", "MTS",
     };
 
-    /// <summary>Formats with no Media Foundation demuxer; these go straight to the fallback.</summary>
+    /// <summary>
+    /// Containers Media Foundation has no demuxer for. Since playback moved to
+    /// LibVLC these are no longer rejected up front — LibVLC demuxes most of
+    /// them itself — so the set now only feeds <see cref="IsVideo"/> (so they
+    /// still route to the video preview) and the parity tests.
+    /// </summary>
     private static readonly HashSet<string> ExternalOnlyVideoExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         "RM", "RMVB", "FLV", "F4V", "DIVX", "OGV", "M3U8", "SWF",
