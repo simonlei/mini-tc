@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text;
+using System.Text.Json;
 
 namespace MiniTC.Services;
 
@@ -12,7 +13,7 @@ public enum PreviewKind
     Unsupported,
 }
 
-internal sealed record TextPreview(string Content, int LineCount, long FileSize, string Encoding, bool Truncated);
+internal sealed record TextPreview(string Content, int LineCount, long FileSize, string Encoding, bool Truncated, string? Note = null);
 
 /// <summary>
 /// Decides what a file can be previewed as and loads text content.
@@ -94,6 +95,7 @@ internal static class PreviewService
     {
         var info = new FileInfo(path);
         var isLog = string.Equals(info.Extension.TrimStart('.'), "log", StringComparison.OrdinalIgnoreCase);
+        var isJson = string.Equals(info.Extension.TrimStart('.'), "json", StringComparison.OrdinalIgnoreCase);
 
         if (info.Length > MaxTextSize && !isLog)
         {
@@ -128,8 +130,26 @@ internal static class PreviewService
             text = $"──── 文件过大（共 {FileSizeText(info.Length)}），仅显示末尾 512 KB ────{Environment.NewLine}{text}";
         }
 
+        string? note = null;
+        if (isJson)
+        {
+            // Mirror the web build's behaviour: pretty-print with a 2-space
+            // indent, and on a parse failure just keep the raw text with a
+            // non-blocking warning (so copy-all still yields the original bytes).
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                text = JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
+                note = "JSON 已格式化（2 空格缩进）";
+            }
+            catch (JsonException)
+            {
+                note = "JSON 格式错误，以下为原始文本";
+            }
+        }
+
         var lines = text.Length == 0 ? 0 : text.AsSpan().Count('\n') + 1;
-        return new TextPreview(text, lines, info.Length, encodingName, truncated);
+        return new TextPreview(text, lines, info.Length, encodingName, truncated, note);
     }
 
     private static string FileSizeText(long bytes) => Models.FileEntry.FormatBytes(bytes);

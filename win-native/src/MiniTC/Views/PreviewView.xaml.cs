@@ -127,9 +127,14 @@ public partial class PreviewView : UserControl
             }
 
             TextBody.Text = preview.Content;
-            FooterInfo.Text =
-                $"{preview.LineCount} 行 · {preview.Content.Length} 字符 · " +
+            var footer = $"{preview.LineCount} 行 · {preview.Content.Length} 字符 · " +
                 $"{FileEntry.FormatBytes(preview.FileSize)} · {preview.Encoding}";
+            if (preview.Note is { } note)
+            {
+                footer += $" · {note}";
+            }
+
+            FooterInfo.Text = footer;
 
             CopyAllButton.Visibility = Visibility.Visible;
         }
