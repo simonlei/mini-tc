@@ -65,6 +65,72 @@ public class GifAnimationTests
     }
 
     /// <summary>
+    /// Every composed frame is wrapped from one shared working buffer. If
+    /// <see cref="System.Windows.Media.Imaging.BitmapSource.Create"/> aliased that
+    /// buffer instead of copying it, all frames would collapse into the last one —
+    /// the animation would sit still on a single picture.
+    ///
+    /// The frames here are fully opaque too, which also exercises the "copy the row
+    /// instead of blending it" fast path.
+    /// </summary>
+    [Fact]
+    public void ComposedFramesAreIndependentCopies()
+    {
+        using var stream = BuildColouredGif();
+
+        var timeline = GifAnimationService.Decode(stream);
+
+        Assert.Equal(3, timeline.Frames.Count);
+        var first = Pixels(timeline.Frames[0]);
+        var second = Pixels(timeline.Frames[1]);
+        var third = Pixels(timeline.Frames[2]);
+
+        Assert.NotEqual(first, second);
+        Assert.NotEqual(second, third);
+    }
+
+    private static byte[] Pixels(BitmapSource frame)
+    {
+        var stride = frame.PixelWidth * 4;
+        var buffer = new byte[stride * frame.PixelHeight];
+        frame.CopyPixels(buffer, stride, 0);
+        return buffer;
+    }
+
+    /// <summary>
+    /// A full-size red frame followed by two smaller ones, so the logical screen is
+    /// 8x8 while later frames cover only a corner — which forces composing, and makes
+    /// each composed frame visibly different from the one before it.
+    /// </summary>
+    private static MemoryStream BuildColouredGif()
+    {
+        var encoder = new GifBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(OpaqueFrame(8, 8, Colors.Red)));
+        encoder.Frames.Add(BitmapFrame.Create(OpaqueFrame(4, 4, Colors.Green)));
+        encoder.Frames.Add(BitmapFrame.Create(OpaqueFrame(4, 4, Colors.Blue)));
+
+        var stream = new MemoryStream();
+        encoder.Save(stream);
+        stream.Position = 0;
+        return stream;
+    }
+
+    private static BitmapSource OpaqueFrame(int width, int height, Color color)
+    {
+        var stride = width * 4;
+        var pixels = new byte[stride * height];
+        for (var i = 0; i < pixels.Length; i += 4)
+        {
+            pixels[i] = color.B;
+            pixels[i + 1] = color.G;
+            pixels[i + 2] = color.R;
+            pixels[i + 3] = 255;
+        }
+
+        return BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null, pixels, stride);
+    }
+
+    /// <summary>
     /// Encodes a real GIF, then patches the per-frame delay straight into each
     /// Graphic Control Extension. GifBitmapEncoder ignores /grctlext/Delay on save —
     /// it reads back as 0 every time — so patching the bytes is the only way to get

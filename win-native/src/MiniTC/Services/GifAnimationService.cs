@@ -102,6 +102,54 @@ internal static class GifAnimationService
     }
 
     /// <summary>
+    /// Decodes just the first frame, so the preview can put a picture on screen
+    /// without waiting for the whole animation to be composed — 6 ms for a 4 MB GIF
+    /// versus 200-1000 ms for the full decode.
+    ///
+    /// The frame is composed onto the background if it needs it: plenty of GIFs start
+    /// with a complete first frame, but one that carries transparency would otherwise
+    /// show transparent gaps (black patches) for the moment before playback starts.
+    /// </summary>
+    internal static BitmapSource FirstFrame(byte[] bytes)
+    {
+        // Deliberately not disposed: DelayCreation defers decoding a frame's pixels
+        // until something asks for them, which for the returned frame happens later
+        // on the UI thread. A MemoryStream over a byte[] holds nothing unmanaged, so
+        // leaving it to the GC is both safe and the only way the frame stays valid.
+        var stream = new MemoryStream(bytes, writable: false);
+        var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.DelayCreation, BitmapCacheOption.OnLoad);
+        var source = decoder.Frames;
+
+        if (source.Count == 0)
+        {
+            throw new InvalidDataException("GIF 没有可显示的帧");
+        }
+
+        var width = Math.Max(1, QueryUInt16(decoder.Metadata, "/logscrdesc/Width") ?? source[0].PixelWidth);
+        var height = Math.Max(1, QueryUInt16(decoder.Metadata, "/logscrdesc/Height") ?? source[0].PixelHeight);
+        var first = source[0];
+
+        // A full-canvas frame with nothing transparent is already the finished
+        // picture, which is true of most GIFs' first frame.
+        if (first.PixelWidth == width &&
+            first.PixelHeight == height &&
+            QueryBool(first.Metadata, "/grctlext/TransparencyFlag") != true)
+        {
+            if (first.CanFreeze)
+            {
+                first.Freeze();
+            }
+
+            return first;
+        }
+
+        var pixels = new byte[width * 4 * height];
+        Fill(pixels, ResolveBackground(decoder, source));
+        Blend(pixels, width, height, first);
+        return ToFrame(pixels, width, height, width * 4);
+    }
+
+    /// <summary>
     /// Reads a frame's delay. GIF stores it in hundredths of a second, so 5 means
     /// 50 ms. Values at or below 1 are bumped to the default — browsers do the same,
     /// otherwise "fast" GIFs strobe at 10 ms per frame.
@@ -132,14 +180,16 @@ internal static class GifAnimationService
         int height)
     {
         var stride = width * 4;
-        var canvas = new WriteableBitmap(width, height, 96, 96, PixelFormats.Pbgra32, null);
 
-        // Managed mirror of the canvas: reading it back per frame would mean another
-        // CopyPixels round trip, and blending needs the pixels underneath anyway.
+        // One managed buffer *is* the canvas. The previous implementation kept a
+        // WriteableBitmap and pushed this buffer into it with WritePixels before
+        // cloning a snapshot out of it — two full-canvas copies per frame, which
+        // measured at ~930 ms of the 1056 ms total for a 39-frame 640x1144 GIF.
+        // Blending straight into the buffer and wrapping it with BitmapSource.Create
+        // needs only the one copy that produces the frame.
         var pixels = new byte[stride * height];
         var background = ResolveBackground(decoder, source);
         Fill(pixels, background);
-        canvas.WritePixels(new Int32Rect(0, 0, width, height), pixels, stride, 0);
 
         var composed = new List<BitmapSource>(source.Count);
         byte[]? beforePrevious = null;
@@ -154,36 +204,49 @@ internal static class GifAnimationService
                 switch (QueryByte(source[i - 1].Metadata, "/grctlext/Disposal") ?? 0)
                 {
                     case 2:
-                        Clear(canvas, pixels, width, height, stride, source[i - 1], background);
+                        Wipe(pixels, width, height, source[i - 1], background);
                         break;
 
                     case 3 when beforePrevious is not null:
-                        Restore(canvas, pixels, beforePrevious, stride, height);
+                        Array.Copy(beforePrevious, pixels, pixels.Length);
                         break;
                 }
             }
 
-            // Snapshot before drawing, so a later disposal 3 can restore it.
-            beforePrevious = (byte[])pixels.Clone();
+            // Only disposal 3 ever needs the pre-frame canvas back, so the 2.9 MB
+            // clone is skipped for the overwhelming majority of GIFs.
+            if ((QueryByte(source[i].Metadata, "/grctlext/Disposal") ?? 0) == 3)
+            {
+                beforePrevious = (byte[])pixels.Clone();
+            }
 
-            Blend(canvas, pixels, width, height, stride, source[i]);
-            composed.Add(Snapshot(canvas));
+            Blend(pixels, width, height, source[i]);
+            composed.Add(ToFrame(pixels, width, height, stride));
         }
 
         return composed;
     }
 
     /// <summary>
-    /// Draws one frame onto the canvas at its own offset, blending through its alpha.
-    /// Only the region the frame actually covers is written back.
+    /// Wraps the current canvas contents as an immutable frame. <see cref="BitmapSource.Create"/>
+    /// copies the buffer, so every frame stays independent even though they share one array.
     /// </summary>
-    private static void Blend(
-        WriteableBitmap canvas,
-        byte[] pixels,
-        int width,
-        int height,
-        int stride,
-        BitmapFrame frame)
+    private static BitmapSource ToFrame(byte[] pixels, int width, int height, int stride)
+    {
+        var frame = BitmapSource.Create(width, height, 96, 96, PixelFormats.Pbgra32, null, pixels, stride);
+        frame.Freeze();
+        return frame;
+    }
+
+    /// <summary>
+    /// Blends one frame into the canvas at its own offset.
+    ///
+    /// Pixels are premultiplied BGRA, which makes the blend a one-liner:
+    /// <c>dst = src + dst * (1 - srcAlpha)</c>. Transparent pixels (alpha 0, which is
+    /// how WIC surfaces the GIF's transparent palette index) leave the canvas
+    /// untouched, so nothing underneath is lost.
+    /// </summary>
+    private static void Blend(byte[] pixels, int width, int height, BitmapFrame frame)
     {
         var (left, top, frameWidth, frameHeight, sourceX, sourceY) = Place(frame, width, height);
         if (frameWidth <= 0 || frameHeight <= 0)
@@ -191,7 +254,7 @@ internal static class GifAnimationService
             return;
         }
 
-        // Pbgra32 matches the canvas, so the blend can work straight on premultiplied
+        // Pbgra32 matches the canvas, so the blend works straight on premultiplied
         // values, and WIC converts the frame's palette (including the transparent
         // index) for us.
         var converted = new FormatConvertedBitmap(frame, PixelFormats.Pbgra32, null, 0);
@@ -199,10 +262,22 @@ internal static class GifAnimationService
         var buffer = new byte[sourceStride * frame.PixelHeight];
         converted.CopyPixels(buffer, sourceStride, 0);
 
+        var opaque = IsFullyOpaque(buffer);
+        var targetStride = width * 4;
+
         for (var y = 0; y < frameHeight; y++)
         {
             var sourceRow = ((sourceY + y) * frame.PixelWidth + sourceX) * 4;
             var targetRow = ((top + y) * width + left) * 4;
+
+            if (opaque)
+            {
+                // Nothing to blend: copy the row outright. Unoptimised GIFs (every
+                // frame a complete picture) hit this on every frame, and it is about
+                // 50x cheaper than blending pixel by pixel.
+                Buffer.BlockCopy(buffer, sourceRow, pixels, targetRow, frameWidth * 4);
+                continue;
+            }
 
             for (var x = 0; x < frameWidth; x++)
             {
@@ -234,21 +309,29 @@ internal static class GifAnimationService
                 pixels[d + 3] = (byte)(alpha + ((pixels[d + 3] * inverse) >> 8));
             }
         }
+    }
 
-        WriteRegion(canvas, pixels, stride, left, top, frameWidth, frameHeight);
+    /// <summary>
+    /// Whether a frame has any transparency at all. A GIF can flag a transparent index
+    /// and then never use it, so the blend can often be skipped entirely.
+    /// </summary>
+    private static bool IsFullyOpaque(byte[] premultiplied)
+    {
+        for (var i = 3; i < premultiplied.Length; i += 4)
+        {
+            if (premultiplied[i] != 255)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
     /// Disposal 2: wipe the frame's area back to the background colour.
     /// </summary>
-    private static void Clear(
-        WriteableBitmap canvas,
-        byte[] pixels,
-        int width,
-        int height,
-        int stride,
-        BitmapFrame frame,
-        Color background)
+    private static void Wipe(byte[] pixels, int width, int height, BitmapFrame frame, Color background)
     {
         var (left, top, frameWidth, frameHeight, _, _) = Place(frame, width, height);
         if (frameWidth <= 0 || frameHeight <= 0)
@@ -260,17 +343,6 @@ internal static class GifAnimationService
         {
             FillRow(pixels, ((top + y) * width + left) * 4, frameWidth, background);
         }
-
-        WriteRegion(canvas, pixels, stride, left, top, frameWidth, frameHeight);
-    }
-
-    /// <summary>
-    /// Disposal 3: put the canvas back exactly as it was before the frame was drawn.
-    /// </summary>
-    private static void Restore(WriteableBitmap canvas, byte[] pixels, byte[] snapshot, int stride, int height)
-    {
-        Array.Copy(snapshot, pixels, pixels.Length);
-        canvas.WritePixels(new Int32Rect(0, 0, stride / 4, height), pixels, stride, 0);
     }
 
     /// <summary>
@@ -315,34 +387,6 @@ internal static class GifAnimationService
         }
 
         return (left, top, frameWidth, frameHeight, sourceX, sourceY);
-    }
-
-    private static void WriteRegion(
-        WriteableBitmap canvas,
-        byte[] pixels,
-        int stride,
-        int left,
-        int top,
-        int width,
-        int height)
-    {
-        canvas.WritePixels(
-            new Int32Rect(left, top, width, height),
-            pixels,
-            stride,
-            (top * stride) + (left * 4));
-    }
-
-    /// <summary>
-    /// A frozen copy of the canvas. Each composed frame has to be its own bitmap —
-    /// the animation switches <c>Image.Source</c> between them — and it has to be
-    /// frozen to cross back to the UI thread.
-    /// </summary>
-    private static BitmapSource Snapshot(WriteableBitmap canvas)
-    {
-        var copy = new WriteableBitmap(canvas);
-        copy.Freeze();
-        return copy;
     }
 
     private static void Fill(byte[] pixels, Color color)
