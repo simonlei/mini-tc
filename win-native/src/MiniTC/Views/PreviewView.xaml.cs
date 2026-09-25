@@ -20,6 +20,7 @@ public partial class PreviewView : UserControl
     private int _pdfTotalPages;
     private bool _pdfFit = true;
     private CancellationTokenSource? _pdfRenderCts;
+    private Stream? _gifStream;
 
     public PreviewView()
     {
@@ -48,6 +49,10 @@ public partial class PreviewView : UserControl
     {
         _loadCts?.Cancel();
         _pdfRenderCts?.Cancel();
+        // A GIF animation holds a live stream; drop it on every (re)load so the
+        // previous preview cannot keep the file locked or leak the MemoryStream.
+        _gifStream?.Dispose();
+        _gifStream = null;
         var cts = new CancellationTokenSource();
         _loadCts = cts;
 
@@ -70,7 +75,9 @@ public partial class PreviewView : UserControl
 
         TypeBadge.Text = kind switch
         {
-            PreviewKind.Image => "IMAGE",
+            PreviewKind.Image => string.Equals(Path.GetExtension(path).TrimStart('.'), "gif", StringComparison.OrdinalIgnoreCase)
+                ? "GIF"
+                : "IMAGE",
             PreviewKind.Pdf => "PDF",
             PreviewKind.Docx => "DOCX",
             PreviewKind.Text => Path.GetExtension(path).TrimStart('.').ToUpperInvariant() is { Length: > 0 } ext
@@ -117,6 +124,12 @@ public partial class PreviewView : UserControl
 
     private void LoadImage(string path)
     {
+        if (string.Equals(Path.GetExtension(path).TrimStart('.'), "gif", StringComparison.OrdinalIgnoreCase))
+        {
+            LoadAnimatedGif(path);
+            return;
+        }
+
         try
         {
             var bitmap = new BitmapImage();
@@ -135,6 +148,40 @@ public partial class PreviewView : UserControl
         }
         catch (Exception ex)
         {
+            ImageBody.Source = null;
+            ShowError($"无法解码图片：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// WPF's <see cref="BitmapImage"/> only animates a GIF while the source is not
+    /// frozen and decoded on demand. The static path above calls Freeze() and forces
+    /// OnLoad — both of which collapse the GIF to its first frame. Here we read the
+    /// bytes into a kept-alive MemoryStream and hand WPF an un-frozen, on-demand
+    /// BitmapImage so the frames actually advance.
+    /// </summary>
+    private void LoadAnimatedGif(string path)
+    {
+        try
+        {
+            _gifStream?.Dispose();
+            _gifStream = new MemoryStream(File.ReadAllBytes(path));
+
+            var bitmap = new BitmapImage();
+            bitmap.BeginInit();
+            bitmap.StreamSource = _gifStream;
+            // Leave CacheOption at its default (on-demand): OnLoad decodes a single
+            // frame and the animation never advances.
+            bitmap.EndInit();
+            // Intentionally NOT frozen — freezing a BitmapImage kills GIF playback.
+
+            ImageBody.Source = bitmap;
+            FooterInfo.Text = $"GIF 动画 · {FileEntry.FormatBytes(_shell.PreviewSize)}";
+        }
+        catch (Exception ex)
+        {
+            _gifStream?.Dispose();
+            _gifStream = null;
             ImageBody.Source = null;
             ShowError($"无法解码图片：{ex.Message}");
         }

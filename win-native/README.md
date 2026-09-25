@@ -93,7 +93,7 @@ win-native/
 | 类型 | 实现 |
 |---|---|
 | 文本 | `txt/md/json/log` + 用户自定义后缀；2 MB 上限，`.log` 超限只读末尾 512 KB；BOM → 严格 UTF-8 → GBK 逐级嗅探（原版一律 lossy UTF-8）；`.json` 自动 2 空格缩进美化（解析失败回退原文并提示「JSON 格式错误」） |
-| 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除） |
+| 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除）；**GIF 走动画路径**——读入内存副本后按需解码且不 `Freeze`，由 WPF 驱动帧动画，源文件同样不锁（原 `Freeze`+`OnLoad` 会把 GIF 压成静止首帧） |
 | 视频 | LibVLC（`LibVLCSharp.WPF` 的 `VideoView`）；常驻进度条、按钮行 3 秒自动隐藏、±5/±30 秒、倍速、音量滚轮、播完自动续播下一个、全屏。外挂字幕（同目录探测 / 手动加载 / ±0.5 秒偏移）已随引擎替换暂时移除 |
 | PDF | PdfiumViewer 原生渲染（不引 WebView2），翻页、适应宽度 / 实际大小，显示「第 X / Y 页」（对齐 WebView 版 `convertFileSrc`+`<iframe>` 的内联预览） |
 | DOCX | `DocumentFormat.OpenXml` 解析 OOXML 包，在进程内渲染 WPF `FlowDocument`：标题分级、粗体/斜体/下划线/删除线、超链接、项目符号与编号列表（解析 numbering.xml）、基础表格；图片不内联（对齐 WebView 版 mammoth 默认行为），页脚标注「图片未内联渲染」 |
