@@ -15,6 +15,7 @@ public partial class PreviewView : UserControl
     private MainViewModel _shell = null!;
     private CancellationTokenSource? _loadCts;
 
+    private string? _docxPlainText;
     private int _pdfCurrentPage;
     private int _pdfTotalPages;
     private bool _pdfFit = true;
@@ -59,6 +60,8 @@ public partial class PreviewView : UserControl
             ImageBody.Source = null;
             PdfBody.Source = null;
             TextBody.Text = string.Empty;
+            DocxViewer.Document = null;
+            _docxPlainText = null;
             return;
         }
 
@@ -69,6 +72,7 @@ public partial class PreviewView : UserControl
         {
             PreviewKind.Image => "IMAGE",
             PreviewKind.Pdf => "PDF",
+            PreviewKind.Docx => "DOCX",
             PreviewKind.Text => Path.GetExtension(path).TrimStart('.').ToUpperInvariant() is { Length: > 0 } ext
                 ? ext
                 : "TEXT",
@@ -76,8 +80,11 @@ public partial class PreviewView : UserControl
             _ => kind.ToString().ToUpperInvariant(),
         };
 
-        // A directory has nothing to read as text.
-        AsTextButton.Visibility = Directory.Exists(path) ? Visibility.Collapsed : Visibility.Visible;
+        // A directory has nothing to read as text, and DOCX is a ZIP package so a
+        // "read as text" fallback would just dump binary — hide that button there.
+        AsTextButton.Visibility = Directory.Exists(path) || kind == PreviewKind.Docx
+            ? Visibility.Collapsed
+            : Visibility.Visible;
 
         switch (kind)
         {
@@ -93,10 +100,16 @@ public partial class PreviewView : UserControl
                 await LoadPdfAsync(path, cts.Token);
                 break;
 
+            case PreviewKind.Docx:
+                await LoadDocxAsync(path, cts.Token);
+                break;
+
             default:
                 ImageBody.Source = null;
                 PdfBody.Source = null;
                 TextBody.Text = string.Empty;
+                DocxViewer.Document = null;
+                _docxPlainText = null;
                 FooterInfo.Text = _shell.PreviewSize > 0 ? FileEntry.FormatBytes(_shell.PreviewSize) : string.Empty;
                 break;
         }
@@ -356,9 +369,49 @@ public partial class PreviewView : UserControl
         }
     }
 
+    private async Task LoadDocxAsync(string path, CancellationToken token)
+    {
+        LoadingHost.Visibility = Visibility.Visible;
+        try
+        {
+            var preview = await DocxPreviewService.LoadAsync(path, token);
+            if (token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            DocxViewer.Document = preview.Document;
+            _docxPlainText = preview.PlainText;
+
+            var footer = $"{preview.ParagraphCount} 段 · {FileEntry.FormatBytes(_shell.PreviewSize)}";
+            if (preview.HasImages)
+            {
+                footer += " · 图片未内联渲染";
+            }
+
+            FooterInfo.Text = footer;
+            CopyAllButton.Visibility = Visibility.Visible;
+            AsTextButton.Visibility = Visibility.Collapsed;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _docxPlainText = null;
+            DocxViewer.Document = null;
+            ShowError($"无法预览 DOCX：{ex.Message}");
+        }
+        finally
+        {
+            LoadingHost.Visibility = Visibility.Collapsed;
+        }
+    }
+
     private void OnCopyAllClick(object sender, RoutedEventArgs e)
     {
-        if (ClipboardService.SetText(TextBody.Text))
+        var text = _docxPlainText ?? TextBody.Text;
+        if (ClipboardService.SetText(text))
         {
             _shell.ShowToast("已复制全部内容", ToastKind.Success);
         }

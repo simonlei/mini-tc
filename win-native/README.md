@@ -96,8 +96,9 @@ win-native/
 | 图片 | WIC 解码，`OnLoad` 缓存以免锁定文件（预览时仍可重命名/删除） |
 | 视频 | Media Foundation；常驻进度条、按钮行 3 秒自动隐藏、±5/±30 秒、倍速、音量滚轮、字幕（同目录探测 / 手动加载 / ±0.5 秒偏移）、播完自动续播下一个、全屏 |
 | PDF | PdfiumViewer 原生渲染（不引 WebView2），翻页、适应宽度 / 实际大小，显示「第 X / Y 页」（对齐 WebView 版 `convertFileSrc`+`<iframe>` 的内联预览） |
+| DOCX | `DocumentFormat.OpenXml` 解析 OOXML 包，在进程内渲染 WPF `FlowDocument`：标题分级、粗体/斜体/下划线/删除线、超链接、项目符号与编号列表（解析 numbering.xml）、基础表格；图片不内联（对齐 WebView 版 mammoth 默认行为），页脚标注「图片未内联渲染」 |
 
-PDF 与 doc/docx 未做内联渲染（需引入 native PDFium 或 OOXML 解析，体积与启动成本不划算），选中时提供「用系统程序打开」。
+DOCX 现可内联预览（C1）。`.doc`（旧版二进制格式）仍不支持，选中时提供「用系统程序打开」。PDF 走 PdfiumViewer 原生渲染，不引 WebView2。
 
 ## 发布
 

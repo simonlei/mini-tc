@@ -15,6 +15,7 @@ public enum PreviewKind
     Image,
     Video,
     Pdf,
+    Docx,
     Unsupported,
 }
 
@@ -43,6 +44,11 @@ internal static class PreviewService
     private static readonly HashSet<string> PdfExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         "PDF",
+    };
+
+    private static readonly HashSet<string> DocxExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "DOCX",
     };
 
     /// <summary>
@@ -77,6 +83,8 @@ internal static class PreviewService
 
     internal static bool IsPdf(string extension) => PdfExtensions.Contains(extension);
 
+    internal static bool IsDocx(string extension) => DocxExtensions.Contains(extension);
+
     internal static bool IsVideo(string extension)
         => NativeVideoExtensions.Contains(extension) || ExternalOnlyVideoExtensions.Contains(extension);
 
@@ -98,6 +106,11 @@ internal static class PreviewService
         if (IsPdf(extension))
         {
             return PreviewKind.Pdf;
+        }
+
+        if (IsDocx(extension))
+        {
+            return PreviewKind.Docx;
         }
 
         return IsTextExtension(extension) ? PreviewKind.Text : PreviewKind.Unsupported;

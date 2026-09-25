@@ -92,6 +92,13 @@
           </Border>
         </Grid>
 
+        <!-- DOCX -->
+        <FlowDocumentScrollViewer x:Name="DocxViewer"
+                                  Background="{DynamicResource Brush.Preview.Canvas}"
+                                  HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollBarVisibility="Auto"
+                                  Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Docx}" />
+
         <!-- Unsupported -->
         <Grid Visibility="{Binding PreviewKind, Converter={StaticResource PreviewKind}, ConverterParameter=Unsupported}">
           <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="24">

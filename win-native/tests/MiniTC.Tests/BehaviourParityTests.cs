@@ -6,6 +6,11 @@ using MiniTC.Services;
 using Path = System.IO.Path;
 using File = System.IO.File;
 
+// DOCX preview test builds a real package with the Open XML SDK.
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Wordprocessing;
+
 namespace MiniTC.Tests;
 
 /// <summary>
@@ -248,7 +253,42 @@ public class PreviewClassificationTests
         // PDF is now rendered inline via PdfiumViewer (B1); the WebView build had to punt it.
         Assert.Equal(PreviewKind.Pdf, PreviewService.Classify("PDF"));
 
+        // DOCX is rendered inline via DocumentFormat.OpenXml (C1).
+        Assert.Equal(PreviewKind.Docx, PreviewService.Classify("DOCX"));
+        Assert.True(PreviewService.IsDocx("docx"));
+
+        // The legacy binary .doc format is still not previewable inline.
+        Assert.Equal(PreviewKind.Unsupported, PreviewService.Classify("DOC"));
+
         Assert.Equal(PreviewKind.Unsupported, PreviewService.Classify("XYZ"));
+    }
+
+    [Fact]
+    public async Task DocxIsRenderedToFlowDocument()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".docx");
+
+        // Build a minimal but valid .docx with one styled paragraph.
+        using (var docx = WordprocessingDocument.Create(path, WordprocessingDocumentType.Document))
+        {
+            var main = docx.AddMainDocumentPart();
+            main.Document = new Document(new Body(
+                new Paragraph(new Run(new Text("Hello ")), new Run(new Text("World")))));
+            main.Document.Save();
+        }
+
+        try
+        {
+            var preview = await DocxPreviewService.LoadAsync(path);
+
+            Assert.NotNull(preview.Document);
+            Assert.True(preview.Document.Blocks.Count > 0);
+            Assert.Contains("Hello World", preview.PlainText);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 }
 
