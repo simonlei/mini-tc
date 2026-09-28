@@ -129,7 +129,6 @@
           @activate="onPanelActivate('left')"
           @open-video="openVideo"
           @deleted="onPanelDeleted"
-          @drop-move="onDropMove"
         />
       </div>
 
@@ -169,7 +168,6 @@
           @activate="onPanelActivate('right')"
           @open-video="openVideo"
           @deleted="onPanelDeleted"
-          @drop-move="onDropMove"
         />
       </div>
     </div>
@@ -821,15 +819,154 @@ async function doPaste(operation, sources, destDirOverride) {
   }
 }
 
-// Drag-and-drop move: drop files onto a folder / ".." / empty area of a panel.
-// Reuses the paste pipeline (conflict prompt, progress bar, two-panel refresh)
-// with a 'cut' operation and the drop's explicit destination directory.
-async function doDropMove(sources, destDir) {
-  await doPaste("cut", sources, destDir);
+// ── Native drag-and-drop (OS-owned via tauri-plugin-drag) ──
+//
+// All webview drag-and-drop is handled by the OS (dragDropEnabled: true). When
+// the user drags OUT of mini-tc, the OS shows file icons (CF_HDROP on Windows,
+// NSFilenamesPboardType on macOS) and the receiving app sees real files.
+// When the user drags INTO mini-tc — from Explorer / Finder / any app — the
+// OS fires `tauri://drag-drop` with the absolute file paths and a physical
+// cursor position; we resolve that position to a panel + drop target
+// (directory row / ".." / empty area / file row) via `elementFromPoint`.
+//
+// We distinguish "this drop was caused by our own drag-out" from "external
+// drag-in" via `consumeDragOut`: a self-out uses move semantics (cut), an
+// external drag-in uses copy semantics.
+
+import { consumeDragOut } from "./dragOutTracker.js";
+
+// Look up which FilePanel the element belongs to by walking up to the
+// nearest .file-panel container and matching the panel's exposed ref.
+function panelForElement(el) {
+  if (!el) return null;
+  const panelEl = el.closest && el.closest(".file-panel");
+  if (!panelEl) return null;
+  // Each panel has `data-panel-id="left"|"right"` (set on its root); we use
+  // that to pick the matching ref.
+  const id = panelEl.getAttribute("data-panel-id");
+  if (id === "left") return leftPanel.value;
+  if (id === "right") return rightPanel.value;
+  return null;
 }
 
-function onDropMove({ sources, destDir }) {
-  doDropMove(sources, destDir);
+// Resolve where a drop would land from the DOM element under the cursor:
+//   { type: "dir",     name, index } → a directory row (move INTO it)
+//   { type: "parent" }                → the ".." row (move INTO parent dir)
+//   { type: "current" }               → empty list area (move INTO current dir)
+//   null                              → a file row (not a valid target → ignore)
+function resolveDropTarget(el) {
+  const rowEl = el && el.closest ? el.closest(".file-row") : null;
+  if (!rowEl) return { type: "current" };
+  const rt = rowEl.getAttribute("data-row-type");
+  if (rt === "parent") return { type: "parent" };
+  if (rt === "entry") {
+    if (rowEl.getAttribute("data-is-dir") === "true") {
+      return {
+        type: "dir",
+        name: rowEl.getAttribute("data-name"),
+        index: Number(rowEl.getAttribute("data-index")),
+      };
+    }
+    return null;
+  }
+  return { type: "current" };
+}
+
+// Highlight the panel + target under the cursor; clears highlight on the
+// OTHER panel so only one row is ever lit up at a time.
+function setHighlight(targetEl) {
+  const target = resolveDropTarget(targetEl);
+  const panel = panelForElement(targetEl);
+  for (const p of [leftPanel.value, rightPanel.value]) {
+    if (!p) continue;
+    if (p === panel) {
+      p.setDragHighlight(target);
+    } else {
+      p.setDragHighlight(null);
+    }
+  }
+}
+
+function clearAllHighlights() {
+  leftPanel.value?.setDragHighlight(null);
+  rightPanel.value?.setDragHighlight(null);
+}
+
+async function destDirForPanel(target, panel) {
+  if (!panel) return null;
+  const basePath = panel.currentPath;
+  if (!basePath) return null;
+  if (target.type === "dir") return await joinPath(basePath, target.name);
+  if (target.type === "parent") return await getParentDir(basePath);
+  return basePath;
+}
+
+async function handleNativeDrop(targetEl, paths) {
+  if (!Array.isArray(paths) || paths.length === 0) return;
+  const target = resolveDropTarget(targetEl);
+  if (!target) return; // dropped on a file row → ignore
+  const panel = panelForElement(targetEl);
+  const destDir = await destDirForPanel(target, panel);
+  if (!destDir) return;
+
+  // Skip no-op moves where a source already sits directly inside the destination
+  // directory — moving `C:\dir\foo.txt` onto itself via rename is invalid and
+  // silently fails at the OS layer. Without this filter the user would see a
+  // confusing "移动完成，跳过 N 项" toast for a drag that visually did nothing.
+  const normDest = destDir.replace(/\\/g, "/");
+  const filtered = paths.filter((s) => parentDirOf(s) !== normDest);
+  if (filtered.length === 0) return;
+
+  // Self drag-out = move (cut); external drag-in = copy.
+  const isSelfOut = consumeDragOut(filtered);
+  const operation = isSelfOut ? "cut" : "copy";
+  await doPaste(operation, filtered, destDir);
+}
+
+// Normalised parent directory of a path (used to skip no-op moves where a
+// source already sits directly inside the destination).
+function parentDirOf(p) {
+  const norm = p.replace(/\\/g, "/");
+  const i = norm.lastIndexOf("/");
+  return i <= 0 ? "" : norm.slice(0, i);
+}
+
+let unlistenDragEnter = null;
+let unlistenDragOver = null;
+let unlistenDragDrop = null;
+let unlistenDragLeave = null;
+// NOTE: `appUnmounted` is declared further below (near onMounted); the drag
+// listeners below can safely reference it since setupNativeDragListeners() is
+// only invoked from onMounted, long after the whole script scope has run.
+
+// tauri://drag-* events report the cursor in PHYSICAL pixels (device pixels),
+// while elementFromPoint expects CSS (logical) pixels. On displays scaled to
+// 125% / 150% these differ — convert via devicePixelRatio (1 at 100% scaling).
+function elFromTauriPosition(pos) {
+  const dpr = window.devicePixelRatio || 1;
+  return document.elementFromPoint(pos.x / dpr, pos.y / dpr);
+}
+
+function setupNativeDragListeners() {
+  listen("tauri://drag-enter", (event) => {
+    if (!event.payload || !event.payload.position) return;
+    setHighlight(elFromTauriPosition(event.payload.position));
+  }).then((fn) => { if (appUnmounted) fn(); else unlistenDragEnter = fn; });
+
+  listen("tauri://drag-over", (event) => {
+    if (!event.payload || !event.payload.position) return;
+    setHighlight(elFromTauriPosition(event.payload.position));
+  }).then((fn) => { if (appUnmounted) fn(); else unlistenDragOver = fn; });
+
+  listen("tauri://drag-leave", () => {
+    clearAllHighlights();
+  }).then((fn) => { if (appUnmounted) fn(); else unlistenDragLeave = fn; });
+
+  listen("tauri://drag-drop", (event) => {
+    clearAllHighlights();
+    if (!event.payload || !event.payload.position) return;
+    handleNativeDrop(elFromTauriPosition(event.payload.position), event.payload.paths || []);
+  }).then((fn) => { if (appUnmounted) fn(); else unlistenDragDrop = fn; });
 }
 
 // ── Toast feedback (success / error / info) ──
@@ -1107,6 +1244,12 @@ function onVisibilityRegain() {
 
 // Keyboard shortcuts
 onMounted(() => {
+  // Native OS drag-and-drop listeners (dragDropEnabled: true makes Tauri own
+  // all webview drag events). tauri://drag-over gives us a continuous stream
+  // of cursor positions while a drag is in flight; we resolve each to a
+  // highlight target via elementFromPoint.
+  setupNativeDragListeners();
+
   // Window regained focus (the handler above owns the refresh + focus restore).
   listen("tauri://focus", onWindowFocusRegain).then((fn) => {
     // If the component is already gone by the time the promise settles, drop
@@ -1211,6 +1354,10 @@ onMounted(() => {
 onUnmounted(() => {
   appUnmounted = true;
   if (unlistenTauriFocus) unlistenTauriFocus();
+  if (unlistenDragEnter) unlistenDragEnter();
+  if (unlistenDragOver) unlistenDragOver();
+  if (unlistenDragDrop) unlistenDragDrop();
+  if (unlistenDragLeave) unlistenDragLeave();
   window.removeEventListener("focus", onWindowFocusRegain);
   document.removeEventListener("visibilitychange", onVisibilityRegain);
 });
