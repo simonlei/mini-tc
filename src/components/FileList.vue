@@ -42,16 +42,20 @@
     <!-- Scrollable file entries -->
     <div
       class="file-entries"
-      :class="{ 'drag-over-empty': dragHighlight && dragHighlight.type === 'current' }"
+      :class="{ 'drag-over-empty': dragOverEmpty }"
       ref="entriesContainer"
       @click="onEntriesClick"
       @contextmenu.prevent="onEntriesContextMenu"
+      @dragenter="onDragEnter"
+      @dragover="onDragOver"
+      @dragleave="onDragLeave"
+      @drop="onDrop"
     >
       <!-- Parent dir entry (hidden only while an actual filter is active) -->
       <div
         v-if="hasParent && (!isSearching || searchQuery === '')"
         class="file-row parent-row"
-        :class="{ 'drag-over': dragHighlight && dragHighlight.type === 'parent' }"
+        :class="{ 'drag-over': dragOverParent }"
         data-row-type="parent"
         data-is-dir="true"
         @click="clearSelection"
@@ -74,7 +78,7 @@
           'is-dir': entry.is_dir,
           'is-hidden': entry.is_hidden,
           'is-cut': cutSet.has(entry.name),
-          'drag-over': dragHighlight && dragHighlight.type === 'dir' && dragHighlight.index === index,
+          'drag-over': dragOverIndex === index,
         }"
         draggable="true"
         data-row-type="entry"
@@ -85,6 +89,7 @@
         @dblclick="onDoubleClick(entry)"
         @contextmenu.prevent.stop="onRowContextMenu(index, $event, entry)"
         @dragstart="onRowDragStart($event, index)"
+        @dragend="onRowDragEnd"
       >
         <div class="col-name">
           <span class="file-icon" :class="entry.is_dir ? 'folder-icon' : 'file-icon-' + entry.extension.toLowerCase()">
@@ -124,7 +129,8 @@
 
 <script setup>
 import { computed, ref, watch, nextTick } from "vue";
-import { joinPath, startNativeDrag } from "../api.js";
+import { joinPath, getParentDir } from "../api.js";
+import { dragState, clearDragState } from "../dragState.js";
 import { matches, markHandled } from "../shortcuts.js";
 
 const props = defineProps({
@@ -141,7 +147,7 @@ const props = defineProps({
   cutNames: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename", "drop-move"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -155,15 +161,12 @@ const anchorIndex = ref(-1);
 const cutSet = computed(() => new Set(props.cutNames || []));
 
 // ── Drag-and-drop move state ──
-// dragHighlight is set externally (by App.vue's tauri://drag-over handler)
-// via setDragHighlight(). The drop target is resolved there using
-// elementFromPoint(x, y), so FileList no longer listens to HTML5 DnD events
-// at all — the OS owns the drag (dragDropEnabled: true + tauri-plugin-drag).
-// `null` = no highlight, otherwise one of:
-//   { type: "dir", index } — directory row at `index`
-//   { type: "parent" }     — the ".." row
-//   { type: "current" }    — empty / no-row area (drop into the active dir)
-const dragHighlight = ref(null);
+// dragOverIndex:  entry index currently hovered as a drop target (number) or -1.
+// dragOverParent: the ".." parent row is hovered.
+// dragOverEmpty:  the empty area of the list is hovered (drop → current dir).
+const dragOverIndex = ref(-1);
+const dragOverParent = ref(false);
+const dragOverEmpty = ref(false);
 
 const entriesContainer = ref(null);
 const listContainer = ref(null);
@@ -240,17 +243,6 @@ watch(
   }
 );
 
-// Classify a name's first meaningful char so non-ASCII (CJK) names sort AFTER
-// digits and Latin letters — matching Explorer: 0..9 < a-z < 中文. Hyphens are
-// stripped first so "-1a.txt" is classified by its "1" (digit), not the dash.
-function nameClass(name) {
-  const ch = name.replace(/-/g, "")[0];
-  if (!ch) return 2;
-  if (ch >= "0" && ch <= "9") return 0;
-  if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) return 1;
-  return 2;
-}
-
 // Sort entries based on current sort settings
 const sortedEntries = computed(() => {
   const list = [...props.entries];
@@ -265,21 +257,11 @@ const sortedEntries = computed(() => {
 
     let cmp = 0;
     if (col === "name") {
-      // Sort by char class first (digit < Latin < CJK/other) so Chinese names
-      // land after English ones; within a class, ignore hyphens and use natural
-      // numeric ordering. Fall back to the raw name so ties are deterministic.
-      // The directory-first check above still runs first, so dirs keep sorting
-      // before files regardless of name order.
-      const ca = nameClass(a.name);
-      const cb = nameClass(b.name);
-      if (ca !== cb) {
-        cmp = ca - cb;
-      } else {
-        const ka = a.name.replace(/-/g, "");
-        const kb = b.name.replace(/-/g, "");
-        cmp = ka.localeCompare(kb, undefined, { numeric: true, sensitivity: "base" });
-        if (cmp === 0) cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
-      }
+      // Natural sort: digit runs compare by numeric value (so "1a.jpg" <
+      // "2c.jpg" < "10b.jpg"), case/accent-insensitive via sensitivity:"base"
+      // (replaces the old toLowerCase()). The directory-first check above still
+      // runs first, so dirs keep sorting before files regardless of name order.
+      cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
     } else if (col === "size") {
       cmp = a.size - b.size;
       // For size sort, directories go first regardless
@@ -1074,15 +1056,40 @@ function focusList() {
 }
 
 // ── Drag-and-drop move ──
-// Dragging a file/folder row triggers a NATIVE OS drag-out (via
-// tauri-plugin-drag's startDrag). Cross-panel drops / drops onto a folder /
-// drops onto ".." / drops onto the empty list area are all handled by
-// App.vue's tauri://drag-drop listener — FileList only owns the dragstart
-// side. Highlight (the "drag-over" class on rows and "drag-over-empty" on
-// the container) is also driven externally via setDragHighlight(), since
-// FileList no longer receives dragover events (dragDropEnabled: true makes
-// the OS own them).
-import { noteDragOut } from "../dragOutTracker.js";
+// Dragging a file/folder row onto a directory (or the ".." / empty area) moves
+// the dragged item(s) there. Multi-selection is honoured: dragging any selected
+// row drags the whole selection. Cross-panel drops are supported — the actual
+// move is delegated up to FilePanel → App (which owns `move_items` and the
+// two-panel refresh). This matches the "cut + paste into target" semantics.
+
+function clearDragHighlight() {
+  dragOverIndex.value = -1;
+  dragOverParent.value = false;
+  dragOverEmpty.value = false;
+}
+
+// Resolve where a drop would land from the DOM element under the cursor:
+//   { type: "dir",     name, index } → a directory row (move INTO it)
+//   { type: "parent" }                → the ".." row (move INTO parent dir)
+//   { type: "current" }               → empty list area (move INTO current dir)
+//   null                             → a file row (not a valid target → ignore)
+function resolveDropTarget(target) {
+  const rowEl = target && target.closest ? target.closest(".file-row") : null;
+  if (!rowEl) return { type: "current" };
+  const rt = rowEl.getAttribute("data-row-type");
+  if (rt === "parent") return { type: "parent" };
+  if (rt === "entry") {
+    if (rowEl.getAttribute("data-is-dir") === "true") {
+      return {
+        type: "dir",
+        name: rowEl.getAttribute("data-name"),
+        index: Number(rowEl.getAttribute("data-index")),
+      };
+    }
+    return null; // dropping onto a file → not allowed
+  }
+  return { type: "current" };
+}
 
 function onRowDragStart(e, index) {
   // Build the set of source names: the whole multi-selection when the dragged
@@ -1098,50 +1105,109 @@ function onRowDragStart(e, index) {
     e.preventDefault();
     return;
   }
-  // CRITICAL: cancel the browser's own drag pipeline SYNCHRONOUSLY, before any
-  // await. The browser does not await the promise returned by an async event
-  // handler — as soon as the handler yields (first `await`), the default
-  // action (HTML5 drag) already started and a later preventDefault() is a
-  // no-op. That leaves an EMPTY browser drag running (forbidden cursor over
-  // every target) while our native drag never gets to start cleanly.
-  e.preventDefault();
-  // Fire-and-forget the async part: resolve absolute paths, then hand off to
-  // drag-rs (DoDragDrop) which takes over the mouse until the button is
-  // released. The invoke roundtrip is a few ms — the button is still down.
-  void startDragOut(names);
-}
-
-async function startDragOut(names) {
-  const paths = await Promise.all(names.map((n) => joinPath(props.path, n)));
-  if (paths.length === 0) return;
-  // Tell the tracker which paths we're dragging so App.vue's drag-drop
-  // handler can recognise our own drag-out (move) vs an external drag-in
-  // (copy).
-  noteDragOut(paths);
+  dragState.sourceNames = names;
+  dragState.sourcePath = props.path;
+  // "all" keeps the drag maximally permissive; the actual cursor is narrowed to
+  // "move" via dropEffect in onDragEnter/onDragOver. Using "all" here avoids any
+  // effectAllowed/dropEffect mismatch that could otherwise force the forbidden
+  // cursor even after preventDefault().
+  e.dataTransfer.effectAllowed = "all";
+  // Custom type marks this as an internal file move (used by dragover to decide
+  // whether to allow a drop); a text payload is set as a fallback so the drag is
+  // recognised by the browser at all.
   try {
-    await startNativeDrag({ paths, mode: "move" });
-  } catch (err) {
-    console.error("Native drag-out failed:", err);
+    e.dataTransfer.setData("application/x-minitc-move", "1");
+    e.dataTransfer.setData("text/plain", names.join("\n"));
+  } catch {
+    /* some browsers restrict setData; the drag still works via effectAllowed */
   }
 }
 
-// Highlight the row/container under the cursor as a drop target. Driven by
-// App.vue's tauri://drag-over handler; pass null to clear. Keeping the
-// ref-based highlight here lets the rows still participate in Vue reactivity
-// (the dragOver class re-applies when entries change, etc.).
-function setDragHighlight(target) {
-  if (!target) {
-    dragHighlight.value = null;
-    return;
-  }
-  if (target.type === "dir" || target.type === "parent" || target.type === "current") {
-    dragHighlight.value = target;
-  } else {
-    dragHighlight.value = null;
+function onRowDragEnd() {
+  clearDragHighlight();
+  clearDragState();
+}
+
+// Whether the in-progress drag is one of our own internal file moves.
+// Primary signal: the dragState singleton set on dragstart. Fallback: our
+// dragstart always writes a text/plain payload, which is readable here even if
+// dragState somehow ended up empty — this prevents us from skipping
+// preventDefault() (which would leave the forbidden no-drop cursor up).
+function isOurDrag(e) {
+  if (dragState.sourceNames && dragState.sourceNames.length > 0) return true;
+  try {
+    return !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("text/plain"));
+  } catch {
+    return false;
   }
 }
 
-defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList, setDragHighlight });
+function onDragEnter(e) {
+  // Some engines (Firefox, and as a safety net WebView2) only flip the drop
+  // cursor to "allowed" if BOTH dragenter and dragover call preventDefault().
+  if (!isOurDrag(e) || !e.dataTransfer) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+}
+
+function onDragOver(e) {
+  if (!isOurDrag(e) || !e.dataTransfer) return;
+  // MUST call preventDefault() for the cursor to switch away from "forbidden".
+  // Do this before resolving the target so a valid internal drag is always
+  // accepted (highlight is applied afterwards based on the resolved target).
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  const target = resolveDropTarget(e.target);
+  clearDragHighlight();
+  if (!target) return; // file row → not a drop target (cursor stays neutral)
+  if (target.type === "dir") dragOverIndex.value = target.index;
+  else if (target.type === "parent") dragOverParent.value = true;
+  else dragOverEmpty.value = true;
+}
+
+function onDragLeave(e) {
+  // Only clear when the pointer truly leaves the entries container (not when it
+  // moves onto a child row, which would otherwise flicker the highlight).
+  if (entriesContainer.value && e.relatedTarget && entriesContainer.value.contains(e.relatedTarget)) return;
+  clearDragHighlight();
+}
+
+// Normalised parent directory of a path (used to skip no-op moves where a source
+// is already directly inside the destination).
+function parentDirOf(p) {
+  const norm = p.replace(/\\/g, "/");
+  const i = norm.lastIndexOf("/");
+  return i <= 0 ? "" : norm.slice(0, i);
+}
+
+async function onDrop(e) {
+  // Same reasoning as onDragOver: rely on dragState, not dataTransfer.types.
+  if (!dragState.sourceNames || dragState.sourceNames.length === 0) return;
+  if (!e.dataTransfer) return;
+  e.preventDefault();
+  const target = resolveDropTarget(e.target);
+  clearDragHighlight();
+  if (!target) return; // dropped on a file → ignore
+
+  const sources = await Promise.all(dragState.sourceNames.map((n) => joinPath(dragState.sourcePath, n)));
+  clearDragState();
+  if (sources.length === 0) return;
+
+  let destDir = null;
+  if (target.type === "dir") destDir = await joinPath(props.path, target.name);
+  else if (target.type === "parent") destDir = await getParentDir(props.path);
+  else destDir = props.path;
+  if (!destDir) return;
+
+  // Skip no-op moves (a source already sitting directly in the destination).
+  const normDest = destDir.replace(/\\/g, "/");
+  const filtered = sources.filter((s) => parentDirOf(s) !== normDest);
+  if (filtered.length === 0) return;
+
+  emit("drop-move", { sources: filtered, destDir });
+}
+
+defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList });
 </script>
 
 <style scoped>

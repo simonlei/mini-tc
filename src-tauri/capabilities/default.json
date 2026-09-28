@@ -6,7 +6,6 @@
   "permissions": [
     "core:default",
     "updater:default",
-    "process:default",
-    "drag:default"
+    "process:default"
   ]
 }

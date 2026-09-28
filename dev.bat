@@ -71,7 +71,7 @@ for %%v in (
 )
 :vcvars_found
 
-REM Workaround for rustc ICE - disable incremental compilation
+REM Workaround for rustc ICE — disable incremental compilation
 set "CARGO_INCREMENTAL=0"
 
 set "CMD=%~1"
@@ -89,12 +89,10 @@ echo   check - Cargo check only
 echo   clean - Clean build artifacts
 goto :eof
 
-REM ---- ensure npm deps are installed ----
-REM Always run npm install: it is idempotent (fast no-op when up to date) and
-REM picks up newly added dependencies. The old check (skip when tauri CLI exists)
-REM missed new deps added to package.json after the first install.
+REM ---- ensure npm deps are installed (so the local tauri CLI resolves) ----
 :ensure_deps
-echo [1/3] Checking npm dependencies...
+if exist "%PROJECT_ROOT%node_modules\.bin\tauri" goto :eof
+echo [1/3] Installing npm dependencies (tauri CLI missing)...
 call npm install
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] npm install failed. Check network / npm registry settings.
