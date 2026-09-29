@@ -22,7 +22,11 @@
         color: #c9d1d9;
         font-family: "Consolas", "Cascadia Mono", "Menlo", monospace;
         z-index: 9999;
-        transition: opacity 0.6s ease, visibility 0.6s ease;
+        /* Keep in sync with SPLASH_FADE_MS in src/main.js, which overrides
+           this inline at runtime (that constant is the single source of
+           truth). It used to be 0.6s here while main.js claimed 300ms — the
+           drift silently added ~350ms to every launch. */
+        transition: opacity 250ms ease, visibility 250ms ease;
       }
       #splash.hide {
         opacity: 0;
@@ -122,6 +126,15 @@
       </div>
     </div>
     <div id="app"></div>
+    <script>
+      // Earliest boot timestamp we can take: the parser has reached the end of
+      // <body>, so the splash markup is in the DOM (not yet painted). The main
+      // bundle is a deferred module and runs after this, so these marks end up
+      // first in the timeline printed by src/bootLog.js.
+      window.__MINITC_BOOT_MARKS__ = [
+        ["html:parsed", performance.now()],
+      ];
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

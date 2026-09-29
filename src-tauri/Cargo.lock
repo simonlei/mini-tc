@@ -1923,6 +1923,7 @@ name = "mini-tc"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "indexmap 1.9.3",
  "serde",
  "serde_json",
  "tauri",

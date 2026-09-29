@@ -228,6 +228,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { mark, track } from "./bootLog.js";
 
 const activePanel = ref("left");
 
@@ -409,12 +410,19 @@ async function downloadUpdate() {
 }
 
 onMounted(() => {
-  initTheme();
-  loadTextPreviewConfig();
+  mark("app:onMounted");
+  // Each of these is an independent IPC round-trip fired in parallel; `track`
+  // records how long each one actually took so slow ones are visible.
+  track("cfg:theme", initTheme());
+  track("cfg:text-preview", loadTextPreviewConfig());
   // Load ~/.minitc/shortcuts.json before the first keystroke can arrive; until
   // it resolves every command simply falls back to its built-in defaults.
-  loadShortcuts();
-  getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
+  track("cfg:shortcuts", loadShortcuts());
+  // Only needed by the About dialog — measured to confirm it's free.
+  track(
+    "app:getVersion",
+    getVersion().then((v) => { appVersion.value = v; }).catch(() => {})
+  );
 });
 
 // Panel split ratio

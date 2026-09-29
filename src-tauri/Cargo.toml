@@ -11,6 +11,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# See the note on `indexmap` below: build-dependencies are a separate feature
+# resolution space in cargo, so the fix has to be declared here as well or
+# tauri-build's copy of schemars still fails to compile.
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
@@ -29,6 +33,14 @@ trash = "5"
 # the CI `rust:slim` image still builds). `cut` (move) semantics are Windows-only
 # (Preferred DropEffect); other platforms paste as copy.
 arboard = "3"
+# Not used directly. `schemars` 0.8.22 (pulled in by tauri-build / tauri-utils
+# via its `preserve_order` feature) declares `indexmap 1.9` with
+# default-features = false, which drops indexmap's `std` feature — and without
+# it `IndexMap<K, V, S>` has no default `S`, so schemars fails to compile with
+# "struct takes 3 generic arguments but 2 were supplied". Depending on
+# indexmap 1.9 here re-enables `std` through cargo's feature unification and
+# unbreaks the build. Remove once the tauri chain moves off schemars 0.8.
+indexmap = { version = "1.9", features = ["std"] }
 
 # In-process patch of the `drag` crate (vendored at src-tauri/vendor/drag) it
 # depends on. The upstream crate advertises only a single DROPEFFECT (MOVE *or*

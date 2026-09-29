@@ -2318,12 +2318,95 @@ fn add_to_archive(
     }
 }
 
+// ── Boot instrumentation ───────────────────────────────────────────────────
+// Everything up to the webview's first paint happens before any JS can run, so
+// it is invisible to `performance.now()`. These phases are collected while
+// `run()` builds the app and handed to the frontend (`src/bootLog.js`) so the
+// startup timeline covers the native half too. Each phase is also mirrored to
+// stderr, which is what you see when launching `dev.bat` from a console.
+
+/// One boot phase: milliseconds since the process entered `main()`.
+#[derive(Serialize, Clone)]
+pub struct BootPhase {
+    pub name: String,
+    pub ms: f64,
+}
+
+/// Snapshot returned by the `boot_timings` command.
+#[derive(Serialize)]
+pub struct BootTimings {
+    /// Wall-clock UNIX ms at process start. The frontend subtracts its own
+    /// `performance.timeOrigin` from this to learn how much time went into
+    /// native init + webview creation before the first line of JS ran.
+    pub process_start_unix_ms: u64,
+    pub phases: Vec<BootPhase>,
+}
+
+static BOOT_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static BOOT_UNIX_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static BOOT_PHASES: std::sync::Mutex<Vec<BootPhase>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a boot phase (ms since process start) and echo it to stderr.
+fn boot_mark(name: &str) {
+    let ms = BOOT_START
+        .get()
+        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    eprintln!("[boot] {:>16} {:>8.1} ms", name, ms);
+    if let Ok(mut phases) = BOOT_PHASES.lock() {
+        phases.push(BootPhase {
+            name: name.to_string(),
+            ms,
+        });
+    }
+}
+
+/// Boot phases measured so far (see `run`). Read once by the frontend's
+/// startup report; harmless to call at any point.
+#[tauri::command]
+fn boot_timings() -> BootTimings {
+    BootTimings {
+        process_start_unix_ms: BOOT_UNIX_MS.get().copied().unwrap_or(0),
+        phases: BOOT_PHASES.lock().map(|p| p.clone()).unwrap_or_default(),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_drag::init())
+    BOOT_START
+        .set(std::time::Instant::now())
+        .expect("boot start already recorded");
+    BOOT_UNIX_MS
+        .set(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )
+        .expect("boot unix ms already recorded");
+    boot_mark("main");
+
+    let builder = tauri::Builder::default();
+    boot_mark("builder");
+
+    // Each plugin's init cost is measured separately so a slow one stands out.
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    boot_mark("plugin:updater");
+    let builder = builder.plugin(tauri_plugin_process::init());
+    boot_mark("plugin:process");
+    let builder = builder.plugin(tauri_plugin_drag::init());
+    boot_mark("plugin:drag");
+
+    // Runs after the window + webview exist but before the event loop starts;
+    // the gap from here to the frontend's `timeOrigin` is webview init + the
+    // first HTML parse.
+    let builder = builder.setup(|_app| {
+        boot_mark("setup");
+        Ok(())
+    });
+
+    boot_mark("run:enter");
+    builder
         .invoke_handler(tauri::generate_handler![
             list_directory,
             get_home_dir,
@@ -2350,6 +2433,7 @@ pub fn run() {
             get_archive_tools,
             extract_archive,
             add_to_archive,
+            boot_timings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

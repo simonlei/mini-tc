@@ -88,11 +88,22 @@
 import { ref, watch, computed } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
-// mammoth converts .docx (OOXML) into HTML. We import the self-contained
-// browser bundle (NOT the Node entry, which requires `fs`/`path` and would
-// break the Vite web build). The browser build is pure-JS (uses a browser
-// jszip) and works inside the Tauri webview.
-import mammoth from "mammoth/mammoth.browser.js";
+// mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
+// bundle (NOT the Node entry, which requires `fs`/`path` and would break the
+// Vite web build). The browser build is pure-JS (uses a browser jszip) and
+// works inside the Tauri webview.
+//
+// It is ~700 KB, so it is imported on demand: a static import here pulled it
+// into the main bundle and every launch paid the parse+eval cost even when no
+// .docx was ever opened. Boot instrumentation measured the whole JS startup at
+// ~505 ms; deferring mammoth takes a visible slice off `main.js:eval`.
+let mammothPromise = null;
+function loadMammoth() {
+  if (!mammothPromise) {
+    mammothPromise = import("mammoth/mammoth.browser.js").then((m) => m.default ?? m);
+  }
+  return mammothPromise;
+}
 
 const props = defineProps({
   filePath: { type: String, required: true },
@@ -266,6 +277,7 @@ async function loadDocxPreview() {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`无法读取文件 (HTTP ${resp.status})`);
     const arrayBuffer = await resp.arrayBuffer();
+    const mammoth = await loadMammoth();
     const result = await mammoth.convertToHtml({ arrayBuffer });
     const html = sanitizeHtml(result.value || "");
     previewContent.value = html;

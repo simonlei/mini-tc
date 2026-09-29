@@ -41,3 +41,6 @@ src-tauri/target-check/
 
 # Temp commit-message file (git commit -F .commitmsg)
 .commitmsg
+
+# Temp output dir used by `vite build --outDir .bootcheck` syntax checks
+.bootcheck/

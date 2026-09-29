@@ -73,6 +73,7 @@ import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { mark, track } from "../bootLog.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
 // 7-Zip (and friends) can handle; the actual extraction is delegated to the
@@ -227,10 +228,11 @@ watch(activeTabId, (newId) => { newId && saveState(); });
 // ── Lifecycle ──
 
 onMounted(async () => {
+  mark(`panel:${props.panelId}:onMounted`);
   // Drives are only needed for the PathBar dropdown; `list_directory` already
   // supplies `hasParent`, so we don't need this before the first listing. Load
   // it in the background so it never delays showing the file list.
-  refreshDrives();
+  track(`panel:${props.panelId}:drives`, refreshDrives());
 
   // Archive-extraction tools (7-Zip / WinRAR / unzip) are discovered lazily on
   // the first right-click (see ensureArchiveTools). Scanning the filesystem for
@@ -240,7 +242,7 @@ onMounted(async () => {
 
   // Try to restore saved state — this is the only await that gates the first
   // directory listing, and it's a single tiny file read.
-  const saved = await loadState();
+  const saved = await track(`panel:${props.panelId}:loadState`, loadState());
   if (saved) {
     tabs.value = saved.tabs;
     activeTabId.value = saved.activeTabId;
@@ -248,7 +250,7 @@ onMounted(async () => {
     // First launch: create initial tab with home directory
     let homePath = "/";
     try {
-      homePath = await getHomeDir();
+      homePath = await track(`panel:${props.panelId}:getHomeDir`, getHomeDir());
     } catch {
       homePath = "/";
     }
@@ -263,7 +265,9 @@ onMounted(async () => {
 // Non-Windows hosts return no drive letters, so PathBar hides the selector
 // anyway; we just let the cheap call run and swallow failures.
 function refreshDrives() {
-  listDrives()
+  // Returns the promise so callers can measure it (boot instrumentation);
+  // a failure here is non-fatal and simply keeps the last known drive list.
+  return listDrives()
     .then((d) => { drives.value = d; })
     .catch(() => { /* keep last known drives on failure */ });
 }
@@ -283,9 +287,9 @@ watch(
       hasParent.value = cached.hasParent;
       // Silent background refresh: keep the cached listing on screen (no
       // "Loading…" flash) while fetching the current contents.
-      loadDirectory(newPath, tab.id, { silent: true });
+      trackFirstLoad(loadDirectory(newPath, tab.id, { silent: true }));
     } else {
-      loadDirectory(newPath, tab.id);
+      trackFirstLoad(loadDirectory(newPath, tab.id));
     }
   }
 );
@@ -305,7 +309,7 @@ watch(activeTabId, (newId) => {
   if (tab) {
     // Drop the cache so this switch always re-fetches from disk (no stale view).
     if (tabCache.value[newId]) delete tabCache.value[newId];
-    loadDirectory(tab.path, newId, { silent: true });
+    trackFirstLoad(loadDirectory(tab.path, newId, { silent: true }));
   }
 });
 
@@ -351,6 +355,26 @@ function switchTab(id) {
 }
 
 // ── Navigation ──
+
+// Boot instrumentation: time only the very first listing of this panel —
+// later loads are user-driven and would just be noise in the startup timeline.
+// Two watchers (path + active tab) can both kick off that first load; the
+// in-flight guard collapses them into one request, and this flag keeps the
+// timeline to a single row.
+let firstLoadTracked = false;
+function trackFirstLoad(promise) {
+  if (firstLoadTracked) return promise;
+  firstLoadTracked = true;
+  const tracked = track(`panel:${props.panelId}:first-listing`, promise);
+  // Tell the splash screen (src/main.js) that this panel has content, so it
+  // can dismiss as soon as both panels are populated instead of waiting out a
+  // fixed delay. Fires on failure too — an error listing must still let the
+  // user through to the UI.
+  tracked.finally(() => {
+    window.dispatchEvent(new CustomEvent("minitc:panel-listed"));
+  });
+  return tracked;
+}
 
 // Load a directory and cache the result by tab id. When `tabId` is not the
 // active tab, the listing runs purely in the background (warming the cache) and
