@@ -4,6 +4,8 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use tauri::Emitter;
 
+mod window_state;
+
 #[cfg(windows)]
 #[link(name = "shell32")]
 extern "system" {
@@ -2400,8 +2402,12 @@ pub fn run() {
     // Runs after the window + webview exist but before the event loop starts;
     // the gap from here to the frontend's `timeOrigin` is webview init + the
     // first HTML parse.
-    let builder = builder.setup(|_app| {
+    let builder = builder.setup(|app| {
         boot_mark("setup");
+        // Restores the previous geometry before the window is shown (the
+        // config sets `visible: false` for exactly this). Costs a few
+        // microseconds: one small JSON read, no webview round-trip.
+        window_state::install(app);
         Ok(())
     });
 
