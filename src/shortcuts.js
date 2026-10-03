@@ -42,7 +42,8 @@ export const COMMANDS = [
   { id: "edit.cut", scope: "global", label: "剪切", desc: "剪切所选项目到系统剪贴板", defaults: ["Ctrl+X"] },
   { id: "edit.paste", scope: "global", label: "粘贴", desc: "把系统剪贴板内容粘贴到当前目录", defaults: ["Ctrl+V"] },
   { id: "edit.selectAll", scope: "global", label: "全选", desc: "选中当前面板所有项目", defaults: ["Ctrl+A"] },
-  { id: "panel.switch", scope: "global", label: "切换左右面板", desc: "在左栏 / 右栏之间移动焦点", defaults: ["Ctrl+Tab"] },
+  // Total Commander 用光标 Tab 切左右栏，Ctrl+Tab 是等效键 —— 两个都作为默认。
+  { id: "panel.switch", scope: "global", label: "切换左右面板", desc: "在左栏 / 右栏之间移动焦点（与 Total Commander 一致：Tab）", defaults: ["Tab", "Ctrl+Tab"] },
   { id: "preview.close", scope: "global", label: "关闭预览", desc: "关闭图片 / 文本 / 视频预览", defaults: ["Escape"] },
 
   // ── 文件列表 ──

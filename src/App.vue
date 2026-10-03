@@ -223,7 +223,7 @@ import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
-import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled } from "./shortcuts.js";
+import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
@@ -1346,15 +1346,34 @@ onMounted(() => {
       return;
     }
 
-    // Ctrl+Tab: Switch active panel (skip if target is showing preview)
+    // Tab / Ctrl+Tab: Switch active panel (skip if target is showing preview)
     if (matches("panel.switch", e)) {
-      e.preventDefault();
-      markHandled(e);
+      // A bare Tab is a real browser key (focus traversal), so it only means
+      // "switch panel" when a file list actually owns the focus — the Total
+      // Commander behaviour. Anywhere else (address bar, filename filter,
+      // inline rename, dialog buttons, right-click menu) we must fall through
+      // and let the webview move focus natively, otherwise keyboard users can't
+      // leave a text field or reach a dialog button. Ctrl+Tab has no native
+      // meaning, so it always switches.
+      const bareTab = eventCombo(e) === "Tab";
+      if (bareTab) {
+        const t = e.target;
+        if (isTypingTarget(t)) return;
+        // Reject anything outside the file grids (menus, dialogs, preview
+        // surfaces) — only `.file-list` containers opt in.
+        if (!t || !t.closest || !t.closest(".file-list")) return;
+      }
       if (previewVisible.value) {
-        // Don't allow switching to the preview panel
+        // Don't allow switching to the preview panel. Fall through WITHOUT
+        // consuming the key so a bare Tab still traverses focus natively.
         return;
       }
+      e.preventDefault();
+      markHandled(e);
       activePanel.value = activePanel.value === "left" ? "right" : "left";
+      // Hand the DOM keyboard focus to the newly active panel so the arrow
+      // keys that follow drive THAT list, not the one we just left.
+      getActivePanelRef()?.focusList?.();
     }
   });
 });
