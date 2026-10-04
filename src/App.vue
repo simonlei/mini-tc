@@ -144,7 +144,7 @@
         />
       </div>
 
-      <div class="separator" @mousedown="startDrag">
+      <div class="separator" @mousedown="startDrag" @dblclick="onSeparatorDblclick">
         <div class="separator-line"></div>
       </div>
 
@@ -495,6 +495,7 @@ onMounted(() => {
   // Load ~/.minitc/shortcuts.json before the first keystroke can arrive; until
   // it resolves every command simply falls back to its built-in defaults.
   track("cfg:shortcuts", loadShortcuts());
+  track("cfg:panel-split", loadPanelSplit());
   // Only needed by the About dialog — measured to confirm it's free.
   track(
     "app:getVersion",
@@ -503,15 +504,34 @@ onMounted(() => {
 });
 
 // Panel split ratio
+//
+// Persisted to ~/.minitc/panel-split.json. We store the ratio (left flex-grow
+// factor) rather than a pixel width: both wrappers are flex children with
+// `flex-basis: 0`, so the grow ratio alone fully determines the split and
+// stays meaningful after a window resize or on a different monitor.
+const PANEL_SPLIT_CONFIG = "panel-split";
+const SPLIT_MIN = 0.2;
+const SPLIT_MAX = 0.8;
+
 const leftFlex = ref(1);
 const rightFlex = ref(1);
 const dragging = ref(false);
+
+// Set once the user actually moves the separator, so the async config load
+// can't clobber a drag that happened while it was still in flight.
+let splitTouched = false;
+
+function applySplit(ratio) {
+  leftFlex.value = ratio;
+  rightFlex.value = 1 - ratio;
+}
 
 const leftPanel = ref(null);
 const rightPanel = ref(null);
 
 function startDrag(e) {
   dragging.value = true;
+  splitTouched = true;
   e.preventDefault();
 }
 
@@ -520,14 +540,66 @@ function onDrag(e) {
   const container = e.currentTarget;
   const rect = container.getBoundingClientRect();
   const ratio = (e.clientX - rect.left) / rect.width;
-  // Clamp between 20% and 80%
-  const clamped = Math.max(0.2, Math.min(0.8, ratio));
-  leftFlex.value = clamped;
-  rightFlex.value = 1 - clamped;
+  // Clamp so neither side can be squashed flat
+  applySplit(Math.max(SPLIT_MIN, Math.min(SPLIT_MAX, ratio)));
+  scheduleSplitSave();
+}
+
+// Persist on the trailing edge: a drag fires mousemove every few ms, and the
+// final mousemove must be saved even if `mouseup` never lands (pointer released
+// outside the window), so the drag path schedules too — the debounce collapses
+// both into a single write.
+let splitSaveTimer = null;
+
+function scheduleSplitSave() {
+  if (splitSaveTimer) clearTimeout(splitSaveTimer);
+  splitSaveTimer = setTimeout(() => {
+    splitSaveTimer = null;
+    savePanelSplit();
+  }, 300);
 }
 
 function endDrag() {
+  if (!dragging.value) return;
   dragging.value = false;
+  scheduleSplitSave();
+}
+
+// Double-click the separator to snap back to an even split.
+function onSeparatorDblclick() {
+  splitTouched = true;
+  applySplit(0.5);
+  scheduleSplitSave();
+}
+
+async function loadPanelSplit() {
+  // Bail before applying anything: the user may have grabbed the separator
+  // while this IPC was in flight, and their split is the newer truth. Any
+  // pending save timer was armed by that drag and will write it out.
+  if (splitTouched) return;
+  try {
+    const raw = await loadConfig(PANEL_SPLIT_CONFIG);
+    if (raw) {
+      // Tolerate both `{left}` and a bare number, so a hand-edited file that
+      // drops the wrapper still restores instead of silently resetting.
+      const parsed = JSON.parse(raw);
+      const left = Number(typeof parsed === "object" ? parsed?.left : parsed);
+      // Ignore anything non-finite (corrupt/hand-edited file) and re-clamp, so
+      // a bad value can't collapse one panel to nothing.
+      if (Number.isFinite(left)) {
+        applySplit(Math.max(SPLIT_MIN, Math.min(SPLIT_MAX, left)));
+      }
+    }
+  } catch (e) {
+    console.error("Failed to load panel split:", e);
+    // Keep the default 50/50 split.
+  }
+}
+
+async function savePanelSplit() {
+  await saveConfig(PANEL_SPLIT_CONFIG, JSON.stringify({ left: leftFlex.value })).catch((e) =>
+    console.error("Failed to persist panel split:", e)
+  );
 }
 
 // ── File Preview (Ctrl+Q) ──
