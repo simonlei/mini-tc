@@ -18,6 +18,8 @@
 - **启动耗时埋点**：`src/bootLog.js` + 后端 `boot_mark` / `boot_timings` 命令，开发模式下 devtools 控制台会打印两张 `console.table`（JS 阶段 / Rust 阶段，共用同一时钟可直接对齐），Rust 侧另有 `[boot] ... ms` 逐行输出到控制台窗口。用 `localStorage.setItem("minitc-boot-log", "off")` 可关闭
 - **文件预览**（Ctrl+Q）：文本（txt/md/json/log）和图片（jpg/png/gif/webp/bmp/svg/avif）；图片经 asset protocol 直接加载，无大小限制；文本预览区内可拖选文字按 Ctrl+C 复制，或点 footer「复制全部」复制整篇
 - **视频预览**：`mp4/webm/ogv/mov/m4v` 等由 WebView 直接解码（含字幕自动探测同目录 `srt/vtt/ass`、外挂字幕、±0.5s 偏移微调、倍速、音量记忆）；`mkv/avi/flv/wmv/rmvb` 等无法解码的格式自动回退「用系统播放器打开」，HEVC/H.265 这类「有声音没画面」的情况也会自动识别并回退。控制栏中**进度条常驻**（随时可见当前位置、可拖动 seek），仅下方按钮行在播放 3 秒后自动收起，鼠标移回底部或暂停时立即恢复
+  - **预览时窗口置顶**（配置 → 通用设置，默认开启）：播放视频预览时 MiniTC 窗口保持在所有窗口之上，关闭预览（Esc / 切换到别的文件 / 关掉面板）后自动还原层级。⚠️ 置顶是**操作系统窗口级**属性，所以浮起来的是**整个 MiniTC 窗口**（含文件列表），不是只有视频画面那一块——浏览器没有任何 API 能把单个 DOM 元素抬到其他程序窗口之上，想做到「只有视频浮在最上层」必须把播放器拆成独立的置顶窗口。置顶联动由一个 `watch` 驱动 `src/alwaysOnTop.js`（对 ↑/↓ 切片、面板切换、自动连播、Esc 全部自动生效，且做了状态去重与失败回滚），退出时强制还原以免留下置顶窗口。
+- **通用设置**（配置 → 通用设置）：应用级配置项的独立页面，与「文件预览设置」（只管单个文件怎么渲染）和「快捷键设置」并列。配置项以声明式 schema（`GeneralSettingsDialog.vue` 顶部的 `ITEMS` 数组）声明，新增一项只需加一个对象，UI 渲染 / 持久化 / 缺省回退自动获得。持久化到 `~/.minitc/app-config.json`
 - 4 套内置主题（石墨工业 / 霓虹暗夜 / 暖茶拿铁 / 墨竹青翠）
 - **Tab 切换左右面板**（与 Total Commander 一致）：焦点在文件列表时按光标 `Tab` 即在左/右栏之间跳转，切换后键盘焦点交给新面板，方向键直接接着操作；`Ctrl+Tab` 保留为等效键。焦点不在文件列表上（地址栏 / 文件名过滤 / 内联改名 / 对话框 / 右键菜单）时 `Tab` 保持浏览器的原生焦点切换行为不被抢走
 - **右键上下文菜单**：在空白处右键可「新建目录」（在当前目录创建空文件夹，创建后可直接改名）；在文件/文件夹上右键可「打开」「复制路径」；对压缩包（zip/rar/7z/tar/gz/iso…）自动探测本机已安装的 **7-Zip / WinRAR / unzip**，提供「解压到当前文件夹」「解压到同名文件夹」入口，解压后自动刷新面板；**多选多个压缩包时按顺序逐个解压**（菜单标签显示「依次解压 N 个」，图形界面工具会等上一个窗口结束再启动下一个，不会一次弹出 N 个窗口），失败的压缩包在汇总提示里列出文件名，成功的部分照常生效
@@ -107,6 +109,7 @@ mini-tc/
 │   ├── api.js                # Tauri invoke 封装
 │   ├── style.css             # 全局样式（4 套主题变量）
 │   ├── shortcuts.js          # 快捷键注册表：命令 / 作用域 / 匹配 / 冲突检测
+│   ├── alwaysOnTop.js         # 窗口置顶控制器（去重 / 失败回滚 / 退出还原）
 │   └── components/
 │       ├── FilePanel.vue        # 面板容器（Tab + 路径 + 文件列表 + 右键菜单）
 │       ├── TabBar.vue           # 多 Tab 管理
@@ -116,6 +119,7 @@ mini-tc/
 │       ├── VideoPreview.vue     # 视频预览
 │       ├── ContextMenu.vue      # 通用右键菜单组件
 │       ├── SettingsDialog.vue   # 文件预览设置
+│       ├── GeneralSettingsDialog.vue # 通用设置（声明式 ITEMS schema）
 │       └── ShortcutsDialog.vue  # 快捷键设置（独立页面）
 ├── src-tauri/                # Rust 后端
 │   ├── src/

@@ -25,6 +25,10 @@
             </div>
           </div>
           <div class="menu-separator"></div>
+          <div class="menu-option" @click="openGeneralSettings(); configMenuOpen = false">
+            <span class="check-mark"></span>
+            <span>通用设置</span>
+          </div>
           <div class="menu-option" @click="openSettings(); configMenuOpen = false">
             <span class="check-mark"></span>
             <span>文件预览设置</span>
@@ -78,6 +82,14 @@
         </div>
       </div>
     </div>
+
+    <!-- General settings dialog (app-wide options, own page) -->
+    <GeneralSettingsDialog
+      v-if="generalSettingsVisible"
+      :values="appConfig"
+      @close="onGeneralSettingsClose"
+      @save="onGeneralSettingsSave"
+    />
 
     <!-- Settings dialog -->
     <SettingsDialog
@@ -221,9 +233,11 @@ import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
 import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import GeneralSettingsDialog from "./components/GeneralSettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
+import * as alwaysOnTop from "./alwaysOnTop.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
@@ -263,6 +277,68 @@ function onSettingsSave(exts) {
 
 function onSettingsClose() {
   settingsVisible.value = false;
+}
+
+// ── General settings dialog (app-wide options) ──
+// A dedicated page, separate from 文件预览设置 (which is all about how a single
+// file is rendered) and 快捷键设置. The row list lives in the component as a
+// declarative schema; this side only owns persistence and the live effects.
+//
+// Persisted to ~/.minitc/app-config.json.
+const APP_CONFIG = "app-config";
+const generalSettingsVisible = ref(false);
+// Default MUST mirror the schema default in GeneralSettingsDialog.vue — that
+// component is the single source of truth for the row list, but it can only
+// apply its defaults once it receives values, so the pre-load state here needs
+// a matching starting value (otherwise the window would briefly act as if the
+// option were off).
+const appConfig = ref({ videoPreviewAlwaysOnTop: true });
+
+function openGeneralSettings() {
+  helpMenuOpen.value = false;
+  configMenuOpen.value = false;
+  generalSettingsVisible.value = true;
+}
+
+function onGeneralSettingsClose() {
+  generalSettingsVisible.value = false;
+}
+
+function onGeneralSettingsSave(values) {
+  appConfig.value = { ...values };
+  generalSettingsVisible.value = false;
+  // Apply the preference immediately rather than waiting for the next preview
+  // state change, so turning the option off un-pins a currently-open preview.
+  alwaysOnTop.setEnabled(appConfig.value.videoPreviewAlwaysOnTop);
+  alwaysOnTop.sync(previewVisible.value && previewKind.value === "video");
+  saveAppConfig();
+}
+
+async function loadAppConfig() {
+  try {
+    const raw = await loadConfig(APP_CONFIG);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        appConfig.value = { ...appConfig.value, ...parsed };
+      }
+    }
+  } catch (e) {
+    console.error("Failed to load app config:", e);
+    // Keep defaults on failure.
+  }
+  alwaysOnTop.setEnabled(appConfig.value.videoPreviewAlwaysOnTop);
+  // Replay the current state: the preference is only known after this async
+  // load resolves, and a video preview may already be open (the watch fired
+  // with the default `false` and correctly did nothing). Sync again so the
+  // window matches the real preference.
+  alwaysOnTop.sync(previewVisible.value && previewKind.value === "video");
+}
+
+async function saveAppConfig() {
+  await saveConfig(APP_CONFIG, JSON.stringify(appConfig.value)).catch((e) =>
+    console.error("Failed to persist app config:", e)
+  );
 }
 
 // ── Shortcut-settings dialog ──
@@ -415,6 +491,7 @@ onMounted(() => {
   // records how long each one actually took so slow ones are visible.
   track("cfg:theme", initTheme());
   track("cfg:text-preview", loadTextPreviewConfig());
+  track("cfg:app", loadAppConfig());
   // Load ~/.minitc/shortcuts.json before the first keystroke can arrive; until
   // it resolves every command simply falls back to its built-in defaults.
   track("cfg:shortcuts", loadShortcuts());
@@ -542,6 +619,16 @@ const previewFileBytes = ref(0);
 // ── Preview kind & source panel ──
 // previewKind === 'video' 时对面栏渲染 VideoPreview，否则渲染 FilePreview（图片/文本）。
 const previewKind = ref("");
+
+// Keep the window's z-order in sync with "a video preview is showing".
+// Watching the two primitives (rather than hooking every open/close call site)
+// means the ↑/↓ clip navigation, panel switches, autoplay advance and Esc all
+// funnel through here, so there's no path that can leave the window wrongly
+// pinned. `sync` no-ops when the desired state is unchanged.
+watch(
+  () => previewVisible.value && previewKind.value === "video",
+  (isVideo) => alwaysOnTop.sync(isVideo)
+);
 
 function openVideo(payload) {
   const source = payload.panelId || payload.sourcePanel || activePanel.value;
@@ -1387,6 +1474,8 @@ onUnmounted(() => {
   if (unlistenDragLeave) unlistenDragLeave();
   window.removeEventListener("focus", onWindowFocusRegain);
   document.removeEventListener("visibilitychange", onVisibilityRegain);
+  // Never leave the window pinned above other apps on the way out.
+  alwaysOnTop.reset();
 });
 </script>
 
