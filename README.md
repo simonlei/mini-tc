@@ -73,6 +73,30 @@ npm install
 npx tauri dev
 ```
 
+也可以用启动脚本，它会自动探测 Node.js 与 MSVC 环境：
+
+```bash
+./dev.sh            # 或 Windows 下双击 dev.bat —— 开发模式
+./dev.sh build      # 构建发布版
+./dev.sh check      # 仅 cargo check
+./dev.sh clean      # 清理构建产物
+./dev.sh deps       # 强制 npm install
+```
+
+> `npm install` 只在 `package.json` / `package-lock.json` 变化后才会真正执行
+> （依赖已同步时 npm 仍要约 20 秒却什么都不装）。改依赖后若想手动强制安装，
+> 跑 `./dev.sh deps` / `dev.bat deps`。
+
+`dev.sh` / `dev.bat` 的每个阶段都会打印耗时，便于定位慢在哪：
+
+```
+   [探测 Node.js] 569 ms
+   [探测 MSVC] 1126 ms
+   [MSVC 环境] 323 ms
+   [cargo check] 13846 ms
+   [总计] 17162 ms
+```
+
 ## 构建生产版本
 
 ```bash
