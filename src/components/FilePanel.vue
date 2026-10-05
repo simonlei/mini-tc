@@ -7,6 +7,7 @@
       @switch-tab="switchTab"
       @close-tab="closeTab"
       @add-tab="addTab"
+      @tab-menu="onTabMenu"
     />
 
     <!-- Path bar -->
@@ -51,6 +52,16 @@
       :items="ctxMenu.items"
       @close="closeCtxMenu"
       @select="handleCtxSelect"
+    />
+
+    <!-- Right-click context menu on a TAB (lock / unlock / jump back / close) -->
+    <ContextMenu
+      :visible="tabMenu.visible"
+      :x="tabMenu.x"
+      :y="tabMenu.y"
+      :items="tabMenu.items"
+      @close="closeTabMenu"
+      @select="handleTabMenuSelect"
     />
 
     <!-- Panel status bar -->
@@ -176,6 +187,10 @@ async function saveState() {
       path: t.path,
       sortColumn: t.sortColumn,
       sortDirection: t.sortDirection,
+      // Persisted so a lock survives a restart — TC keeps locked tabs' anchor
+      // dirs across sessions too. Old files simply lack the field (undefined
+      // = unlocked), which is exactly the desired fallback.
+      lockedPath: t.lockedPath || "",
     })),
     activeTabId: activeTabId.value,
   };
@@ -219,7 +234,7 @@ async function loadState() {
 
 // Watch for state changes and persist
 watch(
-  () => tabs.value.map((t) => ({ id: t.id, path: t.path, sortColumn: t.sortColumn, sortDirection: t.sortDirection })),
+  () => tabs.value.map((t) => ({ id: t.id, path: t.path, sortColumn: t.sortColumn, sortDirection: t.sortDirection, lockedPath: t.lockedPath || "" })),
   () => { activeTabId.value && saveState(); },
   { deep: true }
 );
@@ -244,7 +259,16 @@ onMounted(async () => {
   // directory listing, and it's a single tiny file read.
   const saved = await track(`panel:${props.panelId}:loadState`, loadState());
   if (saved) {
-    tabs.value = saved.tabs;
+    // Normalise restored tabs: `lockedPath` was added after the first release,
+    // so older ~/.minitc/tabs-*.json files simply don't have it. Defaulting to
+    // "" keeps every tab unlocked instead of leaving `undefined` in the state
+    // (which would then get written back as-is by saveState).
+    tabs.value = saved.tabs.map((t) => ({
+      sortColumn: "name",
+      sortDirection: "asc",
+      ...t,
+      lockedPath: t.lockedPath || "",
+    }));
     activeTabId.value = saved.activeTabId;
   } else {
     // First launch: create initial tab with home directory
@@ -337,6 +361,8 @@ function createTab(path) {
     path,
     sortColumn: "name",
     sortDirection: "asc",
+    // Locked-tab anchor dir. Empty = not locked (see toggleTabLock).
+    lockedPath: "",
   };
   tabs.value.push(tab);
   activeTabId.value = tab.id;
@@ -368,6 +394,100 @@ function closeTab(id) {
 
 function switchTab(id) {
   activeTabId.value = id;
+}
+
+// ── Tab lock (Total Commander's "Lock tab, directory changes allowed") ──
+//
+// Locking records the CURRENT directory as an anchor (`tab.lockedPath`) and
+// nothing else: the tab keeps navigating freely, exactly like TC's
+// "锁定，但允许更改文件夹" mode. `jumpToLocked` then snaps back to the anchor.
+// A plain `Ctrl+Shift+L` toggle is the primary entry; the tab right-click menu
+// exposes the same actions (plus "relock here").
+//
+// Note we deliberately do NOT re-anchor while the user browses — that would
+// make the lock pointless. Re-anchoring only happens on an explicit lock.
+
+function toggleTabLock(id = activeTabId.value) {
+  const tab = tabs.value.find((t) => t.id === id);
+  if (!tab) return null;
+  if (tab.lockedPath) {
+    tab.lockedPath = "";
+    return { locked: false, tab };
+  }
+  tab.lockedPath = tab.path;
+  return { locked: true, tab };
+}
+
+// Re-anchor a locked tab at wherever it currently is (TC has no direct
+// equivalent, but it is the natural third item next to lock / jump back).
+function relockTabAtCurrentPath(id = activeTabId.value) {
+  const tab = tabs.value.find((t) => t.id === id);
+  if (!tab) return null;
+  tab.lockedPath = tab.path;
+  return { locked: true, tab };
+}
+
+// Jump the tab back to its anchor. Reports why it did nothing so App.vue can
+// surface a toast instead of silently swallowing the keypress.
+function jumpToLocked(id = activeTabId.value) {
+  const tab = tabs.value.find((t) => t.id === id);
+  if (!tab) return { ok: false, reason: "none" };
+  if (!tab.lockedPath) return { ok: false, reason: "unlocked" };
+  if (tab.lockedPath === tab.path) return { ok: false, reason: "same" };
+  tab.path = tab.lockedPath;
+  return { ok: true, path: tab.lockedPath };
+}
+
+// ── Tab right-click menu ──
+
+const tabMenu = ref({ visible: false, x: 0, y: 0, items: [], tabId: null });
+
+function onTabMenu({ tabId, x, y }) {
+  const tab = tabs.value.find((t) => t.id === tabId);
+  if (!tab) return;
+  const items = [
+    {
+      label: tab.lockedPath ? "解除锁定" : "锁定当前位置",
+      action: "toggle-lock",
+    },
+    {
+      label: "回到锁定位置",
+      action: "jump-locked",
+      disabled: !tab.lockedPath,
+    },
+    {
+      label: "以当前目录重新锁定",
+      action: "relock",
+      disabled: !tab.lockedPath,
+    },
+    { separator: true },
+    { label: "关闭此标签页", action: "close", disabled: tabs.value.length <= 1 },
+  ];
+  tabMenu.value = { visible: true, x, y, items, tabId };
+}
+
+function closeTabMenu() {
+  tabMenu.value = { ...tabMenu.value, visible: false };
+}
+
+function handleTabMenuSelect(item) {
+  const id = tabMenu.value.tabId;
+  closeTabMenu();
+  if (item.disabled) return;
+  switch (item.action) {
+    case "toggle-lock":
+      toggleTabLock(id);
+      break;
+    case "jump-locked":
+      jumpToLocked(id);
+      break;
+    case "relock":
+      relockTabAtCurrentPath(id);
+      break;
+    case "close":
+      closeTab(id);
+      break;
+  }
 }
 
 // ── Navigation ──
@@ -1004,6 +1124,10 @@ defineExpose({
   // Tab 管理（由 App.vue 的全局快捷键 Ctrl+T / Ctrl+W 驱动，作用于活动面板）
   addTab,
   closeActiveTab: () => closeTab(activeTabId.value),
+  // Tab 锁定（Ctrl+Shift+L / Ctrl+Y）。返回结果供 App.vue 弹 toast，
+  // 让「没锁定 / 已在锁定位置」这类空操作对用户可见。
+  toggleLock: () => toggleTabLock(activeTabId.value),
+  jumpToLocked: () => jumpToLocked(activeTabId.value),
   refresh,
   refreshDrives,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),

@@ -49,6 +49,10 @@ export const COMMANDS = [
   // Ctrl+Tab 在本应用已被 panel.switch 占用，故不提供标签页轮换键。
   { id: "tab.new", scope: "global", label: "新建标签页", desc: "在当前活动面板中，按当前目录新开一个标签页", defaults: ["Ctrl+T"] },
   { id: "tab.close", scope: "global", label: "关闭标签页", desc: "关闭当前活动面板的当前标签页（仅剩一个时无操作）", defaults: ["Ctrl+W"] },
+  // 对应 TC 的「锁定，但允许更改文件夹」：锁定只是记下当前目录作为锚点，
+  // 标签页本身仍可自由进出任何目录；Ctrl+Y 一键跳回锚点。
+  { id: "tab.lock", scope: "global", label: "锁定 / 解锁标签页", desc: "把当前目录记为该标签页的锁定位置；已锁定时再次按下即解除锁定", defaults: ["Ctrl+Shift+L"] },
+  { id: "tab.jumpLocked", scope: "global", label: "回到锁定位置", desc: "把当前标签页跳回锁定时记录的目录（未锁定则无操作）", defaults: ["Ctrl+Y"] },
 
   // ── 文件列表 ──
   { id: "list.filter", scope: "fileList", label: "过滤当前目录", desc: "按文件名增量过滤", defaults: ["/"] },

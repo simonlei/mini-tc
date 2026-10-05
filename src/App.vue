@@ -1524,6 +1524,31 @@ onMounted(() => {
       return;
     }
 
+    // Ctrl+Shift+L / Ctrl+Y: lock / unlock the active panel's current tab, and
+    // jump it back to its locked dir (Total Commander's "lock tab, directory
+    // changes allowed"). Locking only records an anchor — the tab keeps
+    // navigating freely, exactly like TC.
+    if (matches("tab.lock", e) || matches("tab.jumpLocked", e)) {
+      // Resolve both before markHandled() (which makes later matches() false).
+      const isLock = matches("tab.lock", e);
+      e.preventDefault();
+      markHandled(e);
+      const panel = getActivePanelRef();
+      if (isLock) {
+        const res = panel?.toggleLock?.();
+        if (res?.locked) showToast(`已锁定当前标签页：${res.tab.path}`, "info");
+        else if (res) showToast("已解除标签页锁定", "info");
+      } else {
+        const res = panel?.jumpToLocked?.();
+        if (res?.ok) showToast(`已回到锁定位置：${res.path}`, "info");
+        else if (res?.reason === "unlocked") showToast("当前标签页未锁定", "info");
+        // reason === "same" / "none": already there (or no panel) — stay quiet.
+      }
+      // Keep DOM focus on the file grid so navigation continues from here.
+      getActivePanelRef()?.focusList?.();
+      return;
+    }
+
     // Tab / Ctrl+Tab: Switch active panel (skip if target is showing preview)
     if (matches("panel.switch", e)) {
       // A bare Tab is a real browser key (focus traversal), so it only means

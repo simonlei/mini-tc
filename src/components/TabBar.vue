@@ -4,12 +4,15 @@
       v-for="tab in tabs"
       :key="tab.id"
       class="tab"
-      :class="{ active: tab.id === activeTabId }"
+      :class="{ active: tab.id === activeTabId, locked: !!tab.lockedPath }"
+      :title="tabTitle(tab)"
       @click="$emit('switch-tab', tab.id)"
+      @contextmenu.prevent="$emit('tab-menu', { tabId: tab.id, x: $event.clientX, y: $event.clientY })"
       @auxclick="onAuxClick($event, tab.id)"
     >
       <span class="tab-icon">📁</span>
-      <span class="tab-name" :title="tab.path">{{ tabLabel(tab) }}</span>
+      <span v-if="tab.lockedPath" class="tab-lock" title="已锁定">🔒</span>
+      <span class="tab-name">{{ tabLabel(tab) }}</span>
       <button
         v-if="tabs.length > 1"
         class="tab-close"
@@ -31,7 +34,7 @@ defineProps({
   activeTabId: { type: [Number, String], default: 0 },
 });
 
-const emit = defineEmits(["switch-tab", "close-tab", "add-tab"]);
+const emit = defineEmits(["switch-tab", "close-tab", "add-tab", "tab-menu"]);
 
 function tabLabel(tab) {
   const path = tab.path || "";
@@ -45,6 +48,13 @@ function tabLabel(tab) {
     return last + "\\";
   }
   return last;
+}
+
+// Hover tooltip: current dir, plus the lock anchor when locked so the user can
+// see at a glance where Ctrl+Y will take them back.
+function tabTitle(tab) {
+  const path = tab.path || "";
+  return tab.lockedPath ? `${path}\n🔒 已锁定：${tab.lockedPath}（Ctrl+Y 回到此处）` : path;
 }
 
 function onAuxClick(e, tabId) {
@@ -93,6 +103,22 @@ function onAuxClick(e, tabId) {
 .tab.active {
   background: var(--tab-active);
   border-bottom: 2px solid var(--accent);
+}
+
+/* Locked tab: the lock glyph carries the meaning, this only tints the tab so
+   the locked one is findable when several tabs are open. */
+.tab.locked {
+  background: color-mix(in srgb, var(--tab-active) 70%, var(--accent) 12%);
+}
+
+.tab.locked.active {
+  border-bottom-color: var(--accent);
+}
+
+.tab-lock {
+  font-size: 10px;
+  flex-shrink: 0;
+  filter: saturate(1.2);
 }
 
 .tab-icon {
