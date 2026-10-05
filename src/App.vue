@@ -604,7 +604,7 @@ async function savePanelSplit() {
 
 // ── File Preview (Ctrl+Q) ──
 
-const PREVIEWABLE_EXTENSIONS = ["pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const PREVIEWABLE_EXTENSIONS = ["pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic", "heif", "hif", "avci"];
 const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
 
 // Built-in plain-text formats. These are deliberately NOT part of

@@ -16,7 +16,11 @@
 - 文件列表按名称 / 大小 / 修改时间排序（名称排序时：忽略连字符 `-`，如 `-1a.txt` 按 `1a.txt` 比较；中文字符排在数字与英文字母之后，如 `0.txt` < `a.txt` < `推特.txt`；数字段按数值自然排序，`1a.jpg` < `2c.jpg` < `10b.jpg`）
 - **启动屏（splash）**：冷启动时全屏 logo + 三点循环加载。展示**至少 250ms**，并等左右两栏首次列目录都完成才淡出（250ms），另有 2500ms 硬兜底防止慢目录/网络盘把用户堵在加载页；常量 `SPLASH_MIN_SHOW_MS` / `SPLASH_FADE_MS` / `SPLASH_MAX_SHOW_MS` 在 `src/main.js` 顶部，其中淡出时长由 JS 在运行时内联写入 `transitionDuration`，是单一真源（`index.html` 里的 CSS 只是兜底，别再两处各写一份）
 - **启动耗时埋点**：`src/bootLog.js` + 后端 `boot_mark` / `boot_timings` 命令，开发模式下 devtools 控制台会打印两张 `console.table`（JS 阶段 / Rust 阶段，共用同一时钟可直接对齐），Rust 侧另有 `[boot] ... ms` 逐行输出到控制台窗口。用 `localStorage.setItem("minitc-boot-log", "off")` 可关闭
-- **文件预览**（Ctrl+Q）：文本（txt/md/json/log）和图片（jpg/png/gif/webp/bmp/svg/avif）；图片经 asset protocol 直接加载，无大小限制；文本预览区内可拖选文字按 Ctrl+C 复制，或点 footer「复制全部」复制整篇
+- **文件预览**（Ctrl+Q）：文本（txt/md/json/log）、图片（jpg/png/gif/webp/bmp/svg/avif）、HEIC 系列（heic/heif/hif/avci）和 PDF/doc/docx；图片经 asset protocol 直接加载，无大小限制；文本预览区内可拖选文字按 Ctrl+C 复制，或点 footer「复制全部」复制整篇
+  - **HEIC/HEIF 预览**：WebView2 无原生 HEIC 解码器，走 `src/heicDecoder.js` + `src/heicDecode.worker.js` —— Worker 里用 **libheif 的 WebAssembly 版**解码成 RGBA，主线程再 canvas 编成 JPEG 交给 `<img>`，图上标注「已转换为 JPEG」。wasm 约 2 MB，按需加载（`?worker` 导入 + `optimizeDeps.include` 登记），启动不受影响。设了两道防爆上限：单文件 60 MB、解码后 5000 万像素（12MP 手机照片约需 48.8 MB RGBA 缓冲）
+  - **为什么不用 heic2any**（已移除）：它内嵌的是 emscripten **asm.js** 版 libheif，YUV→RGBA 转换跑在 JS 解释器上。实测 12MP 手机照片中位数：**asm.js 1047 ms vs wasm 422 ms（2.5x）**。⚠️ `libheif-js` 的 package.json `main` 指向的正是 asm.js 版（`libheif/libheif.js`），必须显式引 `libheif-wasm/libheif-bundle.mjs` 才拿到 wasm
+  - **HEIC 耗时诊断**：每次预览在 devtools 控制台打一张折叠表（`[heic] <文件名> <总耗时> ms`），分 `start / file-read / worker-decode / encoded / ready / painted` 六步，**每文件一张**可左右对比。`worker-decode` 的 note 里进一步拆出 `hevc=Xms`（比特流解码）和 `rgba=Yms`（颜色转换）。失败、翻页中断、超限中止三种情况也会补打（末行标 `failed` / `interrupted` / `aborted`）
+  - **⚠️ 剩余慢点**：换成 wasm 后 12MP 仍需约 420 ms，**瓶颈依然是全尺寸 YUV420→RGBA 转换**（HEVC 比特流解码只占 2–10 ms）。根治要靠降采样，但 libheif-js 的高层 API 不暴露尺寸参数（C API 有 `heif_image_scale_image` 但缺 `set_maximum_image_size` 便捷封装，需手工调 emscripten 指针）。后端 Rust `libheif-rs` 有干净的 `HeifDecodingOptions::max_width`，是后续方向
 - **视频预览**：`mp4/webm/ogv/mov/m4v` 等由 WebView 直接解码（含字幕自动探测同目录 `srt/vtt/ass`、外挂字幕、±0.5s 偏移微调、倍速、音量记忆）；`mkv/avi/flv/wmv/rmvb` 等无法解码的格式自动回退「用系统播放器打开」，HEVC/H.265 这类「有声音没画面」的情况也会自动识别并回退。控制栏中**进度条常驻**（随时可见当前位置、可拖动 seek），仅下方按钮行在播放 3 秒后自动收起，鼠标移回底部或暂停时立即恢复
   - **预览时窗口置顶**（配置 → 通用设置，默认开启）：播放视频预览时 MiniTC 窗口保持在所有窗口之上，关闭预览（Esc / 切换到别的文件 / 关掉面板）后自动还原层级。⚠️ 置顶是**操作系统窗口级**属性，所以浮起来的是**整个 MiniTC 窗口**（含文件列表），不是只有视频画面那一块——浏览器没有任何 API 能把单个 DOM 元素抬到其他程序窗口之上，想做到「只有视频浮在最上层」必须把播放器拆成独立的置顶窗口。置顶联动由一个 `watch` 驱动 `src/alwaysOnTop.js`（对 ↑/↓ 切片、面板切换、自动连播、Esc 全部自动生效，且做了状态去重与失败回滚），退出时强制还原以免留下置顶窗口。
 - **通用设置**（配置 → 通用设置）：应用级配置项的独立页面，与「文件预览设置」（只管单个文件怎么渲染）和「快捷键设置」并列。配置项以声明式 schema（`GeneralSettingsDialog.vue` 顶部的 `ITEMS` 数组）声明，新增一项只需加一个对象，UI 渲染 / 持久化 / 缺省回退自动获得。持久化到 `~/.minitc/app-config.json`
@@ -138,6 +142,8 @@ mini-tc/
 │   ├── style.css             # 全局样式（4 套主题变量）
 │   ├── shortcuts.js          # 快捷键注册表：命令 / 作用域 / 匹配 / 冲突检测
 │   ├── alwaysOnTop.js         # 窗口置顶控制器（去重 / 失败回滚 / 退出还原）
+│   ├── heicDecoder.js         # HEIC 解码主线程侧：Worker 调度 +像素转 JPEG
+│   ├── heicDecode.worker.js   # HEIC 解码 Worker：libheif wasm → RGBA
 │   └── components/
 │       ├── FilePanel.vue        # 面板容器（Tab + 路径 + 文件列表 + 右键菜单）
 │       ├── TabBar.vue           # 多 Tab 管理

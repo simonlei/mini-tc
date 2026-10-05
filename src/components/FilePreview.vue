@@ -26,6 +26,7 @@
 
     <!-- Image preview -->
     <div class="preview-body image-body" v-else-if="previewType === 'image'">
+      <div class="heic-note" v-if="heicNote">{{ heicNote }}</div>
       <img :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
     </div>
 
@@ -85,9 +86,10 @@
 </template>
 
 <script setup>
-import { ref, watch, computed } from "vue";
+import { ref, watch, computed, onBeforeUnmount } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
+import { decodeHeic, pixelsToBlob } from "../heicDecoder.js";
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
 // Vite web build). The browser build is pure-JS (uses a browser jszip) and
@@ -105,6 +107,11 @@ function loadMammoth() {
   return mammothPromise;
 }
 
+// HEIC/HEIF decoding lives in ../heicDecoder.js. It must stay off the static
+// import graph for the same reason as mammoth, plus one more: the wasm build is
+// a 2 MB chunk, and the decoder lives inside a Worker (see heicDecoder.js for
+// why swapping the engine was necessary and what the numbers were).
+
 const props = defineProps({
   filePath: { type: String, required: true },
   fileName: { type: String, required: true },
@@ -117,6 +124,10 @@ const props = defineProps({
 defineEmits(["close"]);
 
 const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+// HEIC family. Kept OUT of IMAGE_EXTENSIONS on purpose: WebView2 has no
+// built-in HEIC decoder, so these must go through the wasm decode path
+// instead of being handed straight to <img src>.
+const HEIC_EXTENSIONS = ["heic", "heif", "hif", "avci"];
 
 const loading = ref(false);
 const error = ref("");
@@ -125,6 +136,9 @@ const previewContent = ref("");
 const fileSize = ref("");
 const lineCount = ref(null);
 const imageInfo = ref("");
+// One-line notice under the image when the bytes on disk aren't what the
+// <img> actually shows (HEIC → JPEG transcode). Empty for native formats.
+const heicNote = ref("");
 const jsonWarn = ref("");
 const copyAllDone = ref(false);
 
@@ -136,6 +150,17 @@ const charCount = ref(null); // character count of the converted docx text
 const pdfLoadError = ref(false);
 // PDF iframe DOM 引用（供 App.vue 的 Ctrl+C 判定按 class 识别，也便于未来扩展）
 const pdfFrameRef = ref(null);
+
+// HEIC 解码后的 objectURL。必须在换文件/卸载时 revoke —— HEIC 原图常有几MB，
+// 一次解码出的 PNG blob 若泄漏，反复浏览目录会迅速吃掉可观的内存。
+let heicObjectUrl = "";
+function releaseHeicUrl() {
+  if (heicObjectUrl) {
+    URL.revokeObjectURL(heicObjectUrl);
+    heicObjectUrl = "";
+  }
+}
+onBeforeUnmount(releaseHeicUrl);
 
 // 平台检测：判断当前 WebView 是否支持内联 PDF 渲染。
 // 项目未安装 @tauri-apps/plugin-os（后端无 tauri-plugin-os），按约束不新增依赖，
@@ -184,6 +209,13 @@ function getExtension(name) {
 function onImageLoad(e) {
   const img = e.target;
   imageInfo.value = `${img.naturalWidth}x${img.naturalHeight}`;
+  // Close the HEIC timeline: everything before this point was producing the
+  // blob, this row is the webview's own JPEG decode + first paint. If the
+  // "ready -> painted" gap is large, the blob is the wrong size.
+  if (heicPhaseStart) {
+    heicMark("painted", `${img.naturalWidth}x${img.naturalHeight}`);
+    heicReport();
+  }
 }
 
 function onImageError() {
@@ -293,6 +325,106 @@ async function loadDocxPreview() {
   }
 }
 
+// ── HEIC / HEIF preview ──
+// These formats are HEVC-coded in an ISOBMFF container; no mainstream webview
+// decodes them natively. libheif runs in a dedicated Worker (heicDecoder.js)
+// and hands back raw pixels, which we re-encode to a JPEG Blob, turn into an
+// objectURL, and feed to the normal <img> path.
+//
+// Size cap: libheif decodes into an uncompressed RGBA buffer —
+// width*height*4 bytes, so a 48 MP phone photo needs ~200 MB before any
+// encoding. Refuse anything past the cap rather than let the tab die. Measured
+// on a 12 MP file: 48.8 MB per decode.
+const MAX_HEIC_BYTES = 60 * 1024 * 1024; // 60 MB on-disk cap
+const MAX_HEIC_PIXELS = 50e6; // decoded pixel budget (12MP phone photo ≈ fine)
+
+// Per-phase timing for the HEIC path. This is the one preview that routinely
+// takes hundreds of ms, and the cost is very unevenly distributed (see the
+// bench notes below), so a single "load" number tells you nothing about *why*
+// it was slow. Each step is recorded separately and flushed as its own console
+// table once the image is on screen.
+//
+// Why not reuse bootLog's report(): it fires exactly once per session (the
+// `reported` guard), which is right for startup but useless here -- paging
+// through HEICs is exactly the case where you want the per-file numbers for
+// every file, compared against each other.
+const heicMarks = [];
+let heicPhaseStart = 0;
+
+function heicMark(name, detail) {
+  const at = performance.now();
+  heicMarks.push({ step: name, at: +at.toFixed(1), dur: +(at - heicPhaseStart).toFixed(1), note: detail || "" });
+  heicPhaseStart = at;
+}
+
+function heicReport() {
+  if (heicMarks.length < 2) return;
+  const total = heicMarks[heicMarks.length - 1].at - heicMarks[0].at;
+  console.groupCollapsed(
+    `%c[heic] ${props.fileName} ${total.toFixed(0)} ms`,
+    "color:#d29922;font-weight:600"
+  );
+  // Hand console.table a SNAPSHOT, not the live array. DevTools keeps the
+  // reference and only materialises the rows when you expand the group, so
+  // passing `heicMarks` directly shows an empty table: the reset below runs
+  // long before you click it. bootLog.js avoids this for the same reason (it
+  // passes a fresh array from .map()).
+  console.table([...heicMarks]);
+  console.groupEnd();
+  heicMarks.length = 0;
+  heicPhaseStart = 0;
+}
+
+// Benchmarked on the user's own 48-file set (12 MP phone photos, 3024x4032):
+// libheif decode() (HEVC bitstream) is ~3 ms; display() (YUV420 -> RGBA) is the
+// entire cost. The engine matters, so this path uses libheif-js's real WASM
+// build directly instead of heic2any's asm.js one (2.5x, see heicDecoder.js).
+// The remaining cost is downscaling, which libheif-js does not expose.
+async function loadHeicPreview() {
+  releaseHeicUrl();
+  heicPhaseStart = performance.now();
+  heicMarks.length = 0;
+  heicMark("start", `${props.fileName} ${(props.fileBytes / 1024).toFixed(0)} KB`);
+
+  if (props.fileBytes && props.fileBytes > MAX_HEIC_BYTES) {
+    error.value = `HEIC 文件过大，无法预览（最大 ${MAX_HEIC_BYTES / 1024 / 1024} MB）`;
+    loading.value = false;
+    return;
+  }
+
+  const resp = await fetch(convertFileSrc(props.filePath));
+  if (!resp.ok) throw new Error(`无法读取文件 (HTTP ${resp.status})`);
+  const arrayBuffer = await resp.arrayBuffer();
+  heicMark("file-read", `${(arrayBuffer.byteLength / 1024).toFixed(0)} KB`);
+
+  // The Worker does decode + colour conversion off the UI thread; we only
+  // re-encode the returned pixels. These are now separate calls with separate
+  // timings -- heic2any hid both behind one await across two threads.
+  const { pixels, width, height, decodeMs, displayMs } = await decodeHeic(arrayBuffer);
+  heicMark("worker-decode", `hevc ${decodeMs.toFixed(0)}ms + rgba ${displayMs.toFixed(0)}ms -> ${width}x${height}`);
+
+  // The pixel cap can only be enforced after the fact -- the real dimensions
+  // come from the decoder, not from the file header.
+  if (width * height > MAX_HEIC_PIXELS) {
+    error.value = `图片分辨率过高（${width}x${height}），已跳过预览以避免内存耗尽`;
+    loading.value = false;
+    heicMark("aborted", "pixel cap exceeded");
+    heicReport();
+    return;
+  }
+
+  const { blob, putMs, encodeMs } = await pixelsToBlob(pixels, width, height);
+  heicMark("encoded", `putImageData ${putMs.toFixed(0)}ms + jpeg ${encodeMs.toFixed(0)}ms -> ${(blob.size / 1024).toFixed(0)} KB`);
+
+  heicObjectUrl = URL.createObjectURL(blob);
+  previewContent.value = heicObjectUrl;
+  previewType.value = "image";
+  fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : formatSize(blob.size);
+  heicNote.value = "HEIC 已转换为 JPEG 显示";
+  heicMark("ready", `${(blob.size / 1024).toFixed(0)} KB JPEG`);
+  loading.value = false;
+}
+
 async function loadPreview() {
   loading.value = true;
   error.value = "";
@@ -300,6 +432,7 @@ async function loadPreview() {
   previewContent.value = "";
   lineCount.value = null;
   imageInfo.value = "";
+  heicNote.value = "";
   jsonWarn.value = "";
   pdfLoadError.value = false;
   docMessage.value = "";
@@ -313,6 +446,24 @@ async function loadPreview() {
     previewContent.value = convertFileSrc(props.filePath);
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
     loading.value = false;
+    return;
+  }
+
+  // HEIC family: must NOT fall through to the <img> branch above (WebView2
+  // can't decode it), so it gets its own wasm transcode path.
+  if (HEIC_EXTENSIONS.includes(ext)) {
+    try {
+      await loadHeicPreview();
+    } catch (e) {
+      error.value = `无法解码此 HEIC 文件：${String(e?.message || e)}`;
+      loading.value = false;
+      // Flush the partial timeline — "where did it die" is exactly the
+      // question a failed HEIC raises, and without this the table is dropped.
+      if (heicPhaseStart) {
+        heicMark("failed", String(e?.message || e));
+        heicReport();
+      }
+    }
     return;
   }
 
@@ -378,6 +529,13 @@ async function loadPreview() {
 watch(
   () => props.filePath,
   () => {
+    // A pending HEIC timeline is left hanging when the user pages away before
+    // <img> fired `load` (fast arrow-key scrubbing through 48 files). Flush it
+    // here so those runs still show up in the console.
+    if (heicPhaseStart) {
+      heicMark("interrupted", "selection changed before painted");
+      heicReport();
+    }
     if (props.filePath) loadPreview();
   },
   { immediate: true }
@@ -495,6 +653,23 @@ watch(
   overflow: auto;
   background: var(--bg);
   padding: 12px;
+}
+
+/* Transcode notice, pinned above the image without stealing its space. */
+.heic-note {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--header-bg);
+  border: 1px solid var(--border);
+  pointer-events: none;
+  white-space: nowrap;
 }
 
 .preview-image {
