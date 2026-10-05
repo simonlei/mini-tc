@@ -1505,6 +1505,25 @@ onMounted(() => {
       return;
     }
 
+    // Ctrl+T / Ctrl+W: new / close a tab in the ACTIVE panel (Total Commander
+    // keys). Both are plain Ctrl combos with no webview-native meaning, so we
+    // always consume them — even while the filename filter or the address bar
+    // has focus, which is where a new tab is most often wanted.
+    if (matches("tab.new", e) || matches("tab.close", e)) {
+      // Resolve BOTH bindings before consuming the event: `markHandled` makes
+      // every later `matches()` on the same event return false.
+      const isNew = matches("tab.new", e);
+      e.preventDefault();
+      markHandled(e);
+      const panel = getActivePanelRef();
+      if (isNew) panel?.addTab?.();
+      else panel?.closeActiveTab?.();
+      // Keep the DOM focus on the file grid so the arrow keys immediately
+      // drive the (new) active tab.
+      getActivePanelRef()?.focusList?.();
+      return;
+    }
+
     // Tab / Ctrl+Tab: Switch active panel (skip if target is showing preview)
     if (matches("panel.switch", e)) {
       // A bare Tab is a real browser key (focus traversal), so it only means

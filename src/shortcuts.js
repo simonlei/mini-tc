@@ -45,6 +45,10 @@ export const COMMANDS = [
   // Total Commander 用光标 Tab 切左右栏，Ctrl+Tab 是等效键 —— 两个都作为默认。
   { id: "panel.switch", scope: "global", label: "切换左右面板", desc: "在左栏 / 右栏之间移动焦点（与 Total Commander 一致：Tab）", defaults: ["Tab", "Ctrl+Tab"] },
   { id: "preview.close", scope: "global", label: "关闭预览", desc: "关闭图片 / 文本 / 视频预览", defaults: ["Escape"] },
+  // 多标签页（与 Total Commander 一致：Ctrl+T 新建 / Ctrl+W 关闭）。
+  // Ctrl+Tab 在本应用已被 panel.switch 占用，故不提供标签页轮换键。
+  { id: "tab.new", scope: "global", label: "新建标签页", desc: "在当前活动面板中，按当前目录新开一个标签页", defaults: ["Ctrl+T"] },
+  { id: "tab.close", scope: "global", label: "关闭标签页", desc: "关闭当前活动面板的当前标签页（仅剩一个时无操作）", defaults: ["Ctrl+W"] },
 
   // ── 文件列表 ──
   { id: "list.filter", scope: "fileList", label: "过滤当前目录", desc: "按文件名增量过滤", defaults: ["/"] },

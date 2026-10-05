@@ -315,9 +315,25 @@ watch(activeTabId, (newId) => {
 
 // ── Tab management ──
 
+// Tab id must be unique within the panel — it's the `:key` of the v-for, the
+// key of the per-tab listing cache, and the `activeTabId` selector. A raw
+// Date.now() can collide when two tabs are created inside the same
+// millisecond (e.g. a burst of Ctrl+T), which would silently merge them, so
+// nudge the clock forward until the id is free.
+let lastTabId = 0;
+function nextTabId() {
+  let id = Date.now();
+  if (id <= lastTabId) id = lastTabId + 1;
+  lastTabId = id;
+  // Ids restored from ~/.minitc/tabs-<panelId>.json are arbitrary past
+  // timestamps, so also bump past anything already on the panel.
+  while (tabs.value.some((t) => t.id === id)) id += 1;
+  return id;
+}
+
 function createTab(path) {
   const tab = {
-    id: Date.now(),
+    id: nextTabId(),
     path,
     sortColumn: "name",
     sortDirection: "asc",
@@ -985,6 +1001,9 @@ defineExpose({
   selectedEntry,
   selectedEntries,
   currentPath: computed(() => activeTab.value?.path || ""),
+  // Tab 管理（由 App.vue 的全局快捷键 Ctrl+T / Ctrl+W 驱动，作用于活动面板）
+  addTab,
+  closeActiveTab: () => closeTab(activeTabId.value),
   refresh,
   refreshDrives,
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),

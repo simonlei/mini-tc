@@ -14,12 +14,12 @@
         v-if="tabs.length > 1"
         class="tab-close"
         @click.stop="$emit('close-tab', tab.id)"
-        title="Close tab"
+        title="关闭标签页 (Ctrl+W)"
       >
         ×
       </button>
     </div>
-    <button class="tab-add" @click="$emit('add-tab')" title="New tab">
+    <button class="tab-add" @click="$emit('add-tab')" title="新建标签页 (Ctrl+T)">
       +
     </button>
   </div>
