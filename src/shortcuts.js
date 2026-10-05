@@ -42,13 +42,20 @@ export const COMMANDS = [
   { id: "edit.cut", scope: "global", label: "剪切", desc: "剪切所选项目到系统剪贴板", defaults: ["Ctrl+X"] },
   { id: "edit.paste", scope: "global", label: "粘贴", desc: "把系统剪贴板内容粘贴到当前目录", defaults: ["Ctrl+V"] },
   { id: "edit.selectAll", scope: "global", label: "全选", desc: "选中当前面板所有项目", defaults: ["Ctrl+A"] },
-  // Total Commander 用光标 Tab 切左右栏，Ctrl+Tab 是等效键 —— 两个都作为默认。
-  { id: "panel.switch", scope: "global", label: "切换左右面板", desc: "在左栏 / 右栏之间移动焦点（与 Total Commander 一致：Tab）", defaults: ["Tab", "Ctrl+Tab"] },
+  // Total Commander 用光标 Tab 切左右栏（裸 Tab 已是浏览器焦点遍历键，只在
+  // 文件列表获得焦点时才被认领为「切面板」，见 App.vue）。Ctrl+Tab 在 TC 里是
+  // 「本栏下一个标签页」，故不再给 panel.switch，只留给 tab.next。
+  { id: "panel.switch", scope: "global", label: "切换左右面板", desc: "在左栏 / 右栏之间移动焦点（与 Total Commander 一致：Tab）", defaults: ["Tab"] },
   { id: "preview.close", scope: "global", label: "关闭预览", desc: "关闭图片 / 文本 / 视频预览", defaults: ["Escape"] },
-  // 多标签页（与 Total Commander 一致：Ctrl+T 新建 / Ctrl+W 关闭）。
-  // Ctrl+Tab 在本应用已被 panel.switch 占用，故不提供标签页轮换键。
+  // 多标签页（与 Total Commander 一致：Ctrl+T 新建 / Ctrl+W 关闭 /
+  // Ctrl+Tab 与 Ctrl+Shift+Tab 在本栏内轮换）。
+  // 不给 Ctrl+PageUp/PageDown 同义键：它们已被文件列表的翻页键占用
+  // （list.pageUp / list.pageDown，fileList scope 优先），写在这里只会是
+  // 一个按了没反应的死键。
   { id: "tab.new", scope: "global", label: "新建标签页", desc: "在当前活动面板中，按当前目录新开一个标签页", defaults: ["Ctrl+T"] },
   { id: "tab.close", scope: "global", label: "关闭标签页", desc: "关闭当前活动面板的当前标签页（仅剩一个时无操作）", defaults: ["Ctrl+W"] },
+  { id: "tab.next", scope: "global", label: "下一个标签页", desc: "在当前活动面板的标签页之间向前轮换（到底后回到第一个）", defaults: ["Ctrl+Tab"] },
+  { id: "tab.prev", scope: "global", label: "上一个标签页", desc: "在当前活动面板的标签页之间向后轮换（到头后回到最后一个）", defaults: ["Ctrl+Shift+Tab"] },
   // 对应 TC 的「锁定，但允许更改文件夹」：锁定只是记下当前目录作为锚点，
   // 标签页本身仍可自由进出任何目录；Ctrl+Y 一键跳回锚点。
   { id: "tab.lock", scope: "global", label: "锁定 / 解锁标签页", desc: "把当前目录记为该标签页的锁定位置；已锁定时再次按下即解除锁定", defaults: ["Ctrl+Shift+L"] },

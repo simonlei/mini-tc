@@ -396,6 +396,18 @@ function switchTab(id) {
   activeTabId.value = id;
 }
 
+// Total Commander 的 Ctrl+Tab / Ctrl+Shift+Tab：在本栏的标签页之间轮换，
+// 到末尾回到第一个（环绕，不是停在最后一个）。只在 >1 个标签时有意义。
+// 返回切换后的标签，供调用方在 toast 里报出落点。
+function cycleTab(delta) {
+  if (tabs.value.length <= 1) return null;
+  const idx = tabs.value.findIndex((t) => t.id === activeTabId.value);
+  const from = idx === -1 ? 0 : idx;
+  const next = (from + delta + tabs.value.length) % tabs.value.length;
+  activeTabId.value = tabs.value[next].id;
+  return tabs.value[next];
+}
+
 // ── Tab lock (Total Commander's "Lock tab, directory changes allowed") ──
 //
 // Locking records the CURRENT directory as an anchor (`tab.lockedPath`) and
@@ -1124,6 +1136,8 @@ defineExpose({
   // Tab 管理（由 App.vue 的全局快捷键 Ctrl+T / Ctrl+W 驱动，作用于活动面板）
   addTab,
   closeActiveTab: () => closeTab(activeTabId.value),
+  // Tab 轮换（Ctrl+Tab / Ctrl+Shift+Tab）
+  cycleTab,
   // Tab 锁定（Ctrl+Shift+L / Ctrl+Y）。返回结果供 App.vue 弹 toast，
   // 让「没锁定 / 已在锁定位置」这类空操作对用户可见。
   toggleLock: () => toggleTabLock(activeTabId.value),

@@ -1505,6 +1505,29 @@ onMounted(() => {
       return;
     }
 
+    // Ctrl+Tab / Ctrl+Shift+Tab: rotate to the next / previous tab of the
+    // ACTIVE panel (Total Commander keys). Checked BEFORE panel.switch so
+    // these two combos can never be claimed by the bare-Tab handler, which
+    // still owns plain `Tab`. Both are plain Ctrl combos with no webview-native
+    // meaning, so they are always consumed — even while the filename filter or
+    // the address bar has focus.
+    if (matches("tab.next", e) || matches("tab.prev", e)) {
+      // Resolve BOTH bindings before consuming the event: `markHandled` makes
+      // every later `matches()` on the same event return false.
+      const delta = matches("tab.next", e) ? 1 : -1;
+      e.preventDefault();
+      markHandled(e);
+      const panel = getActivePanelRef();
+      const tab = panel?.cycleTab?.(delta);
+      // Only one tab open → nothing moved; stay quiet instead of a toast that
+      // repeats the same text on every keypress.
+      if (tab) showToast(`已切换到标签页：${tab.path}`, "info");
+      // Keep the DOM focus on the file grid so the arrow keys immediately
+      // drive the newly active tab.
+      getActivePanelRef()?.focusList?.();
+      return;
+    }
+
     // Ctrl+T / Ctrl+W: new / close a tab in the ACTIVE panel (Total Commander
     // keys). Both are plain Ctrl combos with no webview-native meaning, so we
     // always consume them — even while the filename filter or the address bar
@@ -1556,8 +1579,10 @@ onMounted(() => {
       // Commander behaviour. Anywhere else (address bar, filename filter,
       // inline rename, dialog buttons, right-click menu) we must fall through
       // and let the webview move focus natively, otherwise keyboard users can't
-      // leave a text field or reach a dialog button. Ctrl+Tab has no native
-      // meaning, so it always switches.
+      // leave a text field or reach a dialog button.
+      // Only a bare `Tab` is bound now — Ctrl+Tab belongs to tab.next above —
+      // but the guard stays on the combo so a user rebinding can't reintroduce
+      // a Ctrl combo that would then hijack the filter input's focus exit.
       const bareTab = eventCombo(e) === "Tab";
       if (bareTab) {
         const t = e.target;
