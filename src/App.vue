@@ -292,7 +292,7 @@ const generalSettingsVisible = ref(false);
 // apply its defaults once it receives values, so the pre-load state here needs
 // a matching starting value (otherwise the window would briefly act as if the
 // option were off).
-const appConfig = ref({ videoPreviewAlwaysOnTop: true });
+const appConfig = ref({ videoPreviewAlwaysOnTop: false });
 
 function openGeneralSettings() {
   helpMenuOpen.value = false;

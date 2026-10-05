@@ -50,7 +50,7 @@ const ITEMS = [
     title: "视频预览时窗口置顶",
     hint: "预览视频时，MiniTC 窗口保持在所有窗口之上",
     desc: "开启后，播放视频预览时整个 MiniTC 窗口会浮到其他程序窗口上方；关闭预览后自动还原。关闭视频预览或按 Esc 退出预览也会立即还原窗口层级。",
-    default: true,
+    default: false,
   },
 ];
 
