@@ -761,6 +761,12 @@ function getActivePanelRef() {
   return activePanel.value === "left" ? leftPanel.value : rightPanel.value;
 }
 
+// The panel FOCUS is not on — i.e. the destination for "copy/move to the other
+// panel" (Total Commander's F5 / Shift+F5).
+function getInactivePanelRef() {
+  return activePanel.value === "left" ? rightPanel.value : leftPanel.value;
+}
+
 // ── Clipboard (Ctrl+C / Ctrl+X / Ctrl+V) ──
 //
 // The OS clipboard is the single source of truth — we never keep an in-app
@@ -888,6 +894,54 @@ async function pasteFromClipboard() {
     return;
   }
   await doPaste(sys.cut ? "cut" : "copy", sys.paths);
+}
+
+// ── F5 / Shift+F5: copy / move the selection into the OTHER panel ──
+//
+// Total Commander's F5 ("copy to other panel") and Shift+F5 ("move to other
+// panel"). The destination is the opposite panel's CURRENT directory — not a
+// file picked there, and not the clipboard — so this bypasses the clipboard
+// round-trip entirely and hands the paths straight to doPaste().
+async function transferToOtherPanel(operation) {
+  const src = getActivePanelRef();
+  const entries = src?.selectedEntries;
+  const srcDir = src?.currentPath;
+  const destDir = getInactivePanelRef()?.currentPath;
+
+  if (!entries || entries.length === 0 || !srcDir) {
+    showToast("请先选中文件或文件夹", "error");
+    return;
+  }
+  if (!destDir) {
+    showToast("对面栏没有有效的当前目录", "error");
+    return;
+  }
+  // Both panels sitting in the same directory: copying a file onto itself is a
+  // no-op at best and a "copy a file into itself" error at worst. Say so
+  // instead of letting the backend silently skip N items.
+  if (normDir(destDir) === normDir(srcDir)) {
+    showToast("对面栏与当前栏在同一目录", "error");
+    return;
+  }
+
+  const paths = await Promise.all(entries.map((e) => joinPath(srcDir, e.name)));
+  // Same filter the drag-drop path uses: an item already sitting DIRECTLY in
+  // the destination can't be moved into it (and copying it would just make a
+  // same-name conflict we can't meaningfully resolve).
+  const normDest = normDir(destDir);
+  const filtered = paths.filter((p) => parentDirOf(p) !== normDest);
+  if (filtered.length === 0) {
+    showToast("所选项目已在对面栏目录中", "info");
+    return;
+  }
+
+  await doPaste(operation === "cut" ? "cut" : "copy", filtered, destDir);
+}
+
+// Slash-normalised directory for comparison (drops the Windows backslash so
+// "C:\a" and "C:/a" compare equal). Mirrors parentDirOf()'s normalisation.
+function normDir(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
 // Core paste logic (used for both copy and cut pastes sourced from the OS
@@ -1502,6 +1556,29 @@ onMounted(() => {
       if (isCopy) setClipboard("copy");
       else if (isCut) setClipboard("cut");
       else pasteFromClipboard();
+      return;
+    }
+
+    // F5 / Shift+F5: copy / move the selection into the OTHER panel's current
+    // directory (Total Commander keys). Deliberately NOT part of the clipboard
+    // branch above: these never touch the system clipboard, they go straight
+    // from the active panel's selection to the inactive panel's path.
+    //
+    // Both are plain function keys with no webview-native meaning, so they are
+    // consumed even while the address bar or the filename filter has focus
+    // (same reasoning as Ctrl+T below) — the one exception is a rename box,
+    // which is a text field where a stray F5 clearly means "not for me".
+    if (matches("edit.copyToOther", e) || matches("edit.moveToOther", e)) {
+      const t = e.target;
+      if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
+      // Resolve BOTH bindings before consuming: markHandled() makes every
+      // later matches() on the same event return false.
+      const isMove = matches("edit.moveToOther", e);
+      e.preventDefault();
+      markHandled(e);
+      transferToOtherPanel(isMove ? "cut" : "copy");
+      // Focus stays on the SOURCE panel (like TC): the user usually wants to
+      // keep working through the same selection. doPaste refreshes both panels.
       return;
     }
 

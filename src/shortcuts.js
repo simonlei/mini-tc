@@ -41,6 +41,12 @@ export const COMMANDS = [
   { id: "edit.copy", scope: "global", label: "复制", desc: "复制所选项目到系统剪贴板", defaults: ["Ctrl+C"] },
   { id: "edit.cut", scope: "global", label: "剪切", desc: "剪切所选项目到系统剪贴板", defaults: ["Ctrl+X"] },
   { id: "edit.paste", scope: "global", label: "粘贴", desc: "把系统剪贴板内容粘贴到当前目录", defaults: ["Ctrl+V"] },
+  // Total Commander 的 F5 / Shift+F5「复制到另一栏 / 移动到另一栏」。目标恒为
+  // **对面面板当前所在的目录**（不是对面选中的文件），所以这两条和 edit.paste
+  // 是两条独立的路：paste 只认剪贴板，这两条只认对面栏的当前路径。
+  // 焦点在输入框（地址栏 / 过滤框 / 重命名）时不认领——见 App.vue 的守卫。
+  { id: "edit.copyToOther", scope: "global", label: "复制到对面栏", desc: "把选中项复制到另一侧面板的当前目录（与 Total Commander 一致：F5）", defaults: ["F5"] },
+  { id: "edit.moveToOther", scope: "global", label: "移动到对面栏", desc: "把选中项移动到另一侧面板的当前目录（与 Total Commander 一致：Shift+F5）", defaults: ["Shift+F5"] },
   { id: "edit.selectAll", scope: "global", label: "全选", desc: "选中当前面板所有项目", defaults: ["Ctrl+A"] },
   // Total Commander 用光标 Tab 切左右栏（裸 Tab 已是浏览器焦点遍历键，只在
   // 文件列表获得焦点时才被认领为「切面板」，见 App.vue）。Ctrl+Tab 在 TC 里是
