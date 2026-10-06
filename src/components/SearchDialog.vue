@@ -70,7 +70,10 @@
         <span v-if="doneInfo?.cancelled" class="warn">已取消</span>
         <span v-if="doneInfo?.truncated" class="warn">结果已达上限（{{ MAX_RESULTS }}）</span>
         <span class="spacer"></span>
-        <span v-if="hits.length" class="dim">双击 / 回车跳转到文件</span>
+        <span v-if="searching && currentDir" class="dim cur-dir" :title="currentDir">
+          正在扫描：{{ currentDirShort }}
+        </span>
+        <span v-else-if="hits.length" class="dim">双击 / 回车跳转到文件</span>
       </div>
       <p v-if="error" class="search-error">{{ error }}</p>
       <ul v-if="scanErrors.length" class="scan-errors">
@@ -163,6 +166,17 @@ const matched = ref(0);
 const elapsed = ref(0);
 const doneInfo = ref(null);
 const scanErrors = ref([]);
+// Directory the backend is walking right now (search-progress), so a slow
+// scan no longer looks like a freeze.
+const currentDir = ref("");
+// Tail of that path — the leading part is rarely informative and would eat the
+// whole status row. Full path stays available as a tooltip.
+const currentDirShort = computed(() => {
+  const p = currentDir.value;
+  if (!p) return "";
+  const parts = p.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts.length > 2 ? "…\\" + parts.slice(-2).join("\\") : p;
+});
 const error = ref("");
 const activeIndex = ref(-1);
 
@@ -174,6 +188,7 @@ let startedAt = 0;
 let ticker = null;
 let unlistenBatch = null;
 let unlistenDone = null;
+let unlistenProgress = null;
 
 // The parent re-emits `initialPath` when the user hits 「当前目录」.
 watch(
@@ -245,6 +260,13 @@ function onListKeydown(e) {
 
 // ── Search lifecycle ──
 
+function onProgress(payload) {
+  if (!payload || payload.id !== searchId) return; // stale scan
+  scanned.value = payload.scanned || 0;
+  matched.value = payload.matched || 0;
+  currentDir.value = payload.current || "";
+}
+
 function onBatch(payload) {
   if (!payload || payload.id !== searchId) return; // stale scan
   hits.value = hits.value.concat(payload.hits || []);
@@ -254,6 +276,7 @@ function onBatch(payload) {
 function onDone(payload) {
   if (!payload || payload.id !== searchId) return;
   searching.value = false;
+  currentDir.value = "";
   scanned.value = payload.scanned || 0;
   matched.value = payload.matched || 0;
   doneInfo.value = payload;
@@ -280,6 +303,7 @@ async function run() {
   hits.value = [];
   scanErrors.value = [];
   doneInfo.value = null;
+  currentDir.value = "";
   scanned.value = 0;
   matched.value = 0;
   elapsed.value = 0;
@@ -429,6 +453,7 @@ let resizeObs = null;
 onMounted(async () => {
   unlistenBatch = await listen("search-batch", onBatch);
   unlistenDone = await listen("search-done", onDone);
+  unlistenProgress = await listen("search-progress", onProgress);
   document.addEventListener("keydown", onEscCapture, true);
   await nextTick();
   patternInput.value?.focus();
@@ -451,6 +476,7 @@ onBeforeUnmount(() => {
   stopTicker();
   unlistenBatch?.();
   unlistenDone?.();
+  unlistenProgress?.();
   resizeObs?.disconnect();
   document.removeEventListener("keydown", onEscCapture, true);
 });
@@ -649,6 +675,17 @@ onBeforeUnmount(() => {
 
 .search-status .dim {
   opacity: 0.7;
+}
+
+/* Long paths must not push the other counters off the row: show the last two
+   segments (the informative part) and keep the full path in the tooltip.
+   `direction: rtl` would be tempting here but reorders the `.` and `\` in a
+   path via bidi rules, so it is deliberately not used. */
+.search-status .cur-dir {
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .search-error {

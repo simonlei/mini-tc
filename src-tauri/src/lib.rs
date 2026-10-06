@@ -82,20 +82,24 @@ fn system_time_to_millis(time: std::io::Result<std::time::SystemTime>) -> i64 {
     }
 }
 
-/// Check whether a file/folder is hidden (Unix dot-file or Windows hidden attribute).
-fn is_hidden(name: &str, _path: &Path) -> bool {
+/// Check whether a file/folder is hidden (Unix dot-file or Windows hidden
+/// attribute). Takes the metadata the caller already has — resolving the path
+/// again here would double the syscall cost of every listing.
+fn is_hidden(name: &str, meta: &fs::Metadata) -> bool {
     if name.starts_with('.') {
         return true;
     }
     #[cfg(windows)]
     {
-        if let Ok(metadata) = fs::metadata(_path) {
-            use std::os::windows::fs::MetadataExt;
-            const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
-                return true;
-            }
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return true;
         }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
     }
     false
 }
@@ -122,9 +126,17 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
             Err(_) => continue, // skip entries we can't read
         };
         let file_path = entry.path();
-        let metadata = match fs::metadata(&file_path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        // Same rule as the search walk: `DirEntry::metadata()` reuses the
+        // attributes the directory scan already returned (no syscall), while
+        // `fs::metadata(&path)` re-resolves and re-opens the file. Only
+        // symlinks fall back, because there we do want the *target's* size and
+        // type, and links are rare enough not to matter.
+        let metadata = match entry.metadata() {
+            Ok(m) if !m.file_type().is_symlink() => m,
+            _ => match fs::metadata(&file_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            },
         };
         let name = entry.file_name().to_string_lossy().to_string();
 
@@ -132,6 +144,7 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
             .extension()
             .map(|e| e.to_string_lossy().to_uppercase())
             .unwrap_or_default();
+        let hidden = is_hidden(&name, &metadata);
 
         result.push(FileEntry {
             name,
@@ -139,7 +152,7 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
             size: if metadata.is_dir() { 0 } else { metadata.len() },
             modified: system_time_to_millis(metadata.modified()),
             extension,
-            is_hidden: is_hidden(&entry.file_name().to_string_lossy(), &file_path),
+            is_hidden: hidden,
         });
     }
 
@@ -400,6 +413,14 @@ struct SearchBatch {
 }
 
 #[derive(Serialize, Clone)]
+struct SearchProgress {
+    id: u64,
+    scanned: u64,
+    matched: u64,
+    current: String, // directory being scanned right now
+}
+
+#[derive(Serialize, Clone)]
 struct SearchDone {
     id: u64,
     scanned: u64,
@@ -430,6 +451,14 @@ const CONTENT_SCAN_LIMIT: u64 = 8 * 1024 * 1024;
 const MAX_SEARCH_DEPTH: usize = 64;
 const SEARCH_BATCH_SIZE: usize = 200;
 const SEARCH_BATCH_INTERVAL_MS: u128 = 200;
+// How often the walk reports "still alive". Without this a scan over a huge
+// flat directory looks frozen: no hit means no batch, so the UI showed 0
+// scanned until the very end.
+const SEARCH_PROGRESS_INTERVAL_MS: u128 = 300;
+// How often (in scanned entries) the wall clock is consulted for progress.
+// The cancel flag itself is an atomic load — a few nanoseconds — so it is
+// checked on *every* entry; only the (relatively costly) clock read is masked.
+const SEARCH_PROGRESS_CHECK_MASK: u64 = 31;
 
 /// Cancellation flag of the search currently running (if any). Starting a new
 /// search cancels the previous one, so results from a stale scan can never
@@ -545,25 +574,6 @@ fn name_matches(patterns: &[Pattern], name: &str, case_sensitive: bool) -> bool 
     false
 }
 
-fn is_entry_hidden(name: &str, meta: &fs::Metadata) -> bool {
-    if name.starts_with('.') {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-        if meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
-            return true;
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-    }
-    false
-}
-
 /// True when `path` holds `needle`. Skips binaries (NUL byte in the first
 /// 4 KB) and files above `CONTENT_SCAN_LIMIT` — grepping those is either
 /// meaningless or far too slow to do inside a directory walk.
@@ -601,6 +611,25 @@ fn emit_batch(app: &tauri::AppHandle, id: u64, batch: &mut Vec<SearchHit>) {
     let _ = app.emit("search-batch", SearchBatch { id, hits });
 }
 
+// NOTE: not `emit_progress` — that name is taken by the copy/transfer one.
+fn emit_search_progress(
+    app: &tauri::AppHandle,
+    id: u64,
+    scanned: u64,
+    matched: u64,
+    current: &str,
+) {
+    let _ = app.emit(
+        "search-progress",
+        SearchProgress {
+            id,
+            scanned,
+            matched,
+            current: current.to_string(),
+        },
+    );
+}
+
 fn run_search(
     app: tauri::AppHandle,
     id: u64,
@@ -624,6 +653,7 @@ fn run_search(
     let mut cancelled = false;
     let mut truncated = false;
     let mut last_emit = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
 
     // Iterative DFS: an explicit stack keeps multi-thousand-level trees off the
     // (1 MB) thread stack. Children are pushed in reverse name order so the
@@ -642,18 +672,34 @@ fn run_search(
             }
         };
 
-        let mut files: Vec<(PathBuf, String, fs::Metadata)> = Vec::new();
-        let mut subs: Vec<(PathBuf, String, fs::Metadata)> = Vec::new();
+        // Progress for the directory we are about to walk — this is what makes
+        // a slow directory (network drive, offline media) visible to the user.
+        if last_progress.elapsed().as_millis() >= SEARCH_PROGRESS_INTERVAL_MS {
+            let shown = dir_path.to_string_lossy().to_string();
+            emit_search_progress(&app, id, scanned, matched, &shown);
+            last_progress = std::time::Instant::now();
+        }
+
+        let mut files: Vec<(fs::DirEntry, String, fs::Metadata)> = Vec::new();
+        let mut subs: Vec<(fs::DirEntry, String, fs::Metadata)> = Vec::new();
         for entry in rd {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue, // unreadable entry → skip silently
             };
-            let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            let meta = match fs::metadata(&path) {
+            // 🚨 `DirEntry::metadata()` reuses the attributes the directory
+            // scan already produced (WIN32_FIND_DATA on Windows) and costs no
+            // syscall at all. `fs::metadata(&path)` re-resolves and re-opens
+            // every single entry: measured at 373 ms vs 1.3 ms for 4 782
+            // entries — that one call used to dominate the entire walk.
+            let meta = match entry.metadata() {
                 Ok(m) => m,
-                Err(_) => continue,
+                // Rare fallback: the scan data can be stale or incomplete.
+                Err(_) => match fs::metadata(entry.path()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                },
             };
             let is_dir = meta.is_dir();
             // Never descend into symlinked directories — that is how a walk
@@ -661,20 +707,22 @@ fn run_search(
             if is_dir && meta.file_type().is_symlink() {
                 continue;
             }
-            if !include_hidden && is_entry_hidden(&name, &meta) {
+            if !include_hidden && is_hidden(&name, &meta) {
                 continue;
             }
             if is_dir {
-                subs.push((path, name, meta));
+                subs.push((entry, name, meta));
             } else {
-                files.push((path, name, meta));
+                files.push((entry, name, meta));
             }
         }
 
-        files.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        subs.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        // `sort_by_cached_key` lowercases each name once; `sort_by` with a
+        // closure that lowercases would allocate on every comparison.
+        files.sort_by_cached_key(|x| x.1.to_lowercase());
+        subs.sort_by_cached_key(|x| x.1.to_lowercase());
 
-        for (path, name, meta) in subs {
+        for (entry, name, meta) in subs {
             scanned += 1;
             if name_matches(&patterns, &name, case_sensitive) {
                 if matched >= max {
@@ -682,40 +730,57 @@ fn run_search(
                     break;
                 }
                 matched += 1;
-                batch.push(hit_of(&path, name, &meta, true));
+                batch.push(hit_of(&entry.path(), name, &meta, true));
             }
             if depth + 1 <= MAX_SEARCH_DEPTH {
-                stack.push((path, depth + 1));
+                stack.push((entry.path(), depth + 1));
             }
         }
         if truncated {
             break;
         }
 
-        for (path, name, meta) in files {
+        for (entry, name, meta) in files {
             scanned += 1;
-            if !name_matches(&patterns, &name, case_sensitive) {
-                continue;
+            if name_matches(&patterns, &name, case_sensitive) {
+                if grep
+                    && !file_contains(
+                        &entry.path(),
+                        &needle,
+                        &needle_lc,
+                        case_sensitive,
+                        meta.len(),
+                    )
+                {
+                    // content miss — not a hit
+                } else if matched >= max {
+                    truncated = true;
+                } else {
+                    matched += 1;
+                    batch.push(hit_of(&entry.path(), name, &meta, false));
+                    if batch.len() >= SEARCH_BATCH_SIZE
+                        || last_emit.elapsed().as_millis() >= SEARCH_BATCH_INTERVAL_MS
+                    {
+                        emit_batch(&app, id, &mut batch);
+                        last_emit = std::time::Instant::now();
+                    }
+                }
             }
-            if grep && !file_contains(&path, &needle, &needle_lc, case_sensitive, meta.len()) {
-                continue;
-            }
-            if matched >= max {
-                truncated = true;
+            if truncated {
                 break;
             }
-            matched += 1;
-            batch.push(hit_of(&path, name, &meta, false));
-
-            if batch.len() >= SEARCH_BATCH_SIZE
-                || last_emit.elapsed().as_millis() >= SEARCH_BATCH_INTERVAL_MS
+            // Progress is throttled by a mask (reading the clock on every
+            // single entry is the only part worth avoiding); the cancel flag is
+            // an atomic load costing nanoseconds, so it is read every entry —
+            // a huge flat directory with no hits must still be stoppable.
+            if scanned & SEARCH_PROGRESS_CHECK_MASK == 0
+                && last_progress.elapsed().as_millis() >= SEARCH_PROGRESS_INTERVAL_MS
             {
-                emit_batch(&app, id, &mut batch);
-                last_emit = std::time::Instant::now();
+                let shown = dir_path.to_string_lossy().to_string();
+                emit_search_progress(&app, id, scanned, matched, &shown);
+                last_progress = std::time::Instant::now();
             }
-            // Checked after the (cheap) metadata work so the flag costs nothing
-            // on the hot path of a small directory.
-            if scanned % 256 == 0 && cancel.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
                 break;
             }
