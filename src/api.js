@@ -91,6 +91,24 @@ export async function moveItems(sources, destDir, overwrite = false) {
   return invoke("move_items", { sources, destDir, overwrite });
 }
 
+/// Kick off a recursive file search (Total Commander's Alt+F7).
+///
+/// `options` is `{ root, pattern, content, caseSensitive, includeHidden,
+/// maxResults }`. The command only spawns the worker thread and returns;
+/// results stream back as `search-batch` events and the scan ends with
+/// `search-done`. Both carry the `id` passed here, so a stale scan's events
+/// can be told apart from the current one.
+/// `pattern` follows TC syntax: `;`-separated, `*`/`?` wildcards, a bare word
+/// means "name contains", empty matches everything.
+export async function startSearch(id, options) {
+  return invoke("start_search", { id, options });
+}
+
+/// Ask the running search to stop at its next checkpoint.
+export async function cancelSearch() {
+  return invoke("cancel_search");
+}
+
 /// Load a named config blob from ~/.minitc/<name>.json.
 /// Resolves to the raw JSON string, or null when absent / unreadable.
 export async function loadConfig(name) {

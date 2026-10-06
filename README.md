@@ -38,6 +38,13 @@
   - 与其他 `F*` 快捷键（`F2` 重命名）一样可在**配置 → 快捷键设置**里改键；焦点在内联改名输入框内时 F5 不生效（那是文本框）
 - **鼠标拖拽移动**（跨应用、跨进程）：直接用鼠标把文件/文件夹（单个或 Ctrl/Shift 多选集合）拖到目标文件夹、空白区（= 当前目录）或「..」（= 父目录）即可移动到该目录；支持**跨栏拖拽**（从左栏拖到右栏目录），**也支持直接拖到资源管理器 / QQ / 7-Zip 等外部应用**——接收方拿到的是真实文件（Windows 走 `CF_HDROP` + `Preferred DropEffect=DROPEFFECT_MOVE`，macOS 走 `NSFilenamesPboardType`），行为与从资源管理器拖出完全一致；外部往 mini-tc 拖入的文件则按复制（copy）处理，落到文件行上忽略。落点高亮提示，移动/复制后自动刷新源栏与目标栏，冲突处理与同名项合并策略复用粘贴逻辑。
   - ⚠️ **依赖 `tauri-plugin-drag`（CrabNebula 维护的 drag-rs）**：前端在文件行 `dragstart` 时调用 `startDrag({ item: 绝对路径, mode: 'move' })`，Rust 后端走 Windows 的 OLE `DoDragDrop` / macOS 的 `NSPasteboard` 直接写出 `CF_HDROP` / `NSFilenamesPboardType`。预览图标故意传一个无法解码的字节（0x00），让 drag-rs 跳过 `IDragSourceHelper::InitializeFromBitmap`，由 OS 从 `CF_HDROP` 自动渲染文件图标（多文件显示「多文件缩略图 + 数量」），行为与资源管理器完全一致；如果传了真实图标则会覆盖 OS 默认渲染，反而不如默认直观。Linux 下 drag-rs 需 GTK 应用窗口（winit 类不支持），跨进程拖出会失效，本项目不针对 Linux 保证。`dragDropEnabled: true` 让 Tauri 接管 webview 拖放，配合 `tauri://drag-enter / drag-over / drag-drop / drag-leave` 事件拿到光标坐标 + 文件路径；前端 `elementFromPoint(x, y)` 反推落点（目录行 / `..` / 空白区 / 文件行），自拖自时走 move（cut），外部拖入时走 copy。
+- **递归文件搜索**（`Alt+F7`，`Ctrl+F` 同效，与 Total Commander 一致）：在任意根目录下按文件名递归查找，可在**当前活动面板**中直接跳转到结果所在目录并选中该文件。
+  - 文件名语法沿用 TC：**分号分隔多个模式**（`*.txt;*.md`）、`*`/`?` 通配符、**不含通配符的普通词按「名字包含」匹配**、留空则列出全部。另有「区分大小写」「包含隐藏文件」两个开关。
+  - 可选**内容搜索**：只保留文件内容里包含指定文字的条目；自动跳过二进制（前 4KB 含 NUL 字节）和大于 8MB 的文件，避免扫大文件拖慢整个遍历。
+  - 后端 `start_search` 在**独立线程**里跑，结果以 `search-batch` 事件**分批流式**回传（每 200 条或 200ms 一批），扫描结束发 `search-done`；界面全程可响应，随时可点「停止」取消（`cancel_search` 置标志位，线程在下一个检查点退出）。新搜索会自动取消上一次未完成的扫描，旧结果不会串进新列表（每批结果带 `id` 校验）。
+  - 结果列表是**虚拟滚动**的（只渲染可视行），上万条也不卡；默认上限 5000 条，达到上限状态栏会提示「结果已达上限」。
+  - 双击 / 回车 = 跳转到该文件（对侧是预览时会自动先关掉预览）；右键菜单可「跳转到该文件」「打开所在目录」「复制完整路径」「用系统默认程序打开」。
+  - 与 `/` 键的即时过滤是两种东西：`/` 只过滤**当前目录**、轻量即时；搜索面板是**跨目录递归**的重量级查找，两者并存。
 - **删除 / 永久删除**：`Delete`（`Ctrl/Cmd+Backspace` 同效）移入系统回收站；**`Shift+Delete` 永久删除**——绕过回收站、无法恢复，按下去直接抹除，不弹确认框。两者在权限不足（只读、被占用、系统文件）时都自动回退到 **UAC 提权删除**
   - 删除后光标自动落到**最后删除项的下一个文件**（若删的是末尾一段，则回退到它前面最近的一个幸存项），单选与多选行为一致，不会清空选中
 - **窗口切回自动恢复选中与键盘焦点**：从外部程序（例如 7-Zip 解压窗口）切回 mini-tc 时，自动重新列目录、恢复切换前的选中项并滚动到可见位置、把键盘焦点交还给文件列表，方向键可直接继续操作；正在输入（地址栏 / 文件名过滤 / 内联改名）或焦点在预览区内时不抢焦点
@@ -161,11 +168,12 @@ mini-tc/
 │       ├── ContextMenu.vue      # 通用右键菜单组件
 │       ├── SettingsDialog.vue   # 文件预览设置
 │       ├── GeneralSettingsDialog.vue # 通用设置（声明式 ITEMS schema）
+│       ├── SearchDialog.vue     # 递归文件搜索（Alt+F7）：流式结果 + 虚拟滚动
 │       └── ShortcutsDialog.vue  # 快捷键设置（独立页面）
 ├── src-tauri/                # Rust 后端
 │   ├── src/
 │   │   ├── main.rs
-│   │   ├── lib.rs            # list_directory / read_file_preview / extract_archive / get_archive_tools 等
+│   │   ├── lib.rs            # list_directory / read_file_preview / extract_archive / get_archive_tools / start_search 等
 │   │   └── window_state.rs   # 窗口位置/大小/最大化/全屏持久化（setup 阶段恢复 + 防抖落盘）
 │   ├── tauri.conf.json
 │   └── icons/

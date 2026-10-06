@@ -39,6 +39,9 @@
           </div>
         </div>
       </div>
+      <div class="menu-item" @click="openSearch">
+        <span>搜索</span>
+      </div>
       <div class="menu-item" @click="toggleHelpMenu">
         <span>帮助</span>
         <span class="menu-arrow">▾</span>
@@ -105,6 +108,16 @@
       v-if="shortcutsVisible"
       @close="onShortcutsClose"
       @save="onShortcutsSave"
+    />
+
+    <!-- Recursive file search (Total Commander's Alt+F7) -->
+    <SearchDialog
+      v-if="searchVisible"
+      :initial-path="searchRoot"
+      @close="searchVisible = false"
+      @use-current-dir="onSearchUseCurrentDir"
+      @reveal="onSearchReveal"
+      @open-dir="onSearchOpenDir"
     />
 
     <!-- Main content: two panels with a draggable separator -->
@@ -235,6 +248,7 @@ import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import GeneralSettingsDialog from "./components/GeneralSettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
+import SearchDialog from "./components/SearchDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import * as alwaysOnTop from "./alwaysOnTop.js";
@@ -359,6 +373,49 @@ function onShortcutsClose() {
 async function onShortcutsSave() {
   await saveShortcuts();
   shortcutsVisible.value = false;
+}
+
+// ── Recursive file search (Alt+F7 / Ctrl+F) ──
+// The dialog owns the whole flow (backend thread + streamed events); this side
+// only decides WHERE a hit should be revealed: the panel the user was last
+// working in, i.e. the active one.
+const searchVisible = ref(false);
+// Root directory the dialog starts from — refreshed from the active panel each
+// time it is opened, and on demand via 「当前目录」 while it is open.
+const searchRoot = ref("");
+
+function currentPanelPath() {
+  return getActivePanelRef()?.currentPath || "";
+}
+
+function openSearch() {
+  configMenuOpen.value = false;
+  helpMenuOpen.value = false;
+  searchRoot.value = currentPanelPath();
+  searchVisible.value = true;
+}
+
+function onSearchUseCurrentDir() {
+  searchRoot.value = currentPanelPath();
+}
+
+// Jump to a hit: close the dialog, then navigate the active panel to the hit's
+// directory and select the file. If that panel is currently showing a preview,
+// close the preview first (the panel is hidden behind it and can't be seen).
+function onSearchReveal({ dir, name } = {}) {
+  searchVisible.value = false;
+  if (!dir) return;
+  if (previewVisible.value && previewPanel.value === activePanel.value) closePreview();
+  const panel = getActivePanelRef();
+  panel?.revealFile?.(dir, name);
+}
+
+// "打开所在目录": go to the directory without selecting anything inside it.
+function onSearchOpenDir(dir) {
+  searchVisible.value = false;
+  if (!dir) return;
+  if (previewVisible.value && previewPanel.value === activePanel.value) closePreview();
+  getActivePanelRef()?.goTo?.(dir);
 }
 
 const updateDialog = ref({
@@ -1514,6 +1571,18 @@ onMounted(() => {
       e.preventDefault();
       markHandled(e);
       togglePreview();
+      return;
+    }
+
+    // Alt+F7 / Ctrl+F: recursive file search. Plain function-ish keys with no
+    // webview meaning of their own, so they're consumed even while an input has
+    // focus — except inside the search dialog itself (the dialog owns its own
+    // Enter/Esc handling and the user may be typing a pattern).
+    if (matches("search.open", e)) {
+      if (searchVisible.value) return;
+      e.preventDefault();
+      markHandled(e);
+      openSearch();
       return;
     }
 

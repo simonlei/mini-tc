@@ -371,6 +371,402 @@ fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
     Ok(total)
 }
 
+// ── Recursive file search (Total Commander's Alt+F7) ──
+//
+// The walk runs on a plain background `std::thread` and streams hits to the
+// frontend as `search-batch` events, so scanning a huge tree never blocks the
+// UI and can be cancelled mid-flight. `start_search` returns as soon as the
+// thread is spawned; completion arrives through `search-done`.
+//
+// Pattern syntax follows Total Commander: `;`-separated alternatives, `*`/`?`
+// wildcards, and a bare word means "name contains". Empty = match everything.
+
+/// One hit.
+#[derive(Serialize, Clone)]
+pub struct SearchHit {
+    pub path: String,
+    pub name: String,
+    pub dir: String, // parent directory of the hit
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: i64,
+    pub extension: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SearchBatch {
+    id: u64,
+    hits: Vec<SearchHit>,
+}
+
+#[derive(Serialize, Clone)]
+struct SearchDone {
+    id: u64,
+    scanned: u64,
+    matched: u64,
+    cancelled: bool,
+    truncated: bool,
+    errors: Vec<String>,
+}
+
+/// Search request from the frontend. `max_results` is a hard cap (clamped
+/// server-side) so a pattern like `*` over C:\ can't balloon the result list.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchOptions {
+    pub root: String,
+    pub pattern: String,
+    pub content: String,
+    pub case_sensitive: bool,
+    pub include_hidden: bool,
+    pub max_results: u64,
+}
+
+// Files bigger than this are never content-grepped (binary or not, reading
+// hundreds of MB per candidate would dominate the whole scan).
+const CONTENT_SCAN_LIMIT: u64 = 8 * 1024 * 1024;
+// Depth guard: symlinked directory trees are already skipped, but junctions /
+// reparse points can still nest; this keeps the walk finite.
+const MAX_SEARCH_DEPTH: usize = 64;
+const SEARCH_BATCH_SIZE: usize = 200;
+const SEARCH_BATCH_INTERVAL_MS: u128 = 200;
+
+/// Cancellation flag of the search currently running (if any). Starting a new
+/// search cancels the previous one, so results from a stale scan can never
+/// land in a fresh result list.
+static SEARCH_CANCEL: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+    std::sync::Mutex::new(None);
+
+/// Kick off a background search. Returns immediately; listen for
+/// `search-batch` / `search-done`.
+#[tauri::command]
+fn start_search(app: tauri::AppHandle, id: u64, options: SearchOptions) -> Result<(), String> {
+    let root = Path::new(&options.root);
+    if !root.is_dir() {
+        return Err(format!("搜索目录不存在: {}", options.root));
+    }
+
+    // Cancel whatever is still running from a previous query.
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut guard = SEARCH_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = guard.take() {
+            prev.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        *guard = Some(flag.clone());
+    }
+
+    std::thread::spawn(move || run_search(app, id, options, flag));
+    Ok(())
+}
+
+/// Ask the running search to stop. It stops at the next checkpoint and still
+/// emits `search-done` (with `cancelled: true`) so the UI can settle.
+#[tauri::command]
+fn cancel_search() {
+    let guard = SEARCH_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(flag) = guard.as_ref() {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Pre-parsed pattern: (original, lowercase, has_wildcard).
+type Pattern = (String, String, bool);
+
+fn parse_patterns(raw: &str) -> Vec<Pattern> {
+    raw.split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            (
+                s.to_string(),
+                s.to_lowercase(),
+                s.contains('*') || s.contains('?'),
+            )
+        })
+        .collect()
+}
+
+/// Classic iterative glob match over `*` (any run) and `?` (one char).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn name_matches(patterns: &[Pattern], name: &str, case_sensitive: bool) -> bool {
+    if patterns.is_empty() {
+        return true; // no pattern → everything matches
+    }
+    let lower = name.to_lowercase();
+    for (orig, low, wildcard) in patterns {
+        if *wildcard {
+            let (p, n) = if case_sensitive {
+                (orig.as_str(), name)
+            } else {
+                (low.as_str(), lower.as_str())
+            };
+            if glob_match(p, n) {
+                return true;
+            }
+        } else {
+            let (hay, needle) = if case_sensitive {
+                (name, orig.as_str())
+            } else {
+                (lower.as_str(), low.as_str())
+            };
+            if hay.contains(needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_entry_hidden(name: &str, meta: &fs::Metadata) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+    }
+    false
+}
+
+/// True when `path` holds `needle`. Skips binaries (NUL byte in the first
+/// 4 KB) and files above `CONTENT_SCAN_LIMIT` — grepping those is either
+/// meaningless or far too slow to do inside a directory walk.
+fn file_contains(
+    path: &Path,
+    needle: &str,
+    needle_lc: &str,
+    case_sensitive: bool,
+    size: u64,
+) -> bool {
+    if size == 0 || size > CONTENT_SCAN_LIMIT {
+        return false;
+    }
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let head = bytes.len().min(4096);
+    if bytes[..head].contains(&0u8) {
+        return false;
+    }
+    let hay = String::from_utf8_lossy(&bytes);
+    if case_sensitive {
+        hay.contains(needle)
+    } else {
+        hay.to_lowercase().contains(needle_lc)
+    }
+}
+
+fn emit_batch(app: &tauri::AppHandle, id: u64, batch: &mut Vec<SearchHit>) {
+    if batch.is_empty() {
+        return;
+    }
+    let hits = std::mem::take(batch);
+    let _ = app.emit("search-batch", SearchBatch { id, hits });
+}
+
+fn run_search(
+    app: tauri::AppHandle,
+    id: u64,
+    opt: SearchOptions,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let patterns = parse_patterns(&opt.pattern);
+    let needle = opt.content.trim().to_string();
+    let needle_lc = needle.to_lowercase();
+    let grep = !needle.is_empty();
+    let case_sensitive = opt.case_sensitive;
+    let include_hidden = opt.include_hidden;
+    let max = opt.max_results.clamp(1, 50_000) as u64;
+
+    let mut batch: Vec<SearchHit> = Vec::new();
+    let mut scanned: u64 = 0;
+    let mut matched: u64 = 0;
+    let mut errors: Vec<String> = Vec::new();
+    let mut cancelled = false;
+    let mut truncated = false;
+    let mut last_emit = std::time::Instant::now();
+
+    // Iterative DFS: an explicit stack keeps multi-thousand-level trees off the
+    // (1 MB) thread stack. Children are pushed in reverse name order so the
+    // LIFO stack visits them in name order — the streamed result list therefore
+    // comes out sorted by directory then by name, which is what the user sees.
+    let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(&opt.root), 0)];
+
+    while let Some((dir_path, depth)) = stack.pop() {
+        let rd = match fs::read_dir(&dir_path) {
+            Ok(rd) => rd,
+            Err(e) => {
+                if errors.len() < 5 {
+                    errors.push(format!("{} ({})", dir_path.display(), e));
+                }
+                continue;
+            }
+        };
+
+        let mut files: Vec<(PathBuf, String, fs::Metadata)> = Vec::new();
+        let mut subs: Vec<(PathBuf, String, fs::Metadata)> = Vec::new();
+        for entry in rd {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue, // unreadable entry → skip silently
+            };
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let is_dir = meta.is_dir();
+            // Never descend into symlinked directories — that is how a walk
+            // turns into an infinite loop.
+            if is_dir && meta.file_type().is_symlink() {
+                continue;
+            }
+            if !include_hidden && is_entry_hidden(&name, &meta) {
+                continue;
+            }
+            if is_dir {
+                subs.push((path, name, meta));
+            } else {
+                files.push((path, name, meta));
+            }
+        }
+
+        files.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        subs.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+        for (path, name, meta) in subs {
+            scanned += 1;
+            if name_matches(&patterns, &name, case_sensitive) {
+                if matched >= max {
+                    truncated = true;
+                    break;
+                }
+                matched += 1;
+                batch.push(hit_of(&path, name, &meta, true));
+            }
+            if depth + 1 <= MAX_SEARCH_DEPTH {
+                stack.push((path, depth + 1));
+            }
+        }
+        if truncated {
+            break;
+        }
+
+        for (path, name, meta) in files {
+            scanned += 1;
+            if !name_matches(&patterns, &name, case_sensitive) {
+                continue;
+            }
+            if grep && !file_contains(&path, &needle, &needle_lc, case_sensitive, meta.len()) {
+                continue;
+            }
+            if matched >= max {
+                truncated = true;
+                break;
+            }
+            matched += 1;
+            batch.push(hit_of(&path, name, &meta, false));
+
+            if batch.len() >= SEARCH_BATCH_SIZE
+                || last_emit.elapsed().as_millis() >= SEARCH_BATCH_INTERVAL_MS
+            {
+                emit_batch(&app, id, &mut batch);
+                last_emit = std::time::Instant::now();
+            }
+            // Checked after the (cheap) metadata work so the flag costs nothing
+            // on the hot path of a small directory.
+            if scanned % 256 == 0 && cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+        }
+
+        if batch.len() >= SEARCH_BATCH_SIZE
+            || last_emit.elapsed().as_millis() >= SEARCH_BATCH_INTERVAL_MS
+        {
+            emit_batch(&app, id, &mut batch);
+            last_emit = std::time::Instant::now();
+        }
+        if cancelled || cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+    }
+
+    emit_batch(&app, id, &mut batch);
+    let _ = app.emit(
+        "search-done",
+        SearchDone {
+            id,
+            scanned,
+            matched,
+            cancelled,
+            truncated,
+            errors,
+        },
+    );
+}
+
+fn hit_of(path: &Path, name: String, meta: &fs::Metadata, is_dir: bool) -> SearchHit {
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let extension = Path::new(&name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+    SearchHit {
+        path: path.to_string_lossy().to_string(),
+        name,
+        dir,
+        is_dir,
+        size: if is_dir { 0 } else { meta.len() },
+        modified: system_time_to_millis(meta.modified()),
+        extension,
+    }
+}
+
 /// Preview data returned to the frontend.
 #[derive(Serialize)]
 pub struct FilePreview {
@@ -2423,6 +2819,8 @@ pub fn run() {
             join_path,
             read_file_preview,
             get_dir_size,
+            start_search,
+            cancel_search,
             delete_to_trash,
             delete_permanently,
             delete_with_admin,
@@ -2443,4 +2841,50 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_handles_star_and_question() {
+        assert!(glob_match("*.txt", "a.txt"));
+        assert!(glob_match("*.txt", ".txt"));
+        assert!(!glob_match("*.txt", "a.txt.bak"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        // `*` must be able to match an empty run and to span separators.
+        assert!(glob_match("*name*", "some long name here.txt"));
+        // A mid-pattern `*` spans arbitrary text (including separators).
+        assert!(glob_match("a*b", "acb"));
+        assert!(glob_match("2024*final.pdf", "2024_report_final.pdf"));
+    }
+
+    #[test]
+    fn name_matches_wildcard_and_substring() {
+        let pats = parse_patterns("*.txt;*.md");
+        assert!(name_matches(&pats, "notes.txt", false));
+        assert!(name_matches(&pats, "NOTES.TXT", false)); // case-insensitive
+        assert!(!name_matches(&pats, "NOTES.TXT", true)); // case-sensitive
+        assert!(!name_matches(&pats, "notes.rs", false));
+
+        // No wildcard → substring semantics (Total Commander behaviour).
+        let bare = parse_patterns("report");
+        assert!(name_matches(&bare, "2024 report final.pdf", false));
+        assert!(!name_matches(&bare, "re port.pdf", false));
+
+        // Empty pattern matches everything.
+        let empty = parse_patterns("");
+        assert!(name_matches(&empty, "anything", false));
+    }
+
+    #[test]
+    fn patterns_split_on_semicolon_and_trim() {
+        let pats = parse_patterns(" *.rs ; *.toml ;; ");
+        assert_eq!(pats.len(), 2);
+        assert!(name_matches(&pats, "main.rs", false));
+        assert!(name_matches(&pats, "Cargo.toml", false));
+        assert!(!name_matches(&pats, "main.js", false));
+    }
 }

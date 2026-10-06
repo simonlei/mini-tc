@@ -78,7 +78,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
@@ -1144,6 +1144,24 @@ defineExpose({
   jumpToLocked: () => jumpToLocked(activeTabId.value),
   refresh,
   refreshDrives,
+  // Jump the panel to an arbitrary directory (used by the search dialog's
+  // "打开所在目录" action).
+  goTo: (path) => navigateTo(path),
+  // Navigate to `dir` and select `name` inside it — how a search result is
+  // revealed. Same directory → just move the selection; different directory →
+  // arm `pendingSelectName` so the selection lands once the listing arrives
+  // (FileList consumes it on the entries change, then emits
+  // `pending-select-resolved`).
+  revealFile: (dir, name) => {
+    if (!activeTab.value || !dir) return;
+    if (activeTab.value.path === dir) {
+      fileListRef.value?.selectName?.(name);
+    } else {
+      pendingSelectName.value = name;
+      navigateTo(dir);
+    }
+    nextTick(() => fileListRef.value?.focusList?.());
+  },
   moveSelection: (delta) => fileListRef.value?.moveSelection(delta),
   selectName: (name) => fileListRef.value?.selectName(name),
   getNextVideoEntry: (name) => fileListRef.value?.getNextVideoEntry(name),
