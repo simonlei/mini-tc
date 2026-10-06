@@ -4,6 +4,7 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use tauri::Emitter;
 
+mod search_log;
 mod window_state;
 
 #[cfg(windows)]
@@ -470,10 +471,24 @@ static SEARCH_CANCEL: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::
 /// `search-batch` / `search-done`.
 #[tauri::command]
 fn start_search(app: tauri::AppHandle, id: u64, options: SearchOptions) -> Result<(), String> {
+    search_log::install_panic_hook();
     let root = Path::new(&options.root);
     if !root.is_dir() {
+        search_log::log(&format!(
+            "start_search id={id} REJECTED: not a directory: {:?}",
+            options.root
+        ));
         return Err(format!("搜索目录不存在: {}", options.root));
     }
+    search_log::log(&format!(
+        "start_search id={id} root={:?} pattern={:?} content_len={} case_sensitive={} include_hidden={} max_results={}",
+        options.root,
+        options.pattern,
+        options.content.len(),
+        options.case_sensitive,
+        options.include_hidden,
+        options.max_results
+    ));
 
     // Cancel whatever is still running from a previous query.
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -481,11 +496,45 @@ fn start_search(app: tauri::AppHandle, id: u64, options: SearchOptions) -> Resul
         let mut guard = SEARCH_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(prev) = guard.take() {
             prev.store(true, std::sync::atomic::Ordering::SeqCst);
+            search_log::log(&format!("start_search id={id} cancelled the previous scan"));
         }
         *guard = Some(flag.clone());
     }
 
-    std::thread::spawn(move || run_search(app, id, options, flag));
+    let log_app = app.clone();
+    let log_id = id;
+    let log_flag = flag.clone();
+    std::thread::spawn(move || {
+        search_log::log(&format!("worker thread up: id={log_id}"));
+        // A panic on this thread would otherwise end it silently: no
+        // `search-done`, so the dialog would spin forever. Catch it and report
+        // a failed run instead.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_search(app, id, options, flag);
+        }));
+        if outcome.is_err() {
+            search_log::log(&format!("worker thread PANICKED: id={log_id}"));
+            let _ = log_app.emit(
+                "search-done",
+                SearchDone {
+                    id: log_id,
+                    scanned: 0,
+                    matched: 0,
+                    cancelled: true,
+                    truncated: false,
+                    errors: vec!["搜索线程异常终止，详情见 search.log".to_string()],
+                },
+            );
+        }
+        // Release the cancel slot so a finished scan is not mistaken for a
+        // running one by the next `cancel_search`.
+        let mut guard = SEARCH_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cur) = guard.as_ref() {
+            if std::sync::Arc::ptr_eq(cur, &log_flag) {
+                *guard = None;
+            }
+        }
+    });
     Ok(())
 }
 
@@ -608,7 +657,15 @@ fn emit_batch(app: &tauri::AppHandle, id: u64, batch: &mut Vec<SearchHit>) {
         return;
     }
     let hits = std::mem::take(batch);
-    let _ = app.emit("search-batch", SearchBatch { id, hits });
+    let count = hits.len();
+    match app.emit("search-batch", SearchBatch { id, hits }) {
+        Ok(()) => search_log::log(&format!("emitted search-batch: id={id} hits={count}")),
+        // Previously the error was dropped with `let _ =`, so a failing emit
+        // looked exactly like a search that produced nothing.
+        Err(e) => search_log::log(&format!(
+            "emit search-batch FAILED: id={id} hits={count}: {e}"
+        )),
+    }
 }
 
 // NOTE: not `emit_progress` — that name is taken by the copy/transfer one.
@@ -619,7 +676,8 @@ fn emit_search_progress(
     matched: u64,
     current: &str,
 ) {
-    let _ = app.emit(
+    let message = format!("progress: id={id} scanned={scanned} matched={matched} at={current}");
+    match app.emit(
         "search-progress",
         SearchProgress {
             id,
@@ -627,7 +685,10 @@ fn emit_search_progress(
             matched,
             current: current.to_string(),
         },
-    );
+    ) {
+        Ok(()) => search_log::log(&message),
+        Err(e) => search_log::log(&format!("{message} — emit FAILED: {e}")),
+    }
 }
 
 fn run_search(
@@ -654,6 +715,12 @@ fn run_search(
     let mut truncated = false;
     let mut last_emit = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
+    let started = std::time::Instant::now();
+    let dirs_walked = std::sync::atomic::AtomicU64::new(0);
+    search_log::log(&format!(
+        "run_search start: id={id} patterns={:?} grep={grep} max={max}",
+        patterns.iter().map(|p| p.0.as_str()).collect::<Vec<_>>()
+    ));
 
     // Iterative DFS: an explicit stack keeps multi-thousand-level trees off the
     // (1 MB) thread stack. Children are pushed in reverse name order so the
@@ -662,9 +729,15 @@ fn run_search(
     let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(&opt.root), 0)];
 
     while let Some((dir_path, depth)) = stack.pop() {
+        dirs_walked.fetch_add(1, Ordering::Relaxed);
+        search_log::log(&format!(
+            "enter dir (depth {depth}): {}",
+            dir_path.display()
+        ));
         let rd = match fs::read_dir(&dir_path) {
             Ok(rd) => rd,
             Err(e) => {
+                search_log::log(&format!("read_dir failed: {} : {e}", dir_path.display()));
                 if errors.len() < 5 {
                     errors.push(format!("{} ({})", dir_path.display(), e));
                 }
@@ -717,6 +790,13 @@ fn run_search(
             }
         }
 
+        search_log::log(&format!(
+            "  listed {}: {} files, {} subdirs (scanned so far {scanned})",
+            dir_path.display(),
+            files.len(),
+            subs.len()
+        ));
+
         // `sort_by_cached_key` lowercases each name once; `sort_by` with a
         // closure that lowercases would allocate on every comparison.
         files.sort_by_cached_key(|x| x.1.to_lowercase());
@@ -730,6 +810,7 @@ fn run_search(
                     break;
                 }
                 matched += 1;
+                search_log::log(&format!("  hit [dir] {}", entry.path().display()));
                 batch.push(hit_of(&entry.path(), name, &meta, true));
             }
             if depth + 1 <= MAX_SEARCH_DEPTH {
@@ -757,6 +838,7 @@ fn run_search(
                     truncated = true;
                 } else {
                     matched += 1;
+                    search_log::log(&format!("  hit [file] {}", entry.path().display()));
                     batch.push(hit_of(&entry.path(), name, &meta, false));
                     if batch.len() >= SEARCH_BATCH_SIZE
                         || last_emit.elapsed().as_millis() >= SEARCH_BATCH_INTERVAL_MS
@@ -799,17 +881,24 @@ fn run_search(
     }
 
     emit_batch(&app, id, &mut batch);
-    let _ = app.emit(
-        "search-done",
-        SearchDone {
-            id,
-            scanned,
-            matched,
-            cancelled,
-            truncated,
-            errors,
-        },
-    );
+    search_log::log(&format!(
+        "run_search done: id={id} scanned={scanned} matched={matched} cancelled={cancelled} truncated={truncated} errors={} dirs={} elapsed={:?}",
+        errors.len(),
+        dirs_walked.load(Ordering::Relaxed),
+        started.elapsed()
+    ));
+    let done = SearchDone {
+        id,
+        scanned,
+        matched,
+        cancelled,
+        truncated,
+        errors,
+    };
+    match app.emit("search-done", done) {
+        Ok(()) => search_log::log(&format!("emitted search-done: id={id}")),
+        Err(e) => search_log::log(&format!("emit search-done FAILED: id={id}: {e}")),
+    }
 }
 
 fn hit_of(path: &Path, name: String, meta: &fs::Metadata, is_dir: bool) -> SearchHit {

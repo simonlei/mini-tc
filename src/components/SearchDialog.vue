@@ -118,6 +118,10 @@
 
       <div class="search-footer">
         <span class="footer-hint">右键结果可复制路径 / 打开所在目录</span>
+        <span class="footer-hint log-hint" :title="logPathHint" @click="showLogHint = !showLogHint">
+          诊断日志
+        </span>
+        <span v-if="showLogHint" class="footer-hint log-path">{{ logPathHint }}</span>
         <button class="btn-secondary" @click="$emit('close')">关闭</button>
       </div>
     </div>
@@ -179,6 +183,10 @@ const currentDirShort = computed(() => {
 });
 const error = ref("");
 const activeIndex = ref(-1);
+const showLogHint = ref(false);
+// Mirrors `search_log::log_path()` on the Rust side; shown on demand so the
+// default footer stays quiet.
+const logPathHint = "%USERPROFILE%\\.minitc\\logs\\search.log";
 
 const patternInput = ref(null);
 const viewportRef = ref(null);
@@ -189,6 +197,7 @@ let ticker = null;
 let unlistenBatch = null;
 let unlistenDone = null;
 let unlistenProgress = null;
+let stopFallback = null;
 
 // The parent re-emits `initialPath` when the user hits 「当前目录」.
 watch(
@@ -259,21 +268,39 @@ function onListKeydown(e) {
 }
 
 // ── Search lifecycle ──
+//
+// 🚨 `listen` hands the callback an *Event wrapper* `{ event, id, payload }` —
+// NOT the payload itself. `Event.id` is a globally increasing event sequence
+// number, so reading `payload.id` off the wrapper silently yields the wrong
+// number (and `payload.hits` is undefined), which made every batch look stale
+// and left the dialog spinning forever. Always unwrap `.payload` first.
+function unwrap(event, name) {
+  const p = event?.payload;
+  if (!p || typeof p !== "object") {
+    console.warn(`[search] ${name}: event carried no payload`, event);
+    return null;
+  }
+  return p;
+}
 
-function onProgress(payload) {
+function onProgress(event) {
+  const payload = unwrap(event, "search-progress");
   if (!payload || payload.id !== searchId) return; // stale scan
   scanned.value = payload.scanned || 0;
   matched.value = payload.matched || 0;
   currentDir.value = payload.current || "";
 }
 
-function onBatch(payload) {
+function onBatch(event) {
+  const payload = unwrap(event, "search-batch");
   if (!payload || payload.id !== searchId) return; // stale scan
   hits.value = hits.value.concat(payload.hits || []);
   if (activeIndex.value < 0 && hits.value.length) activeIndex.value = 0;
 }
 
-function onDone(payload) {
+function onDone(event) {
+  const payload = unwrap(event, "search-done");
+  clearTimeout(stopFallback);
   if (!payload || payload.id !== searchId) return;
   searching.value = false;
   currentDir.value = "";
@@ -336,6 +363,15 @@ async function run() {
 async function stop() {
   if (!searching.value) return;
   await cancelSearch().catch(() => {});
+  // Safety net: a worker that died without emitting `search-done` (panic, lost
+  // event) would otherwise leave the dialog spinning forever with no way out.
+  clearTimeout(stopFallback);
+  stopFallback = setTimeout(() => {
+    if (!searching.value) return;
+    searching.value = false;
+    stopTicker();
+    error.value = "搜索未正常结束（后端可能已异常退出），详情见诊断日志";
+  }, 1500);
 }
 
 // ── Result actions ──
@@ -474,6 +510,7 @@ onBeforeUnmount(() => {
   // and pushing events nobody listens to any more.
   if (searching.value) cancelSearch().catch(() => {});
   stopTicker();
+  clearTimeout(stopFallback);
   unlistenBatch?.();
   unlistenDone?.();
   unlistenProgress?.();
@@ -820,5 +857,18 @@ onBeforeUnmount(() => {
   flex: 1;
   font-size: 11px;
   color: var(--text-dim);
+}
+
+/* Click-to-reveal of the backend log location, for when a scan misbehaves. */
+.log-hint {
+  flex: none;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.log-path {
+  flex: none;
+  font-family: Consolas, monospace;
+  opacity: 0.85;
 }
 </style>
