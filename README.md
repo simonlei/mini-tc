@@ -81,11 +81,25 @@
 
 ## 前置条件
 
-- [Rust](https://rustup.rs/) (stable-msvc on Windows)
+- [Rust](https://rustup.rs/) (stable-msvc on Windows，**1.99.0+**)
 - [Node.js](https://nodejs.org/) >= 18
 - Windows：Visual Studio 2022 Build Tools（含 C++ 桌面开发工作负载）
 - macOS：Xcode Command Line Tools
 - Linux：`build-essential` + `libwebkit2gtk-4.1-dev` 等
+
+> **Windows 编译**：请装 **2022 Build Tools**（含 Community / Professional / Enterprise /
+> **BuildTools** 四个版本均可）。`dev.bat` / `dev.sh` 的 MSVC 探测会扫描这几个路径，
+> 但请注意把它们装在**默认路径下**（`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`），
+> 否则探测会漏检并静默退回 rustup 默认工具链，导致 `link.exe` 找不到。
+
+> **⚠️ 若`cargo check` 报 `rmeta encoder panic` 或出现 `拒绝访问 (os error 5)`**：
+> 这多半不是 rustc 缺陷，而是**安全软件 / 零信任客户端的文件操作拦截**
+> （如腾讯 iOA 的 `fileflow` 模块等minifilter 驱动）。它会劫持 rustc 写增量编译目录的
+> 写入动作，导致增量缓存残缺、下次改动时 metadata encoder 取不到 key 而 panic；
+> 同时也会让构建产物被搬进回收站。**排查方法**：看 `cargo check` 输出里有没有
+> `error copying object file ... to incremental directory` 这条警告——
+> **它就是根因信号**。处置方式是关掉对应软件的文件管控模块，而不是去禁增量编译。
+> 验证时务必做**真实的源码内容改动**，`touch` 文件不会触发这个 panic。
 
 ## 快速开始
 

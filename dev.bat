@@ -71,9 +71,6 @@ for %%v in (
 )
 :vcvars_found
 
-REM Workaround for rustc ICE - disable incremental compilation
-set "CARGO_INCREMENTAL=0"
-
 REM Script start timestamp (before any probing) -> used for "total".
 REM Inlined rather than "call :stamp T0": at top level a subroutine call that
 REM ends in "goto :eof" terminates the whole script, skipping the dispatch

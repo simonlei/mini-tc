@@ -48,9 +48,6 @@ print_elapsed() {
   fi
 }
 
-# Rust 1.97.1 ICE 规避：禁用增量编译
-export CARGO_INCREMENTAL=0
-
 # ---- 路径常量（基于脚本所在目录，跨机器通用，无需硬编码项目路径） ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}"

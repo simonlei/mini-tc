@@ -1,3 +1,0 @@
-# Workaround for rustc 1.97.1 ICE (rmeta encoder panic with incremental compilation)
-[build]
-incremental = false

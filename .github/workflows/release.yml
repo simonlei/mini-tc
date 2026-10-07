@@ -99,8 +99,6 @@ jobs:
           # 将来配置 Apple 证书后，在下方加回：
           #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
           #   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
-          # 规避 rustc 1.97.1 ICE（与 dev.sh 保持一致）
-          CARGO_INCREMENTAL: '0'
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: 'MiniTC ${{ github.event.inputs.tag || github.ref_name }}'
