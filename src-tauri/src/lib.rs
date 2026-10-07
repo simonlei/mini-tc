@@ -52,6 +52,12 @@ pub struct FileEntry {
     pub modified: i64, // milliseconds since UNIX_EPOCH
     pub extension: String,
     pub is_hidden: bool,
+    /// Absolute path of this entry. The frontend historically rebuilt this by
+    /// joining the panel's current directory with `name` — that works for a
+    /// real listing but breaks for the "search results" pseudo-directory,
+    /// whose rows come from many different parents. Carrying the absolute
+    /// path on the row itself is what lets one FileList serve both.
+    pub path: String,
 }
 
 /// The result of `list_directory`: the entries plus whether the path has a
@@ -148,12 +154,13 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
         let hidden = is_hidden(&name, &metadata);
 
         result.push(FileEntry {
-            name,
+            name: name.clone(),
             is_dir: metadata.is_dir(),
             size: if metadata.is_dir() { 0 } else { metadata.len() },
             modified: system_time_to_millis(metadata.modified()),
             extension,
             is_hidden: hidden,
+            path: file_path.to_string_lossy().to_string(),
         });
     }
 
@@ -405,6 +412,9 @@ pub struct SearchHit {
     pub size: u64,
     pub modified: i64,
     pub extension: String,
+    /// Carried so a hit dropped into the file panel renders with the same
+    /// greyed-out styling a real listing would give it.
+    pub is_hidden: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -918,6 +928,10 @@ fn hit_of(path: &Path, name: String, meta: &fs::Metadata, is_dir: bool) -> Searc
         size: if is_dir { 0 } else { meta.len() },
         modified: system_time_to_millis(meta.modified()),
         extension,
+        is_hidden: is_hidden(
+            &path.file_name().unwrap_or_default().to_string_lossy(),
+            meta,
+        ),
     }
 }
 

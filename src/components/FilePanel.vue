@@ -10,12 +10,17 @@
       @tab-menu="onTabMenu"
     />
 
-    <!-- Path bar -->
+    <!-- Path bar. A search-results tab has no real path, so it gets a
+         descriptive label instead of a breadcrumb (PathBar would otherwise try
+         to render `minitc://search/1` as navigable segments). -->
     <PathBar
       :path="activeTab ? activeTab.path : ''"
       :drives="drives"
+      :virtual-label="searchLabel"
+      :virtual-root="activeTab?.search?.root || ''"
+      :virtual="isVirtual"
       @navigate="navigateTo"
-      @refresh="refresh"
+      @refresh="refresh({ force: true })"
     />
 
     <!-- File list -->
@@ -25,6 +30,7 @@
       :path="activeTab ? activeTab.path : ''"
       :sort-column="activeTab ? activeTab.sortColumn : 'name'"
       :sort-direction="activeTab ? activeTab.sortDirection : 'asc'"
+      :allow-found-sort="isVirtual"
       :loading="loading"
       :error="error"
       :has-parent="hasParent"
@@ -66,7 +72,8 @@
 
     <!-- Panel status bar -->
     <div class="panel-status">
-      <span>{{ entries.length }} items</span>
+      <span v-if="isVirtual">{{ entries.length }} 个结果<template v-if="activeTab?.search?.live">（搜索中…）</template></span>
+      <span v-else>{{ entries.length }} items</span>
       <span v-if="selectedEntries.length">{{ selectedEntries.length }} selected · {{ formatBytes(selectedSize) }}</span>
       <span v-if="selectedEntry">{{ selectedEntry.name }}</span>
       <span v-if="loading" class="loading-text">Loading...</span>
@@ -78,12 +85,15 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
 import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { entryPath, isSearchPath, parentDirOf, makeSearchPath } from "../paths.js";
+import { cancelSearch, startSearch } from "../api.js";
+import { listen } from "@tauri-apps/api/event";
 import { mark, track } from "../bootLog.js";
 
 // Extensions we consider extractable archives. Covers everything the bundled
@@ -137,6 +147,19 @@ const activeTabId = ref(0);
 
 const activeTab = computed(() => tabs.value.find((t) => t.id === activeTabId.value));
 
+// True when the active tab is a search-results pseudo-directory.
+const isVirtual = computed(() => isSearchPath(activeTab.value?.path || ""));
+
+// Label shown in place of the path breadcrumb on a search-results tab.
+const searchLabel = computed(() => {
+  if (!isVirtual.value) return "";
+  const s = activeTab.value?.search;
+  if (!s) return "搜索结果（已失效）";
+  const scope = s.content ? `${s.pattern || "*"} +内容` : s.pattern || "*";
+  const live = s.live ? " · 搜索中…" : "";
+  return `🔍 ${scope}  —  ${s.root}${live}`;
+});
+
 // File listing state
 const entries = ref([]);
 const loading = ref(false);
@@ -181,8 +204,13 @@ function showToast(text, type = "info") {
 // generic backend config commands, replacing the old localStorage approach.
 
 async function saveState() {
+  // Search-results tabs are deliberately NOT persisted: their rows are an
+  // in-memory snapshot of a scan that may already be stale, and the whole
+  // point of the tab is to be disposable. They are skipped here so a restart
+  // never resurrects an empty `minitc://search/…` tab.
+  const persistable = tabs.value.filter((t) => !isSearchPath(t.path));
   const state = {
-    tabs: tabs.value.map((t) => ({
+    tabs: persistable.map((t) => ({
       id: t.id,
       path: t.path,
       sortColumn: t.sortColumn,
@@ -192,7 +220,12 @@ async function saveState() {
       // = unlocked), which is exactly the desired fallback.
       lockedPath: t.lockedPath || "",
     })),
-    activeTabId: activeTabId.value,
+    // Never point at a tab we just filtered out.
+    activeTabId: persistable.some((t) => t.id === activeTabId.value)
+      ? activeTabId.value
+      : persistable.length
+        ? persistable[0].id
+        : 0,
   };
   try {
     await saveConfig(STORAGE_KEY, JSON.stringify(state));
@@ -363,15 +396,51 @@ function createTab(path) {
     sortDirection: "asc",
     // Locked-tab anchor dir. Empty = not locked (see toggleTabLock).
     lockedPath: "",
+    // Non-null only for a "search results" pseudo-directory: { root, pattern,
+    // hits, live, searchId, done }. Kept on the tab (not in a module-level
+    // variable) so two search tabs in the same panel can't tread on each other.
+    search: null,
   };
   tabs.value.push(tab);
   activeTabId.value = tab.id;
   return tab;
 }
 
+// Open a search-results pseudo-directory in this panel. `hits` are entries
+// already carrying absolute `path`s; `live` means the backend scan is
+// still running and further batches will be appended in place.
+function openSearchTab({ root, pattern, content, caseSensitive, includeHidden, hits, live, searchId, done }) {
+  const tab = createTab(makeSearchPath(nextTabId()));
+  tab.search = {
+    root: root || "",
+    pattern: pattern || "",
+    content: content || "",
+    caseSensitive: !!caseSensitive,
+    includeHidden: !!includeHidden,
+    hits: hits || [],
+    live: !!live,
+    searchId: searchId || 0,
+    done: done || null,
+  };
+  // Default to "search order" (the backend's DFS walk, so results stay grouped
+  // by their parent directory). Unlike a real listing there is no single
+  // directory to float to the top, and re-sorting a live result set mid-scan
+  // would make rows jump under the cursor.
+  if (hits && hits.length > 1) {
+    tab.sortColumn = "found";
+    tab.sortDirection = "asc";
+  }
+  activeTabId.value = tab.id;
+  loadDirectory(tab.path, tab.id);
+  return tab;
+}
+
 function addTab() {
-  const currentPath = activeTab.value?.path || "/";
-  createTab(currentPath);
+  // Ctrl+T on a search-results tab would clone the sentinel path, producing a
+  // second tab that claims to be the same (already consumed) result set. Open
+  // the search's ROOT directory instead — a real, useful starting point.
+  const cur = activeTab.value?.path || "/";
+  createTab(isSearchPath(cur) ? activeTab.value?.search?.root || "/" : cur);
 }
 
 function closeTab(id) {
@@ -382,6 +451,17 @@ function closeTab(id) {
 
   // Drop any cached listing for the closed tab.
   if (tabCache.value[id]) delete tabCache.value[id];
+
+  const closing = tabs.value[idx];
+  // A still-running scan would keep walking the disk and pushing batches at a
+  // tab that no longer exists. Stop it — but only when no other tab in this
+  // panel is showing the same search.
+  if (closing && closing.search && closing.search.live) {
+    const stillShown = tabs.value.some(
+      (t) => t.id !== id && t.search && t.search.searchId === closing.search.searchId
+    );
+    if (!stillShown) cancelSearch().catch(() => {});
+  }
 
   tabs.value.splice(idx, 1);
 
@@ -422,6 +502,9 @@ function cycleTab(delta) {
 function toggleTabLock(id = activeTabId.value) {
   const tab = tabs.value.find((t) => t.id === id);
   if (!tab) return null;
+  // Locking records a real directory as an anchor; a search-results tab has
+  // none, so the whole concept doesn't apply. Report it so the caller can say so.
+  if (isSearchPath(tab.path)) return { ok: false, reason: "virtual" };
   if (tab.lockedPath) {
     tab.lockedPath = "";
     return { locked: false, tab };
@@ -457,24 +540,24 @@ const tabMenu = ref({ visible: false, x: 0, y: 0, items: [], tabId: null });
 function onTabMenu({ tabId, x, y }) {
   const tab = tabs.value.find((t) => t.id === tabId);
   if (!tab) return;
-  const items = [
-    {
-      label: tab.lockedPath ? "解除锁定" : "锁定当前位置",
-      action: "toggle-lock",
-    },
-    {
-      label: "回到锁定位置",
-      action: "jump-locked",
-      disabled: !tab.lockedPath,
-    },
-    {
-      label: "以当前目录重新锁定",
-      action: "relock",
-      disabled: !tab.lockedPath,
-    },
-    { separator: true },
-    { label: "关闭此标签页", action: "close", disabled: tabs.value.length <= 1 },
-  ];
+  const virtual = isSearchPath(tab.path);
+  // Locking anchors a real directory, and "relock here" needs one too — both
+  // are meaningless for a search-results tab, so they're replaced by actions
+  // that do make sense there.
+  const items = virtual
+    ? [
+        { label: "重新搜索", action: "rerun-search" },
+        { label: "跳到搜索根目录", action: "goto-root" },
+        { separator: true },
+        { label: "关闭此标签页", action: "close", disabled: tabs.value.length <= 1 },
+      ]
+    : [
+        { label: tab.lockedPath ? "解除锁定" : "锁定当前位置", action: "toggle-lock" },
+        { label: "回到锁定位置", action: "jump-locked", disabled: !tab.lockedPath },
+        { label: "以当前目录重新锁定", action: "relock", disabled: !tab.lockedPath },
+        { separator: true },
+        { label: "关闭此标签页", action: "close", disabled: tabs.value.length <= 1 },
+      ];
   tabMenu.value = { visible: true, x, y, items, tabId };
 }
 
@@ -486,6 +569,7 @@ function handleTabMenuSelect(item) {
   const id = tabMenu.value.tabId;
   closeTabMenu();
   if (item.disabled) return;
+  const tab = tabs.value.find((t) => t.id === id);
   switch (item.action) {
     case "toggle-lock":
       toggleTabLock(id);
@@ -496,6 +580,21 @@ function handleTabMenuSelect(item) {
     case "relock":
       relockTabAtCurrentPath(id);
       break;
+    case "rerun-search":
+      // Re-running only makes sense on the tab that owns the results, so switch
+      // to it first — otherwise a right-click on a background tab would
+      // refresh what the user isn't even looking at.
+      if (tab && activeTabId.value !== id) activeTabId.value = id;
+      rerunSearch();
+      break;
+    case "goto-root": {
+      const root = tab && tab.search && tab.search.root;
+      if (root) {
+        tab.search = null;
+        tab.path = root;
+      }
+      break;
+    }
     case "close":
       closeTab(id);
       break;
@@ -550,6 +649,21 @@ async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
     dirSizes.value = {};
   }
   try {
+    // A search-results tab has no directory to list — its rows live in the
+    // tab's own `search.hits` array. Serving them here (rather than
+    // special-casing every caller) keeps the whole rest of the panel working
+    // unchanged: sorting, selection, preview, delete, F5 all just see entries.
+    if (isSearchPath(path)) {
+      const tab = tabs.value.find((t) => t.id === tabId);
+      const s = tab && tab.search;
+      if (isActive) {
+        entries.value = s ? s.hits : [];
+        hasParent.value = false; // no ".." row in a result set
+        if (!s) error.value = "搜索结果已失效";
+      }
+      tabCache.value[tabId] = { path, entries: s ? s.hits : [], hasParent: false };
+      return;
+    }
     const res = await listDirectory(path);
     tabCache.value[tabId] = { path, entries: res.entries, hasParent: res.has_parent };
     if (isActive) {
@@ -584,6 +698,10 @@ async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
 // stored in `tabCache`; the UI only picks it up when that tab becomes active.
 function preloadOtherTabs() {
   for (const t of tabs.value) {
+    // Search-results tabs are excluded: their rows are already in memory, and
+    // "preloading" one would mean snapshotting a live scan that is still
+    // growing.
+    if (isSearchPath(t.path)) continue;
     if (t.id !== activeTabId.value && !tabCache.value[t.id]) {
       loadDirectory(t.path, t.id);
     }
@@ -592,17 +710,36 @@ function preloadOtherTabs() {
 
 function navigateTo(newPath) {
   if (!activeTab.value) return;
+  // Any explicit navigation (breadcrumb, path bar, "open containing folder")
+  // leaves the search-results state — the tab is now a real directory.
+  activeTab.value.search = null;
   activeTab.value.path = newPath;
 }
 
-async function navigateInto(folderName) {
+async function navigateInto(entryOrName) {
   if (!activeTab.value) return;
-  const newPath = await joinPath(activeTab.value.path, folderName);
+  const entry =
+    typeof entryOrName === "string" ? { name: entryOrName } : entryOrName;
+  if (!entry || !entry.name) return;
+  // Entering a directory row inside a search-results listing switches THIS tab
+  // to the real directory (Total Commander behaves the same way: following a
+  // hit takes you out of the result set and into the filesystem). The absolute
+  // path on the row is what makes this work — a name-only join would resolve
+  // against the sentinel `minitc://search/…` path and fail.
+  const newPath = await entryPath(entry, activeTab.value.path);
+  // Leaving the result set for a real directory: the tab is no longer virtual.
+  activeTab.value.search = null;
   activeTab.value.path = newPath;
 }
 
 async function navigateParent() {
   if (!activeTab.value) return;
+  // A search-results tab has no parent directory. The ".." row isn't rendered
+  // (hasParent = false), so this is only reachable via the Backspace shortcut.
+  if (isSearchPath(activeTab.value.path)) {
+    showToast("搜索结果列表没有上级目录", "info");
+    return;
+  }
   try {
     // Remember current folder name so we can re-select it in the parent listing
     const currentName = activeTab.value.path.split(/[\\/]/).filter(Boolean).pop() || "";
@@ -616,8 +753,29 @@ async function navigateParent() {
   }
 }
 
-async function refresh() {
-  if (activeTab.value) {
+// `opts.force` distinguishes an EXPLICIT user refresh (the ↻ button, or the
+// tab context menu) from the passive re-list fired on every window-focus regain
+// and after a delete/extract. Only the explicit form may re-run a search.
+async function refresh(opts = {}) {
+  if (!activeTab.value) return;
+  // Refreshing a search-results tab means re-running the scan, not re-listing
+  // a directory (there isn't one). Drop the stale rows first so the panel
+  // doesn't keep showing results the user asked to discard.
+  if (isSearchPath(activeTab.value.path)) {
+    const s = activeTab.value.search;
+    if (!s) return;
+    // A passive `refresh()` — the kind fired on every window-focus regain —
+    // must NOT kick off a full disk rescan behind the user's back. Only an
+    // explicit refresh (the ↻ button) does that; see `force`.
+    if (!opts.force) return;
+    if (s.live) {
+      showToast("搜索仍在进行中，无需刷新", "info");
+      return;
+    }
+    await rerunSearch();
+    return;
+  }
+  {
     // A pending selection (e.g. set by rename/delete/parent-navigation) takes
     // priority over the current selection snapshot.
     const pending = pendingSelectName.value;
@@ -641,6 +799,94 @@ async function refresh() {
     }
   }
 }
+
+// ── Search-results tabs ──
+// A search tab owns its result rows and, while the scan is still running,
+// its own `search-batch` / `search-done` listeners. The dialog hands the
+// running search over with `openSearchTab(..., { live: true })`; from that
+// moment the panel is the consumer and the dialog only keeps its own copy for
+// display. Both sides filter on the search id, so a stale batch can never
+// land in a tab it doesn't belong to.
+
+const MAX_SEARCH_RESULTS = 5000;
+
+async function rerunSearch() {
+  const tab = activeTab.value;
+  const s = tab && tab.search;
+  if (!s) return;
+  // A fresh id so the previous scan's trailing batches are ignored.
+  const id = Date.now() % 1000000;
+  s.searchId = id;
+  s.hits = [];
+  s.live = true;
+  s.done = null;
+  entries.value = [];
+  ensureSearchListeners();
+  try {
+    await startSearch(id, {
+      root: s.root,
+      pattern: s.pattern,
+      content: s.content,
+      caseSensitive: s.caseSensitive,
+      includeHidden: s.includeHidden,
+      maxResults: MAX_SEARCH_RESULTS,
+    });
+  } catch (e) {
+    s.live = false;
+    error.value = String(e);
+    showToast("搜索失败：" + String(e), "error");
+  }
+}
+
+let unlistenBatch = null;
+let unlistenDone = null;
+
+function ensureSearchListeners() {
+  if (unlistenBatch) return;
+  const unwrap = (event, name) => {
+    const p = event && event.payload;
+    if (!p || typeof p !== "object") {
+      console.warn(`[panel-search] ${name}: event carried no payload`, event);
+      return null;
+    }
+    return p;
+  };
+  // `listen` hands back an Event WRAPPER { event, id, payload } — the payload
+  // is on `.payload`, and `Event.id` is a global sequence number unrelated to
+  // our search id. Reading `payload.id` off the wrapper would never match.
+  unlistenBatch = listen("search-batch", (event) => {
+    const p = unwrap(event, "search-batch");
+    if (!p) return;
+    const tab = tabs.value.find((t) => t.search && t.search.searchId === p.id);
+    if (!tab) return; // stale scan, or one we no longer display
+    if (tab.search.hits.length >= MAX_SEARCH_RESULTS) return;
+    tab.search.hits.push(...(p.hits || []));
+    if (tab.id === activeTabId.value) entries.value = tab.search.hits;
+  });
+  unlistenDone = listen("search-done", (event) => {
+    const p = unwrap(event, "search-done");
+    if (!p) return;
+    const tab = tabs.value.find((t) => t.search && t.search.searchId === p.id);
+    if (!tab) return;
+    tab.search.live = false;
+    tab.search.done = p;
+    // Rows may have been dropped by the cap; make the visible list authoritative.
+    if (tab.id === activeTabId.value) entries.value = tab.search.hits;
+    if (p.cancelled) showToast("搜索已取消", "info");
+    else if (p.truncated) showToast(`结果已达上限（${MAX_SEARCH_RESULTS}）`, "info");
+  });
+}
+
+// The listeners above are installed lazily on the first hand-off and live as
+// long as the panel does (both panels are permanent for the window's life), so
+// there is normally nothing to tear down. Still unlisten on unmount rather
+// than leave a backend push feeding a dead component.
+onBeforeUnmount(() => {
+  unlistenBatch?.();
+  unlistenBatch = null;
+  unlistenDone?.();
+  unlistenDone = null;
+});
 
 // ── Sorting ──
 
@@ -684,19 +930,29 @@ function clearCut() {
   cutNames.value = [];
 }
 
-async function calcDirSize(folderName) {
+async function calcDirSize(entryOrName) {
   if (!activeTab.value) return;
-  const fullPath = await joinPath(activeTab.value.path, folderName);
+  // Called with the entry (virtual directories need its absolute path) but we
+  // keep accepting a bare name so the template's `:name` usage keeps working.
+  const entry =
+    typeof entryOrName === "string" ? { name: entryOrName } : entryOrName;
+  if (!entry || !entry.name) return;
+  const fullPath = await entryPath(entry, activeTab.value.path);
+  // Key the cache the same way FileList reads it: by path in a search-results
+  // tab (same-named folders from different parents can both be listed).
+  const key = isSearchPath(activeTab.value.path)
+    ? fullPath
+    : entry.name;
   // Show loading state
-  dirSizes.value = { ...dirSizes.value, [folderName]: -1 };
+  dirSizes.value = { ...dirSizes.value, [key]: -1 };
   try {
     const size = await getDirSize(fullPath);
-    dirSizes.value = { ...dirSizes.value, [folderName]: size };
+    dirSizes.value = { ...dirSizes.value, [key]: size };
   } catch (e) {
     console.error("Failed to calculate dir size:", e);
     // Remove the loading placeholder on error
     const next = { ...dirSizes.value };
-    delete next[folderName];
+    delete next[key];
     dirSizes.value = next;
   }
 }
@@ -716,14 +972,16 @@ async function onDelete(targets, opts = {}) {
   const remove = permanent ? deletePermanently : deleteToTrash;
 
   const successNames = [];
+  const successPaths = [];    // absolute paths, for exact row removal
   const failed = [];        // delete failed → auto-retry with admin
   const adminLaunched = []; // admin delete was accepted (UAC approved)
 
   for (const entry of list) {
-    const fullPath = await joinPath(activeTab.value.path, entry.name);
+    const fullPath = await entryPath(entry, activeTab.value.path);
     try {
       await remove(fullPath);
       successNames.push(entry.name);
+      successPaths.push(fullPath);
     } catch (e) {
       const m = e && typeof e === "object" && e.message ? e.message : String(e);
       // A missing path is not worth an elevation prompt — report it directly.
@@ -735,13 +993,26 @@ async function onDelete(targets, opts = {}) {
     }
   }
 
-  // Remove entries that were successfully deleted.
-  if (successNames.length) {
-    const removed = new Set(successNames);
-    entries.value = entries.value.filter((e) => !removed.has(e.name));
+  // Remove entries that were successfully deleted. Match on the ABSOLUTE path,
+  // not the name: a search-results tab can legitimately contain two rows with
+  // the same name coming from different folders, and deleting one of them must
+  // not take its namesake with it.
+  if (successPaths.length) {
+    const removed = new Set(successPaths);
+    entries.value = entries.value.filter((e) => !removed.has(e.path));
     const next = { ...dirSizes.value };
+    // Drop both keyings — the row may have been cached under its name (real
+    // directory) or its path (search-results tab).
     successNames.forEach((n) => delete next[n]);
+    successPaths.forEach((p) => delete next[p]);
     dirSizes.value = next;
+    // Keep the tab's own snapshot in sync — it is the source of truth for a
+    // search tab, and anything that re-applies it (a refresh, a tab switch back)
+    // would otherwise resurrect the deleted rows.
+    const tab = activeTab.value;
+    if (tab && tab.search) {
+      tab.search.hits = tab.search.hits.filter((e) => !removed.has(e.path));
+    }
     // Free space on the drive changed (trash or permanent delete), so refresh
     // the capacity readout shown in the PathBar drive dropdown.
     refreshDrives();
@@ -788,11 +1059,28 @@ async function onDelete(targets, opts = {}) {
 
 async function onRename(entry, newName) {
   if (!activeTab.value) return;
-  const oldPath = await joinPath(activeTab.value.path, entry.name);
+  const oldPath = await entryPath(entry, activeTab.value.path);
   try {
     await renameFile(oldPath, newName);
-    // Reload the listing, then re-select the renamed entry by its new name so
-    // the selection/caret stays on it (matching Explorer).
+    // Re-select by the new name so the caret stays on the row (matching
+    // Explorer). In a search-results directory there is nothing to re-list —
+    // the rows are a detached snapshot — so patch the row in place instead.
+    if (isSearchPath(activeTab.value.path)) {
+      const newPath = (parentDirOf(oldPath) || oldPath) + "\\" + newName;
+      const row = entries.value.find((e) => e.path === oldPath);
+      if (row) {
+        row.name = newName;
+        row.extension = newName.includes(".")
+          ? newName.split(".").pop().toUpperCase()
+          : "";
+        row.path = newPath;
+      }
+      // `entries` keeps its identity here (same array, one row mutated), so
+      // FileList's entries watcher never fires and a pending selection would
+      // never be consumed. Re-select the row directly instead.
+      nextTick(() => fileListRef.value?.selectName?.(newName));
+      return;
+    }
     pendingSelectName.value = newName;
     await refresh();
   } catch (e) {
@@ -803,9 +1091,12 @@ async function onRename(entry, newName) {
 
 // ── Open file ──
 
-async function onOpen(fileName) {
+async function onOpen(fileNameOrEntry) {
   if (!activeTab.value) return;
-  const fullPath = await joinPath(activeTab.value.path, fileName);
+  const entry =
+    typeof fileNameOrEntry === "string" ? { name: fileNameOrEntry } : fileNameOrEntry;
+  if (!entry || !entry.name) return;
+  const fullPath = await entryPath(entry, activeTab.value.path);
 
   // Double-clicking any file opens it with the OS default app/player. Videos
   // are no exception — the in-app video preview is still reachable via Ctrl+Q
@@ -842,8 +1133,12 @@ function extractTargets(entry) {
 function buildMenuItems(entry) {
   const items = [];
   if (!entry) {
-    items.push({ label: "新建目录", action: "new-folder" });
-    items.push({ separator: true });
+    // "新建目录" needs a real parent directory; a search-results tab doesn't
+    // have one, so offer only the actions that still make sense.
+    if (!isSearchPath(activeTab.value?.path || "")) {
+      items.push({ label: "新建目录", action: "new-folder" });
+      items.push({ separator: true });
+    }
     items.push({ label: "刷新", action: "refresh" });
     return items;
   }
@@ -852,6 +1147,12 @@ function buildMenuItems(entry) {
     items.push({ label: "进入目录", action: "open" });
   } else {
     items.push({ label: "打开", action: "open" });
+  }
+  // In a search-results tab, double-click / Enter opens the FILE wherever it
+  // lives rather than navigating — so the containing directory (which may be
+  // in a completely different part of the tree) needs its own explicit action.
+  if (isSearchPath(activeTab.value?.path || "")) {
+    items.push({ label: "打开所在目录", action: "open-container" });
   }
   items.push({ label: "重命名", action: "rename" });
   items.push({ label: "复制路径", action: "copy-path" });
@@ -932,18 +1233,27 @@ async function handleCtxSelect(item) {
   switch (item.action) {
     case "open":
       if (entry.is_dir) {
-        navigateInto(entry.name);
+        navigateInto(entry);
       } else {
-        onOpen(entry.name);
+        onOpen(entry);
       }
       break;
+    case "open-container": {
+      const full = await entryPath(entry, path);
+      const dir = parentDirOf(full);
+      if (dir) {
+        activeTab.value.search = null;
+        activeTab.value.path = dir;
+      }
+      break;
+    }
     case "copy-path": {
-      const full = await joinPath(path, entry.name);
+      const full = await entryPath(entry, path);
       copyTextToClipboard(full);
       break;
     }
     case "refresh":
-      refresh();
+      refresh({ force: true });
       break;
     case "new-folder":
       await doNewFolder();
@@ -982,6 +1292,13 @@ function uniqueNewFolderName() {
 async function doNewFolder() {
   const path = activeTab.value?.path;
   if (!path) return;
+  // A search-results directory has no real parent to create anything inside —
+  // its rows merely *look* co-located. Refuse rather than silently creating
+  // the folder in the search's root directory.
+  if (isSearchPath(path)) {
+    showToast("搜索结果列表无法新建目录，请先跳转到实际目录", "error");
+    return;
+  }
   const name = uniqueNewFolderName();
   const full = await joinPath(path, name);
   try {
@@ -1024,19 +1341,36 @@ async function doAddToArchive() {
   const isGui = tool.syntax === "7z-gui" || tool.syntax === "winrar-gui";
 
   // Archive name = current folder name (matches Explorer's "Compressed folder").
-  const folderName = path.split(/[\\/]/).filter(Boolean).pop() || "archive";
+  // A search-results directory has no meaningful "current folder", so name the
+  // archive after the first selected item instead — and, crucially, write the
+  // archive NEXT TO THAT ITEM rather than into the sentinel path.
+  const fromResultSet = isSearchPath(path);
   const sources = [];
   for (const t of targets) {
-    sources.push(await joinPath(path, t.name));
+    sources.push(await entryPath(t, path));
   }
+  const baseDir = fromResultSet ? parentDirOf(sources[0]) : path;
+  if (!baseDir) {
+    showToast("无法确定压缩包的目标位置", "error");
+    return;
+  }
+  const firstName = (targets[0] && targets[0].name) || "";
+  const stem = firstName.includes(".")
+    ? firstName.split(".")[0]
+    : firstName;
+  const folderName = fromResultSet
+    ? stem || "archive"
+    : path.split(/[\\/]/).filter(Boolean).pop() || "archive";
 
   try {
-    const res = await addToArchive(sources, path, folderName, tool.exe, tool.syntax);
+    const res = await addToArchive(sources, baseDir, folderName, tool.exe, tool.syntax);
     if (res && res.success) {
       showToast(res.message, "success");
       // GUI tools build the archive asynchronously in their own window (and
       // may prompt for a password), so don't refresh immediately. CLI tools
-      // finish synchronously, so refresh to reveal the new archive.
+      // finish synchronously, so refresh to reveal the new archive. In a
+      // search-results directory refresh() re-runs the search rather than
+      // re-listing, which is equally correct here.
       if (!isGui) refresh();
     } else {
       showToast("压缩失败", "error");
@@ -1069,9 +1403,18 @@ async function doExtract(targets, tool, mode) {
   if (list.length > 1) showToast(`正在依次解压 ${list.length} 个压缩包…`, "info");
 
   for (const entry of list) {
-    const fullArchive = await joinPath(path, entry.name);
+    const fullArchive = await entryPath(entry, path);
+    // Extract next to the archive itself. In a real directory that is the
+    // current dir; in a search-results directory the rows come from many
+    // parents, so each archive must land in its OWN folder — extracting them
+    // all into one (possibly non-existent) target would scatter output.
+    const destDir = isSearchPath(path) ? parentDirOf(fullArchive) : path;
+    if (!destDir) {
+      failed.push(entry.name);
+      continue;
+    }
     try {
-      const res = await extractArchive(fullArchive, path, tool.exe, tool.syntax, mode, wait);
+      const res = await extractArchive(fullArchive, destDir, tool.exe, tool.syntax, mode, wait);
       if (res && res.success) {
         done++;
         lastMessage = res.message || "";
@@ -1147,6 +1490,17 @@ defineExpose({
   // Jump the panel to an arbitrary directory (used by the search dialog's
   // "打开所在目录" action).
   goTo: (path) => navigateTo(path),
+  // Open the given search hits as a pseudo-directory tab in THIS panel.
+  // Called by the search dialog's 「送到面板」 action. A still-running scan is
+  // handed over (`live: true`) and the panel keeps consuming its batches.
+  openSearchResults: (payload) => {
+    const tab = openSearchTab(payload);
+    if (payload && payload.live) ensureSearchListeners();
+    return { tabId: tab.id };
+  },
+  // True when the active tab is a search-results pseudo-directory (App.vue
+  // uses this to block operations that need a real current directory).
+  isVirtual: () => isVirtual.value,
   // Navigate to `dir` and select `name` inside it — how a search result is
   // revealed. Same directory → just move the selection; different directory →
   // arm `pendingSelectName` so the selection lands once the listing arrives

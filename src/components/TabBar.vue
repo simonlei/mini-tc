@@ -10,7 +10,7 @@
       @contextmenu.prevent="$emit('tab-menu', { tabId: tab.id, x: $event.clientX, y: $event.clientY })"
       @auxclick="onAuxClick($event, tab.id)"
     >
-      <span class="tab-icon">📁</span>
+      <span class="tab-icon">{{ tab.search ? "🔍" : "📁" }}</span>
       <span v-if="tab.lockedPath" class="tab-lock" title="已锁定">🔒</span>
       <span class="tab-name">{{ tabLabel(tab) }}</span>
       <button
@@ -37,6 +37,14 @@ defineProps({
 const emit = defineEmits(["switch-tab", "close-tab", "add-tab", "tab-menu"]);
 
 function tabLabel(tab) {
+  // A search-results tab has no directory to name — label it after the query
+  // instead, falling back to a generic marker while the scan is still empty.
+  if (tab.search) {
+    const scope = tab.search.content
+      ? `${tab.search.pattern || "*"}+内容`
+      : tab.search.pattern || "";
+    return scope ? `🔍 ${scope}` : "搜索结果";
+  }
   const path = tab.path || "";
   // Handle both / and \ separators
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -53,6 +61,17 @@ function tabLabel(tab) {
 // Hover tooltip: current dir, plus the lock anchor when locked so the user can
 // see at a glance where Ctrl+Y will take them back.
 function tabTitle(tab) {
+  // Search tab: spell out the scope, the root and (while scanning) the fact
+  // that more rows are still arriving.
+  if (tab.search) {
+    const s = tab.search;
+    const lines = [
+      `搜索：${s.pattern || "*"}${s.content ? ` 内容包含「${s.content}」` : ""}`,
+      `根目录：${s.root}`,
+      `${s.hits.length} 个结果${s.live ? "（搜索仍在进行…）" : ""}`,
+    ];
+    return lines.join("\n");
+  }
   const path = tab.path || "";
   return tab.lockedPath ? `${path}\n🔒 已锁定：${tab.lockedPath}（Ctrl+Y 回到此处）` : path;
 }

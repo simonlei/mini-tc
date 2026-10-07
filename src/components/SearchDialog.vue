@@ -122,6 +122,26 @@
           诊断日志
         </span>
         <span v-if="showLogHint" class="footer-hint log-path">{{ logPathHint }}</span>
+        <!-- Total Commander's "feed the results into a file panel": the hits
+             become an ordinary, fully operable file list (rename / delete /
+             F5 to the other panel / preview / drag out). Works mid-scan — the
+             panel keeps receiving the remaining batches. -->
+        <button
+          class="btn-send"
+          :disabled="!hits.length"
+          :title="hits.length ? '把结果作为一个可操作的文件列表放进面板' : '还没有结果'"
+          @click="send('left')"
+        >
+          送到左栏
+        </button>
+        <button
+          class="btn-send"
+          :disabled="!hits.length"
+          :title="hits.length ? '把结果作为一个可操作的文件列表放进面板' : '还没有结果'"
+          @click="send('right')"
+        >
+          送到右栏
+        </button>
         <button class="btn-secondary" @click="$emit('close')">关闭</button>
       </div>
     </div>
@@ -148,7 +168,7 @@ const props = defineProps({
   initialPath: { type: String, default: "" },
 });
 
-const emit = defineEmits(["close", "reveal", "use-current-dir", "open-dir"]);
+const emit = defineEmits(["close", "reveal", "use-current-dir", "open-dir", "send-to-panel"]);
 
 // Hard cap handed to the backend: a bare `*` over a whole drive would
 // otherwise build an unbounded result list.
@@ -198,6 +218,10 @@ let unlistenBatch = null;
 let unlistenDone = null;
 let unlistenProgress = null;
 let stopFallback = null;
+// Set when the results were handed to a file panel. That panel now owns the
+// event stream, so the dialog must NOT cancel the scan on close — doing so
+// would freeze the panel's results mid-stream.
+let handedOff = false;
 
 // The parent re-emits `initialPath` when the user hits 「当前目录」.
 watch(
@@ -360,6 +384,43 @@ async function run() {
   }
 }
 
+// ── Hand the results to a file panel ──
+//
+// A search hit already carries everything a FileEntry needs except that the
+// two use `dir` where the panel world speaks in absolute `path` (the hit's
+// `path` is exactly that). Copying rather than passing the same objects means
+// the panel owns its rows outright: renaming or deleting one can never mutate
+// the dialog's list out from under it.
+//
+// `live: searching` tells the panel the backend scan is still walking, so it
+// takes over the event stream and appends the rest itself.
+function sendPayload() {
+  return {
+    root: (root.value || "").trim(),
+    pattern: pattern.value || "",
+    content: content.value || "",
+    caseSensitive: caseSensitive.value,
+    includeHidden: includeHidden.value,
+    hits: hits.value.map((h) => ({
+      path: h.path,
+      name: h.name,
+      is_dir: h.is_dir,
+      size: h.size,
+      modified: h.modified,
+      extension: h.extension,
+      is_hidden: !!h.is_hidden,
+    })),
+    live: searching.value,
+    searchId: searchId,
+  };
+}
+
+function send(which) {
+  if (!hits.value.length) return;
+  handedOff = true;
+  emit("send-to-panel", { panel: which, ...sendPayload() });
+}
+
 async function stop() {
   if (!searching.value) return;
   await cancelSearch().catch(() => {});
@@ -507,8 +568,9 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   // A search still running when the dialog closes would keep walking the disk
-  // and pushing events nobody listens to any more.
-  if (searching.value) cancelSearch().catch(() => {});
+  // and pushing events nobody listens to any more — UNLESS a panel took the
+  // results over and is now the intended consumer.
+  if (searching.value && !handedOff) cancelSearch().catch(() => {});
   stopTicker();
   clearTimeout(stopFallback);
   unlistenBatch?.();
@@ -675,6 +737,28 @@ onBeforeUnmount(() => {
 
 .btn-stop:hover {
   opacity: 0.9;
+}
+
+.btn-send {
+  flex: none;
+  padding: 6px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-send:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-send:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .btn-secondary {

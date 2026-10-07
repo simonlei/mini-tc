@@ -1,7 +1,13 @@
 <template>
   <div class="file-list" ref="listContainer" tabindex="0" title="按 / 过滤当前目录文件" @keydown="onKeydown" @mousedown="onMouseDown" @mouseup="onMouseUp" @compositionstart="onCompositionStart">
-    <!-- Column headers -->
+    <!-- Column headers. The leading "顺序" column only appears for a
+     search-results tab, where the backend's own ordering (grouped by parent
+     directory) is meaningful — a real listing has no such order to preserve. -->
     <div class="file-header">
+      <div v-if="allowFoundSort" class="col-found sortable" @click="$emit('sort', 'found')">
+        顺序
+        <span class="sort-arrow" v-if="sortColumn === 'found'">{{ sortDirection === "asc" ? "▲" : "▼" }}</span>
+      </div>
       <div class="col-name sortable" @click="$emit('sort', 'name')">
         Name
         <span class="sort-arrow" v-if="sortColumn === 'name'">{{ sortDirection === "asc" ? "▲" : "▼" }}</span>
@@ -59,6 +65,7 @@
         @contextmenu.prevent.stop="onRowContextMenu(null, $event)"
       >
         <div class="col-name"><span class="file-icon folder-icon">📁</span>..</div>
+        <div v-if="allowFoundSort" class="col-found"></div>
         <div class="col-size"></div>
         <div class="col-type"></div>
         <div class="col-modified"></div>
@@ -73,19 +80,21 @@
           selected: selectedIndices.has(index),
           'is-dir': entry.is_dir,
           'is-hidden': entry.is_hidden,
-          'is-cut': cutSet.has(entry.name),
+          'is-cut': isCut(entry),
           'drag-over': dragHighlight && dragHighlight.type === 'dir' && dragHighlight.index === index,
         }"
         draggable="true"
         data-row-type="entry"
         :data-index="index"
         :data-name="entry.name"
+        :data-path="entry.path"
         :data-is-dir="entry.is_dir"
         @click="onRowClick(index, $event)"
         @dblclick="onDoubleClick(entry)"
         @contextmenu.prevent.stop="onRowContextMenu(index, $event, entry)"
         @dragstart="onRowDragStart($event, index)"
       >
+        <div v-if="allowFoundSort" class="col-found"></div>
         <div class="col-name">
           <span class="file-icon" :class="entry.is_dir ? 'folder-icon' : 'file-icon-' + entry.extension.toLowerCase()">
             {{ entry.is_dir ? "📁" : getFileIcon(entry.name) }}
@@ -105,8 +114,10 @@
         </div>
         <div class="col-size">
           <template v-if="entry.is_dir">
-            <span v-if="dirSizes[entry.name] !== undefined">{{ formatSize(dirSizes[entry.name]) }}</span>
-            <span v-else-if="dirSizes[entry.name] === -1">...</span>
+            <!-- Directory size (Space key). Keyed by path in a search-results tab, where
+                 two same-named folders can both be listed at once. -->
+            <span v-if="dirSizes[dirKey(entry)] !== undefined">{{ formatSize(dirSizes[dirKey(entry)]) }}</span>
+            <span v-else-if="dirSizes[dirKey(entry)] === -1">...</span>
             <span v-else>&lt;DIR&gt;</span>
           </template>
           <template v-else>{{ formatSize(entry.size) }}</template>
@@ -124,7 +135,8 @@
 
 <script setup>
 import { computed, ref, watch, nextTick } from "vue";
-import { joinPath, startNativeDrag } from "../api.js";
+import { startNativeDrag } from "../api.js";
+import { entryPath, isSearchPath } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
 
 const props = defineProps({
@@ -135,6 +147,9 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   error: { type: String, default: "" },
   hasParent: { type: Boolean, default: true },
+  // Show the "顺序" (search order) column. Only meaningful for a
+  // search-results pseudo-directory.
+  allowFoundSort: { type: Boolean, default: false },
   dirSizes: { type: Object, default: () => ({}) },
   pendingSelectName: { type: String, default: null },
   isActive: { type: Boolean, default: false },
@@ -152,7 +167,20 @@ const selectedIndices = ref(new Set());
 const activeIndex = ref(-1);
 const anchorIndex = ref(-1);
 
+// "Cut" ghosting. `cutNames` holds names (what the panel was told), but in a
+// search-results tab a name is ambiguous — two rows can share one from
+// different folders — so there we match on the absolute path instead.
 const cutSet = computed(() => new Set(props.cutNames || []));
+
+function dirKey(entry) {
+  return isSearchPath(props.path) ? entry.path || entry.name : entry.name;
+}
+
+function isCut(entry) {
+  if (cutSet.value.has(entry.name)) return true;
+  if (!isSearchPath(props.path)) return false;
+  return cutSet.value.has(entry.path || "");
+}
 
 // ── Drag-and-drop move state ──
 // dragHighlight is set externally (by App.vue's tauri://drag-over handler)
@@ -253,9 +281,21 @@ function nameClass(name) {
 
 // Sort entries based on current sort settings
 const sortedEntries = computed(() => {
-  const list = [...props.entries];
   const col = props.sortColumn;
   const dir = props.sortDirection === "asc" ? 1 : -1;
+
+  // "found" = keep the order the backend produced (DFS walk, so rows stay
+  // grouped by their parent directory). Returned as the SAME array reference,
+  // not a copy — a search-results tab appends batches in place while the user
+  // is scrolling, and re-sorting (or even copying) on every batch would make
+  // rows jump under the cursor. Reversing for "desc" does need a copy, since
+  // mutating the live array would corrupt the source order.
+  if (col === "found") {
+    if (dir === 1) return props.entries;
+    return props.entries.slice().reverse();
+  }
+
+  const list = [...props.entries];
 
   list.sort((a, b) => {
     // Directories always first (unless sorting by modified/size)
@@ -544,11 +584,10 @@ function extendPage(delta) {
 }
 
 function onDoubleClick(entry) {
-  console.log("[onDoubleClick] entry:", entry.name, "is_dir:", entry.is_dir);
   if (entry.is_dir) {
-    emit("navigate", entry.name);
+    emit("navigate", entry);
   } else {
-    emit("open", entry.name);
+    emit("open", entry);
   }
 }
 
@@ -596,8 +635,8 @@ function onSearchKeydown(e) {
     e.preventDefault();
     const entry = displayedEntries.value[activeIndex.value];
     if (entry) {
-      if (entry.is_dir) emit("navigate", entry.name);
-      else emit("open", entry.name);
+      if (entry.is_dir) emit("navigate", entry);
+      else emit("open", entry);
     }
   } else if (e.key === "Escape") {
     e.preventDefault();
@@ -910,9 +949,9 @@ function onKeydown(e) {
     console.log("[Enter] activeIndex:", activeIndex.value, "entry:", entry?.name, "is_dir:", entry?.is_dir);
     if (entry) {
       if (entry.is_dir) {
-        emit("navigate", entry.name);
+        emit("navigate", entry);
       } else {
-        emit("open", entry.name);
+        emit("open", entry);
       }
     }
   } else if (matches("list.dirSize", e)) {
@@ -921,7 +960,7 @@ function onKeydown(e) {
     if (activeIndex.value >= 0) {
       const entry = list[activeIndex.value];
       if (entry && entry.is_dir) {
-        emit("calc-dir-size", entry.name);
+        emit("calc-dir-size", entry);
       }
     }
   }
@@ -1089,16 +1128,18 @@ function focusList() {
 import { noteDragOut } from "../dragOutTracker.js";
 
 function onRowDragStart(e, index) {
-  // Build the set of source names: the whole multi-selection when the dragged
-  // row is part of it, otherwise just the dragged row.
-  let names;
+  // Build the set of source ENTRIES: the whole multi-selection when the
+  // dragged row is part of it, otherwise just the dragged row. Entries (not
+  // bare names) because a search-results directory's rows live in different
+  // parent folders — the absolute path has to travel with the row.
+  let picked;
   if (selectedIndices.value.has(index)) {
-    names = getSelectedEntries().map((x) => x.name);
+    picked = getSelectedEntries();
   } else {
     const entry = displayedEntries.value[index];
-    names = entry ? [entry.name] : [];
+    picked = entry ? [entry] : [];
   }
-  if (names.length === 0) {
+  if (picked.length === 0) {
     e.preventDefault();
     return;
   }
@@ -1112,11 +1153,11 @@ function onRowDragStart(e, index) {
   // Fire-and-forget the async part: resolve absolute paths, then hand off to
   // drag-rs (DoDragDrop) which takes over the mouse until the button is
   // released. The invoke roundtrip is a few ms — the button is still down.
-  void startDragOut(names);
+  void startDragOut(picked);
 }
 
-async function startDragOut(names) {
-  const paths = await Promise.all(names.map((n) => joinPath(props.path, n)));
+async function startDragOut(picked) {
+  const paths = await Promise.all(picked.map((en) => entryPath(en, props.path)));
   if (paths.length === 0) return;
   // Tell the tracker which paths we're dragging so App.vue's drag-drop
   // handler can recognise our own drag-out (move) vs an external drag-in
@@ -1135,6 +1176,13 @@ async function startDragOut(names) {
 // (the dragOver class re-applies when entries change, etc.).
 function setDragHighlight(target) {
   if (!target) {
+    dragHighlight.value = null;
+    return;
+  }
+  // Never light up the empty-area target in a search results tab: App.vue's
+  // destDirForPanel refuses that drop (there is no real current directory), so
+  // highlighting it would promise a drop that silently does nothing.
+  if (target.type === "current" && isSearchPath(props.path)) {
     dragHighlight.value = null;
     return;
   }
@@ -1241,6 +1289,14 @@ defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSel
 
 .search-clear:hover {
   color: var(--danger);
+}
+
+/* Leading marker column for a search-results tab. Empty on every row (its only
+   job is to make the "顺序" header label align with the rows beneath it), so
+   it just reserves width. */
+.col-found {
+  flex: none;
+  width: 44px;
 }
 
 .col-name {

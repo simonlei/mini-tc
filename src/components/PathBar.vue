@@ -16,9 +16,15 @@
       >{{ driveOptionLabel(d) }}</option>
     </select>
 
-    <button class="path-btn" @click="$emit('refresh')" title="Refresh">↻</button>
+    <button v-if="!editing && !virtual" class="path-btn" @click="$emit('refresh')" title="Refresh">↻</button>
 
-    <div class="path-display">
+    <!-- Search-results tab: there is no real path to show or navigate to, so
+         the breadcrumb is replaced by a descriptive label. -->
+    <div v-if="virtual" class="path-display virtual-display" :title="virtualLabel">
+      <span class="virtual-label">{{ virtualLabel }}</span>
+    </div>
+
+    <div v-else class="path-display">
       <!-- Breadcrumb mode (default) -->
       <div
         v-if="!editing"
@@ -95,11 +101,12 @@
       </div>
     </div>
 
-    <button v-if="!editing" class="path-btn" @click="startEdit" title="Edit path">✎</button>
+    <button v-if="!editing && !virtual" class="path-btn" @click="startEdit" title="Edit path">✎</button>
 
-    <button class="path-btn" @click="copyPath" :title="copied ? 'Copied!' : 'Copy path'">
+    <button v-if="!virtual" class="path-btn" @click="copyPath" :title="copied ? 'Copied!' : 'Copy path'">
       {{ copied ? "✓" : "📋" }}
     </button>
+    <button v-else class="path-btn" @click="copyVirtualLabel" title="复制搜索路径">📋</button>
   </div>
 </template>
 
@@ -110,6 +117,13 @@ import { pathExists, expandPath } from "../api.js";
 const props = defineProps({
   path: { type: String, default: "" },
   drives: { type: Array, default: () => [] },
+  // Set on a search-results tab: `path` is then a `minitc://search/…`
+  // sentinel, not a real directory, so the breadcrumb is replaced by
+  // `virtualLabel` and navigation/refresh-editing is suppressed.
+  virtual: { type: Boolean, default: false },
+  virtualLabel: { type: String, default: "" },
+  // The real directory the search was rooted at (what the copy button yields).
+  virtualRoot: { type: String, default: "" },
 });
 
 const emit = defineEmits(["navigate", "refresh"]);
@@ -377,6 +391,18 @@ async function copyPath() {
     }
   }
 }
+// Copy the search tab's ROOT directory — the only real path involved. Copying
+// the `minitc://search/…` sentinel would be useless to anything else.
+async function copyVirtualLabel() {
+  if (!props.virtualRoot) return;
+  try {
+    await navigator.clipboard.writeText(props.virtualRoot);
+    copied.value = true;
+    setTimeout(() => { copied.value = false; }, 1500);
+  } catch {
+    /* clipboard unavailable — nothing useful to fall back to here */
+  }
+}
 </script>
 
 <style scoped>
@@ -427,6 +453,25 @@ async function copyPath() {
   flex: 1;
   min-width: 0;
   display: flex;
+}
+
+/* Search-results tab: same chrome as the breadcrumb so the bar doesn't jump,
+   but not interactive (there's nothing to navigate to). */
+.virtual-display {
+  align-items: center;
+  padding: 2px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.virtual-label {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .breadcrumb {

@@ -118,6 +118,7 @@
       @use-current-dir="onSearchUseCurrentDir"
       @reveal="onSearchReveal"
       @open-dir="onSearchOpenDir"
+      @send-to-panel="onSearchSendToPanel"
     />
 
     <!-- Main content: two panels with a draggable separator -->
@@ -249,7 +250,8 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import GeneralSettingsDialog from "./components/GeneralSettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import SearchDialog from "./components/SearchDialog.vue";
-import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard } from "./api.js";
+import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir } from "./api.js";
+import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import * as alwaysOnTop from "./alwaysOnTop.js";
 import { listen } from "@tauri-apps/api/event";
@@ -447,6 +449,33 @@ function onSearchOpenDir(dir) {
   const panel = getActivePanelRef();
   panel?.goTo?.(dir);
   nextTick(() => panel?.focusList?.());
+}
+
+// "送到面板": turn the hits into an ordinary file list inside one of the two
+// panels. Total Commander's equivalent is sending the find-results to a panel
+// so you can work on them (rename, delete, F5 to the other side, drag out)
+// instead of only jumping to them one at a time.
+//
+// The dialog closes but a still-running scan is NOT cancelled: the panel takes
+// over the event stream and keeps appending batches, so the user can start
+// working on the first results immediately.
+function onSearchSendToPanel({ panel: which, ...payload } = {}) {
+  const panel = which === "right" ? rightPanel.value : leftPanel.value;
+  if (!panel) return;
+  // A preview occupies one panel; results would land invisible behind it.
+  if (previewVisible.value && previewPanel.value === which) closePreview();
+  panel.openSearchResults?.(payload);
+  searchVisible.value = false;
+  // Make the destination panel active so the rows are visible and keyboard
+  // focus follows them.
+  activePanel.value = which;
+  nextTick(() => panel.focusList?.());
+  showToast(
+    payload.live
+      ? `已在${which === "right" ? "右" : "左"}栏打开搜索结果，扫描仍在继续…`
+      : `${which === "right" ? "右" : "左"}栏已载入 ${payload.hits?.length || 0} 个搜索结果`,
+    "success"
+  );
 }
 
 const updateDialog = ref({
@@ -821,7 +850,7 @@ async function playNextVideo(payload) {
   if (!next) return; // last video in the list → stop, no loop
   const dir = panel?.currentPath;
   if (!dir) return;
-  const p = await joinPath(dir, next.name);
+  const p = await entryPath(next, dir);
   previewFilePath.value = p;
   previewFileName.value = next.name;
   previewFileBytes.value = next.size || 0;
@@ -895,15 +924,21 @@ function setClipboard(operation) {
     showToast("请先选中文件或文件夹", "error");
     return;
   }
-  Promise.all(entries.map((e) => joinPath(currentPath, e.name))).then((paths) => {
+  Promise.all(entries.map((e) => entryPath(e, currentPath))).then((paths) => {
     // Write a real file clipboard so Explorer / Finder / any app can paste
     // these paths. There is intentionally no in-app mirror buffer.
     setClipboardFiles(paths, operation === "cut").catch((e) =>
       console.warn("写入系统剪贴板失败:", e)
     );
     // Mark cut items in the source panel so they appear ghosted until pasted.
+    // In a search-results tab the entries come from many directories, so ghost
+    // them by absolute path — a name would light up unrelated same-named rows.
     if (operation === "cut") {
-      panel.setCutNames(entries.map((e) => e.name));
+      panel.setCutNames(
+        isSearchPath(currentPath)
+          ? entries.map((e) => e.path)
+          : entries.map((e) => e.name)
+      );
     } else {
       panel.clearCut();
     }
@@ -1006,13 +1041,15 @@ async function transferToOtherPanel(operation) {
   }
   // Both panels sitting in the same directory: copying a file onto itself is a
   // no-op at best and a "copy a file into itself" error at worst. Say so
-  // instead of letting the backend silently skip N items.
-  if (normDir(destDir) === normDir(srcDir)) {
+  // instead of letting the backend silently skip N items. Skipped when the
+  // SOURCE is a search-results tab: its "directory" is a sentinel that can
+  // never equal a real one, and its rows legitimately span many folders.
+  if (normDir(destDir) === normDir(srcDir) && !isSearchPath(srcDir)) {
     showToast("对面栏与当前栏在同一目录", "error");
     return;
   }
 
-  const paths = await Promise.all(entries.map((e) => joinPath(srcDir, e.name)));
+  const paths = await Promise.all(entries.map((e) => entryPath(e, srcDir)));
   // Same filter the drag-drop path uses: an item already sitting DIRECTLY in
   // the destination can't be moved into it (and copying it would just make a
   // same-name conflict we can't meaningfully resolve).
@@ -1026,12 +1063,6 @@ async function transferToOtherPanel(operation) {
   await doPaste(operation === "cut" ? "cut" : "copy", filtered, destDir);
 }
 
-// Slash-normalised directory for comparison (drops the Windows backslash so
-// "C:\a" and "C:/a" compare equal). Mirrors parentDirOf()'s normalisation.
-function normDir(p) {
-  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
-}
-
 // Core paste logic (used for both copy and cut pastes sourced from the OS
 // clipboard). `operation` is 'copy' (keep source) or 'cut' (move, then
 // consume the clipboard). `destDirOverride` lets a drag-and-drop move supply an
@@ -1043,6 +1074,14 @@ async function doPaste(operation, sources, destDirOverride) {
   const destDir = destDirOverride || getActivePanelRef()?.currentPath;
   if (!destDir) {
     showToast("目标目录无效", "error");
+    return;
+  }
+  // A search-results tab is not a real directory — pasting there would ask the
+  // OS to create `minitc://search/1\thing`. Say so plainly instead. (Dropping
+  // onto a directory ROW inside such a tab still works: destDirForPanel
+  // resolves that to the row's genuine path.)
+  if (!destDirOverride && isSearchPath(destDir)) {
+    showToast("搜索结果列表无法作为粘贴目标，请先跳转到实际目录", "error");
     return;
   }
 
@@ -1173,6 +1212,10 @@ function resolveDropTarget(el) {
       return {
         type: "dir",
         name: rowEl.getAttribute("data-name"),
+        // The row's own absolute path. Needed because in a search results tab
+        // the rows' parent directories have nothing to do with the tab's own
+        // (sentinel) path.
+        path: rowEl.getAttribute("data-path") || "",
         index: Number(rowEl.getAttribute("data-index")),
       };
     }
@@ -1205,7 +1248,17 @@ async function destDirForPanel(target, panel) {
   if (!panel) return null;
   const basePath = panel.currentPath;
   if (!basePath) return null;
-  if (target.type === "dir") return await joinPath(basePath, target.name);
+  // Dropping onto a directory ROW always works, including inside a search
+  // results tab: that folder is a genuine path, and `target.path` carries it
+  // (joining a bare name against the sentinel `minitc://search/…` path would
+  // produce nonsense).
+  if (target.type === "dir") {
+    return target.path || (await joinPath(basePath, target.name));
+  }
+  // Everything else resolves against "the directory the panel is showing",
+  // which a search results tab doesn't have — so refuse rather than let the
+  // backend try to create `minitc://search/1\whatever`.
+  if (isSearchPath(basePath)) return null;
   if (target.type === "parent") return await getParentDir(basePath);
   return basePath;
 }
@@ -1230,14 +1283,6 @@ async function handleNativeDrop(targetEl, paths) {
   const isSelfOut = consumeDragOut(filtered);
   const operation = isSelfOut ? "cut" : "copy";
   await doPaste(operation, filtered, destDir);
-}
-
-// Normalised parent directory of a path (used to skip no-op moves where a
-// source already sits directly inside the destination).
-function parentDirOf(p) {
-  const norm = p.replace(/\\/g, "/");
-  const i = norm.lastIndexOf("/");
-  return i <= 0 ? "" : norm.slice(0, i);
 }
 
 let unlistenDragEnter = null;
@@ -1295,7 +1340,7 @@ function showToast(text, type = "info") {
 // `asText = true` forces a plain-text read (used for user-added text-preview
 // extensions that aren't built-in text types).
 async function showFilePreview(entry, path, asText = false) {
-  const fullPath = await joinPath(path, entry.name);
+  const fullPath = await entryPath(entry, path);
   previewPanel.value = activePanel.value === "left" ? "right" : "left";
   previewKind.value = "file";
   previewFilePath.value = fullPath;
@@ -1351,7 +1396,7 @@ async function togglePreview() {
 
   const ext = entry.extension.toLowerCase();
   if (VIDEO_EXTENSIONS.includes(ext)) {
-    const fullPath = await joinPath(path, entry.name);
+    const fullPath = await entryPath(entry, path);
     openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
     return;
   }
@@ -1428,7 +1473,7 @@ watch(
       const panel = getActivePanelRef();
       const path = panel?.currentPath;
       if (!path) return;
-      const fullPath = await joinPath(path, entry.name);
+      const fullPath = await entryPath(entry, path);
       if (previewVisible.value && previewKind.value === "video") {
         // Already in video preview → just swap the source without remounting.
         previewFilePath.value = fullPath;
@@ -1475,7 +1520,7 @@ watch(activePanel, async () => {
   if (VIDEO_EXTENSIONS.includes(ext)) {
     const path = panel?.currentPath;
     if (!path) return;
-    const fullPath = await joinPath(path, entry.name);
+    const fullPath = await entryPath(entry, path);
     if (previewVisible.value && previewKind.value === "video") {
       previewFilePath.value = fullPath;
       previewFileName.value = entry.name;
