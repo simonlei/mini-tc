@@ -28,17 +28,37 @@ let worker = null;
 let nextReqId = 1;
 const pending = new Map();
 
+// Decoded-pixel budget. libheif hands back uncompressed RGBA, so the cost is
+// width*height*4 bytes of wasm heap *before* anything is encoded: a 12 MP
+// phone photo needs ~49 MB, a 48 MP one ~200 MB. Past this we refuse rather
+// than let the tab die.
+//
+// The number is enforced inside the worker, before display() runs — see the
+// comment there. It used to be checked in the UI after the decode returned,
+// which meant an oversized file had already paid the full cost (measured: 4.4 s
+// and ~800 MB for a 12240x16320 grid) before the error appeared.
+export const MAX_HEIC_PIXELS = 50e6;
+
 function ensureWorker() {
   if (worker) return worker;
   worker = new HeicWorker();
 
   worker.onmessage = (e) => {
-    const { id, pixels, width, height, error, decodeMs, displayMs } = e.data;
+    const { id, pixels, width, height, fullWidth, fullHeight, downscaled, animated, frameCount, defaultFrameMs, index, durationMs, tooLarge, error, decodeMs, displayMs } = e.data;
     const entry = pending.get(id);
     if (!entry) return;
     pending.delete(id);
     if (error) entry.reject(new Error(error));
-    else entry.resolve({ pixels, width, height, decodeMs, displayMs });
+    // Not an exception: the UI wants to phrase this itself, with the real
+    // dimensions in the message.
+    else if (tooLarge) entry.resolve({ tooLarge });
+    else {
+      entry.resolve({
+        pixels, width, height, decodeMs, displayMs,
+        ...(fullWidth ? { fullWidth, fullHeight, downscaled } : null),
+        ...(animated ? { animated, frameCount, defaultFrameMs, index, durationMs } : null),
+      });
+    }
   };
 
   worker.onerror = (e) => {
@@ -51,9 +71,19 @@ function ensureWorker() {
 }
 
 /// Decode a HEIC/HEIF buffer to RGBA pixels, off the UI thread.
+///
+/// If the primary image is over `MAX_HEIC_PIXELS`, the worker first looks for a
+/// downscaled copy embedded in the same container (HEIC "grid" mosaics embed
+/// one) and decodes that instead — `downscaled` then comes back true. Failing
+/// that it resolves `{tooLarge}` rather than decoding something that would
+/// exhaust memory.
+///
 /// @param {ArrayBuffer} arrayBuffer raw file bytes
 /// @returns {Promise<{pixels: Uint8Array, width: number, height: number,
-///                    decodeMs: number, displayMs: number}>}
+///                    fullWidth?: number, fullHeight?: number,
+///                    downscaled?: boolean,
+///                    decodeMs: number, displayMs: number}
+///                  | {tooLarge: {width: number, height: number}}>}
 export function decodeHeic(arrayBuffer) {
   const w = ensureWorker();
   const id = nextReqId++;
@@ -62,7 +92,31 @@ export function decodeHeic(arrayBuffer) {
     try {
       // Copy rather than transfer: the caller may hold a view we must not
       // detach, and the copy is ~1 ms against a ~400 ms decode.
-      w.postMessage({ id, buffer: arrayBuffer.slice(0) });
+      w.postMessage({ id, buffer: arrayBuffer.slice(0), maxPixels: MAX_HEIC_PIXELS });
+    } catch (err) {
+      pending.delete(id);
+      reject(err);
+    }
+  });
+}
+
+/// Decode one frame of an animated HEIC, by index.
+///
+/// Only valid after `decodeHeic` has reported `animated: true` — the worker
+/// keeps the parsed container from that call, so this skips the ~19 ms reparse
+/// a fresh decode would cost. The index is 0-based and wraps: pass
+/// `frameCount - 1` to loop back to the first frame.
+///
+/// @param {number} index frame position
+/// @returns {Promise<{pixels: Uint8Array, width: number, height: number,
+///                    index: number, durationMs: number, displayMs: number}>}
+export function decodeHeicFrame(index) {
+  const w = ensureWorker();
+  const id = nextReqId++;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    try {
+      w.postMessage({ id, frameRequest: true, index });
     } catch (err) {
       pending.delete(id);
       reject(err);

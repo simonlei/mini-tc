@@ -27,7 +27,25 @@
     <!-- Image preview -->
     <div class="preview-body image-body" v-else-if="previewType === 'image'">
       <div class="heic-note" v-if="heicNote">{{ heicNote }}</div>
-      <img :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
+      <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
+           flashes (and leaks an objectURL per frame); a canvas just gets a
+           drawImage per frame, which is also cheaper than a JPEG round-trip
+           through an <img>. -->
+      <canvas
+        v-if="frameState.count > 1"
+        ref="frameCanvasRef"
+        class="preview-image"
+        :width="frameState.width"
+        :height="frameState.height"
+      ></canvas>
+      <img v-else :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
+      <button
+        v-if="frameState.count > 1"
+        class="anim-toggle"
+        :title="frameState.playing ? '暂停 (空格)' : '播放 (空格)'"
+        @click="togglePlayback"
+      >{{ frameState.playing ? "⏸" : "▶" }}</button>
+      <span v-if="frameState.count > 1" class="anim-counter">{{ frameState.index + 1 }}/{{ frameState.count }}</span>
     </div>
 
     <!-- PDF preview -->
@@ -86,10 +104,10 @@
 </template>
 
 <script setup>
-import { ref, watch, computed, onBeforeUnmount } from "vue";
+import { ref, watch, computed, onBeforeUnmount, nextTick } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
-import { decodeHeic, pixelsToBlob } from "../heicDecoder.js";
+import { decodeHeic, decodeHeicFrame, pixelsToBlob } from "../heicDecoder.js";
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
 // Vite web build). The browser build is pure-JS (uses a browser jszip) and
@@ -160,7 +178,104 @@ function releaseHeicUrl() {
     heicObjectUrl = "";
   }
 }
-onBeforeUnmount(releaseHeicUrl);
+// Must be paired with releaseHeicUrl on unmount: a live timer outliving the
+// component would call decodeHeicFrame() into a worker that outlives it too.
+onBeforeUnmount(() => {
+  releaseHeicUrl();
+  stopAnimation();
+});
+
+// ── 动画 HEIC 播放 ──
+// A multi-frame HEIC (burst, sequence, Live Photo style) plays on a canvas.
+// State is a plain ref so the template can bind it, but the *playhead* lives in
+// non-reactive variables: nothing in the template depends on them, and making
+// them reactive would re-render on every frame for no benefit.
+const frameCanvasRef = ref(null);
+const frameState = ref({ count: 0, index: 0, playing: false, width: 0, height: 0 });
+
+let animTimer = 0;      // setTimeout handle for the next frame
+let animToken = 0;      // bumped on every stop/file change; stale loops bail
+let frameDurations = []; // ms per frame, 0 = use the default
+let animDefaultMs = 100;
+
+// Stop playback and drop per-frame data. MUST be called on every file change:
+// a runaway timer that keeps calling decodeHeicFrame() would decode frames of
+// a file the user has already navigated away from.
+function stopAnimation() {
+  if (animTimer) {
+    clearTimeout(animTimer);
+    animTimer = 0;
+  }
+  animToken++;
+  frameDurations = [];
+  animDefaultMs = 100;
+  frameState.value = { count: 0, index: 0, playing: false, width: 0, height: 0 };
+}
+
+// Draw decoded RGBA into the visible canvas.
+function paintFrame(pixels, width, height) {
+  const canvas = frameCanvasRef.value;
+  if (!canvas) return;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // putImageData ignores the canvas transform and composite ops but requires
+  // the exact byte layout, so it is the right call for raw decoder output.
+  ctx.putImageData(
+    new ImageData(new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength), width, height),
+    0,
+    0
+  );
+}
+
+// Advance one frame. `token` pins this loop to the animation that started it,
+// so a stop/restart mid-flight can never leave two loops fighting over the
+// canvas.
+function scheduleFrame(token) {
+  if (token !== animToken || !frameState.value.playing) return;
+  const { count, index } = frameState.value;
+  const next = (index + 1) % count;
+  const wait = frameDurations[next] || animDefaultMs || 100;
+
+  animTimer = setTimeout(async () => {
+    if (token !== animToken) return;
+    try {
+      const f = await decodeHeicFrame(next);
+      if (token !== animToken) return;
+      paintFrame(f.pixels, f.width, f.height);
+      // Reassign rather than mutate: `frameState.value` is what the template
+      // and toggle button read, and a same-object assignment would not
+      // trigger the counter update.
+      frameState.value = { ...frameState.value, index: next };
+      if (f.durationMs) frameDurations[next] = f.durationMs;
+    } catch {
+      // A frame that will not decode ends the loop rather than spinning on
+      // the error. Keep what is already on screen.
+      frameState.value = { ...frameState.value, playing: false };
+      return;
+    }
+    scheduleFrame(token);
+  }, wait);
+}
+
+function startAnimation(token) {
+  if (token !== animToken || !frameState.value.playing) return;
+  scheduleFrame(token);
+}
+
+function togglePlayback() {
+  if (!frameState.value.count) return;
+  const token = ++animToken;
+  if (frameState.value.playing) {
+    frameState.value = { ...frameState.value, playing: false };
+    return;
+  }
+  frameState.value = { ...frameState.value, playing: true };
+  startAnimation(token);
+}
 
 // 平台检测：判断当前 WebView 是否支持内联 PDF 渲染。
 // 项目未安装 @tauri-apps/plugin-os（后端无 tauri-plugin-os），按约束不新增依赖，
@@ -335,8 +450,11 @@ async function loadDocxPreview() {
 // width*height*4 bytes, so a 48 MP phone photo needs ~200 MB before any
 // encoding. Refuse anything past the cap rather than let the tab die. Measured
 // on a 12 MP file: 48.8 MB per decode.
+//
+// The pixel cap itself lives in heicDecoder.js (MAX_HEIC_PIXELS) because it has
+// to be applied INSIDE the worker, before display() allocates — only the file
+// on disk is capped here, since that we can know without decoding.
 const MAX_HEIC_BYTES = 60 * 1024 * 1024; // 60 MB on-disk cap
-const MAX_HEIC_PIXELS = 50e6; // decoded pixel budget (12MP phone photo ≈ fine)
 
 // Per-phase timing for the HEIC path. This is the one preview that routinely
 // takes hundreds of ms, and the cost is very unevenly distributed (see the
@@ -382,6 +500,7 @@ function heicReport() {
 // The remaining cost is downscaling, which libheif-js does not expose.
 async function loadHeicPreview() {
   releaseHeicUrl();
+  stopAnimation();
   heicPhaseStart = performance.now();
   heicMarks.length = 0;
   heicMark("start", `${props.fileName} ${(props.fileBytes / 1024).toFixed(0)} KB`);
@@ -400,16 +519,42 @@ async function loadHeicPreview() {
   // The Worker does decode + colour conversion off the UI thread; we only
   // re-encode the returned pixels. These are now separate calls with separate
   // timings -- heic2any hid both behind one await across two threads.
-  const { pixels, width, height, decodeMs, displayMs } = await decodeHeic(arrayBuffer);
-  heicMark("worker-decode", `hevc ${decodeMs.toFixed(0)}ms + rgba ${displayMs.toFixed(0)}ms -> ${width}x${height}`);
+  const result = await decodeHeic(arrayBuffer);
 
-  // The pixel cap can only be enforced after the fact -- the real dimensions
-  // come from the decoder, not from the file header.
-  if (width * height > MAX_HEIC_PIXELS) {
+  // The pixel budget is enforced in the worker, before it commits the RGBA
+  // allocation. Reaching here means the primary either fitted, or the file
+  // carried an embedded downscaled copy the worker fell back to.
+  if (result.tooLarge) {
+    const { width, height } = result.tooLarge;
     error.value = `图片分辨率过高（${width}x${height}），已跳过预览以避免内存耗尽`;
     loading.value = false;
-    heicMark("aborted", "pixel cap exceeded");
+    heicMark("aborted", `${width}x${height} over budget, no embedded preview`);
     heicReport();
+    return;
+  }
+
+  const { pixels, width, height, decodeMs, displayMs } = result;
+  heicMark("worker-decode", `hevc ${decodeMs.toFixed(0)}ms + rgba ${displayMs.toFixed(0)}ms -> ${width}x${height}`);
+
+  // Animated: the first frame is already decoded and in `pixels`. Paint it on
+  // a canvas and let the loop fetch the rest on demand — decoding every frame
+  // up front would cost frames * width * height * 4 bytes all at once.
+  if (result.animated) {
+    previewType.value = "image";
+    fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
+    frameState.value = { count: result.frameCount, index: 0, playing: false, width, height };
+    frameDurations = new Array(result.frameCount).fill(0);
+    if (result.durationMs) frameDurations[0] = result.durationMs;
+    animDefaultMs = result.defaultFrameMs || 100;
+    heicNote.value = `HEIC 动画，共 ${result.frameCount} 帧`;
+    loading.value = false;
+    // The canvas only exists after previewType flips to "image", so the first
+    // paint has to wait for Vue to render it.
+    await nextTick();
+    paintFrame(pixels, width, height);
+    heicMark("ready", `frame 1/${result.frameCount} on canvas`);
+    heicReport();
+    togglePlayback();
     return;
   }
 
@@ -420,7 +565,12 @@ async function loadHeicPreview() {
   previewContent.value = heicObjectUrl;
   previewType.value = "image";
   fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : formatSize(blob.size);
-  heicNote.value = "HEIC 已转换为 JPEG 显示";
+  // Say so when this is the embedded preview rather than the real image —
+  // otherwise a 384x512 stand-in is indistinguishable from a genuinely small
+  // photo, and the user has no idea what they're not seeing.
+  heicNote.value = result.downscaled
+    ? `原图 ${result.fullWidth}x${result.fullHeight} 过大，已显示内嵌预览图`
+    : "HEIC 已转换为 JPEG 显示";
   heicMark("ready", `${(blob.size / 1024).toFixed(0)} KB JPEG`);
   loading.value = false;
 }
@@ -536,6 +686,11 @@ watch(
       heicMark("interrupted", "selection changed before painted");
       heicReport();
     }
+    // Kill any animation BEFORE the new file starts loading. Without this an
+    // arrow-key run through an animated HEIC leaves a live timer calling
+    // decodeHeicFrame() against a container the worker has already replaced,
+    // and the canvas keeps painting frames nobody is looking at.
+    stopAnimation();
     if (props.filePath) loadPreview();
   },
   { immediate: true }
@@ -663,6 +818,48 @@ watch(
   transform: translateX(-50%);
   z-index: 1;
   padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--header-bg);
+  border: 1px solid var(--border);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* Animated HEIC transport. Both sit at the bottom so they never collide with
+   the heic-note chip at the top, and they stay clear of the image because
+   .preview-body is position:relative — which also makes them overlay rather
+   than push the canvas around. */
+.anim-toggle {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--header-bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.anim-toggle:hover {
+  opacity: 1;
+  border-color: var(--accent);
+}
+
+.anim-counter {
+  position: absolute;
+  bottom: 16px;
+  right: 12px;
+  z-index: 2;
+  padding: 2px 8px;
   border-radius: 10px;
   font-size: 11px;
   color: var(--text-dim);
