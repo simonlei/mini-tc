@@ -114,7 +114,7 @@
     <SearchDialog
       v-if="searchVisible"
       :initial-path="searchRoot"
-      @close="searchVisible = false"
+      @close="closeSearch"
       @use-current-dir="onSearchUseCurrentDir"
       @reveal="onSearchReveal"
       @open-dir="onSearchOpenDir"
@@ -383,6 +383,9 @@ const searchVisible = ref(false);
 // Root directory the dialog starts from — refreshed from the active panel each
 // time it is opened, and on demand via 「当前目录」 while it is open.
 const searchRoot = ref("");
+// Panel and focused element to hand the keyboard back to on close.
+let searchReturnPanel = "left";
+let searchReturnFocus = null;
 
 function currentPanelPath() {
   return getActivePanelRef()?.currentPath || "";
@@ -391,8 +394,31 @@ function currentPanelPath() {
 function openSearch() {
   configMenuOpen.value = false;
   helpMenuOpen.value = false;
+  // Remember where focus came from: the panel we search from, and the exact
+  // element that had it (the file list itself, the path bar or the filter
+  // input). Closing the dialog puts focus back where it was, so Esc doesn't
+  // dump the user on a dead <body> with no keyboard at all.
+  searchReturnPanel = activePanel.value;
+  searchReturnFocus = document.activeElement;
   searchRoot.value = currentPanelPath();
   searchVisible.value = true;
+}
+
+function closeSearch() {
+  searchVisible.value = false;
+  const target = searchReturnFocus;
+  const panel = searchReturnPanel === "left" ? leftPanel.value : rightPanel.value;
+  nextTick(() => {
+    // Restoring the previous element is the precise answer — it is the file
+    // list, the path bar or the filter input the user was actually typing in.
+    // Fall back to the list when that element is gone (panel re-created) or
+    // focus was nowhere to begin with.
+    if (target && target !== document.body && target.isConnected) {
+      target.focus();
+      if (document.activeElement === target) return;
+    }
+    panel?.focusList?.();
+  });
 }
 
 function onSearchUseCurrentDir() {
@@ -408,6 +434,9 @@ function onSearchReveal({ dir, name } = {}) {
   if (previewVisible.value && previewPanel.value === activePanel.value) closePreview();
   const panel = getActivePanelRef();
   panel?.revealFile?.(dir, name);
+  // The dialog took the keyboard; hand it back so the revealed file can be
+  // navigated (and Enter/Tab used) right away.
+  nextTick(() => panel?.focusList?.());
 }
 
 // "打开所在目录": go to the directory without selecting anything inside it.
@@ -415,7 +444,9 @@ function onSearchOpenDir(dir) {
   searchVisible.value = false;
   if (!dir) return;
   if (previewVisible.value && previewPanel.value === activePanel.value) closePreview();
-  getActivePanelRef()?.goTo?.(dir);
+  const panel = getActivePanelRef();
+  panel?.goTo?.(dir);
+  nextTick(() => panel?.focusList?.());
 }
 
 const updateDialog = ref({
@@ -1546,6 +1577,13 @@ onMounted(() => {
     // first because it listens on the element, the video preview runs first
     // because it listens on the capture phase).
     if (isHandled(e)) return;
+
+    // The search dialog is modal and owns the keyboard: Esc is caught in its
+    // capture phase, Enter lives on its inputs. Everything else must be let
+    // go — otherwise typing a pattern also drives the panels underneath
+    // (Backspace walks up a directory, Delete removes files, arrows move the
+    // cursor behind the overlay).
+    if (searchVisible.value) return;
 
     // Esc: close the current preview (image / text / pdf / video / unsupported)
     // and return the source file list to the file that was just previewed. When
