@@ -1801,6 +1801,34 @@ onMounted(() => {
       return;
     }
 
+    // Alt+← / Alt+→: walk the active tab's own directory history (browser
+    // style). Each tab keeps an independent stack, persisted with it, so a
+    // restart can still walk back. Alt+ArrowLeft/Right have no webview-native
+    // meaning of their own (the browser's back/forward is plain Alt+← only on
+    // some builds and never fires inside a Tauri webview), so they're always
+    // consumed — same reasoning as Ctrl+T above.
+    if (matches("nav.back", e) || matches("nav.forward", e)) {
+      // Resolve both before markHandled() (which makes later matches() false).
+      const isBack = matches("nav.back", e);
+      const panel = getActivePanelRef();
+      // Don't consume the key when this panel has nowhere to go: letting it
+      // fall through keeps the combo available to the webview, and the
+      // PathBar's ← / → buttons already show the state as disabled.
+      if (!(isBack ? panel?.canGoBack?.() : panel?.canGoForward?.())) return;
+      e.preventDefault();
+      markHandled(e);
+      const res = isBack ? panel.goBack() : panel.goForward();
+      // `stepHistory` awaits a pathExists() probe per skipped entry, so it
+      // settles asynchronously even on the fast path.
+      Promise.resolve(res).then((r) => {
+        if (r?.ok && r.dropped) {
+          showToast(`已跳过 ${r.dropped} 个已不存在的目录`, "info");
+        }
+        getActivePanelRef()?.focusList?.();
+      });
+      return;
+    }
+
     // Tab / Ctrl+Tab: Switch active panel (skip if target is showing preview)
     if (matches("panel.switch", e)) {
       // A bare Tab is a real browser key (focus traversal), so it only means

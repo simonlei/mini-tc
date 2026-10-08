@@ -66,6 +66,11 @@ export const COMMANDS = [
   // 标签页本身仍可自由进出任何目录；Ctrl+Y 一键跳回锚点。
   { id: "tab.lock", scope: "global", label: "锁定 / 解锁标签页", desc: "把当前目录记为该标签页的锁定位置；已锁定时再次按下即解除锁定", defaults: ["Ctrl+Shift+L"] },
   { id: "tab.jumpLocked", scope: "global", label: "回到锁定位置", desc: "把当前标签页跳回锁定时记录的目录（未锁定则无操作）", defaults: ["Ctrl+Y"] },
+  // 每个标签页维护自己的目录历史栈（浏览器式前进/后退）。前进分支在发生新
+  // 导航时被截断（标准 history 语义），栈随tabs-<panelId>.json 一起持久化，
+  // 重启后仍能往回走。
+  { id: "nav.back", scope: "global", label: "后退", desc: "回到上一个目录（每个标签页各自记录历史，重启后仍可回退）", defaults: ["Alt+ArrowLeft"] },
+  { id: "nav.forward", scope: "global", label: "前进", desc: "回到后退之后离开的目录（没有前进历史时无操作）", defaults: ["Alt+ArrowRight"] },
   // 递归文件搜索（Total Commander 的 Alt+F7）。搜索面板打开后焦点在输入框里，
   // 此时按键由输入框处理（Ctrl+F 之类放行给 App.vue 的守卫），不会重复触发。
   { id: "search.open", scope: "global", label: "文件搜索", desc: "在指定目录下递归搜索文件（与 Total Commander 一致：Alt+F7）", defaults: ["Alt+F7", "Ctrl+F"] },

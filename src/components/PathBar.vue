@@ -16,6 +16,24 @@
       >{{ driveOptionLabel(d) }}</option>
     </select>
 
+    <!-- History (Alt+← / Alt+→). A search-results tab has no real directory to
+         travel between, so both buttons are hidden there rather than shown
+         permanently dead. -->
+    <template v-if="!virtual">
+      <button
+        class="path-btn"
+        :disabled="!canBack"
+        @click="$emit('back')"
+        :title="canBack ? '后退 (Alt+←)' : '没有可后退的目录'"
+      >←</button>
+      <button
+        class="path-btn"
+        :disabled="!canForward"
+        @click="$emit('forward')"
+        :title="canForward ? '前进 (Alt+→)' : '没有可前进的目录'"
+      >→</button>
+    </template>
+
     <button v-if="!editing && !virtual" class="path-btn" @click="$emit('refresh')" title="Refresh">↻</button>
 
     <!-- Search-results tab: there is no real path to show or navigate to, so
@@ -124,9 +142,12 @@ const props = defineProps({
   virtualLabel: { type: String, default: "" },
   // The real directory the search was rooted at (what the copy button yields).
   virtualRoot: { type: String, default: "" },
+  // Whether ← / → have anywhere to go. Drives the buttons' disabled state.
+  canBack: { type: Boolean, default: false },
+  canForward: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["navigate", "refresh"]);
+const emit = defineEmits(["navigate", "back", "forward", "refresh"]);
 
 const inputRef = ref(null);
 const editing = ref(false);
@@ -447,6 +468,17 @@ async function copyVirtualLabel() {
 
 .path-btn:hover {
   background: var(--hover);
+}
+
+/* No history in this direction — the button stays visible so the toolbar
+   doesn't reflow, but it must not look clickable. */
+.path-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.path-btn:disabled:hover {
+  background: var(--tab-bg);
 }
 
 .path-display {

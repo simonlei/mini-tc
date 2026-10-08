@@ -19,7 +19,11 @@
       :virtual-label="searchLabel"
       :virtual-root="activeTab?.search?.root || ''"
       :virtual="isVirtual"
+      :can-back="canGoBack"
+      :can-forward="canGoForward"
       @navigate="navigateTo"
+      @back="goBack"
+      @forward="goForward"
       @refresh="refresh({ force: true })"
     />
 
@@ -41,6 +45,8 @@
       @sort="handleSort"
       @navigate="navigateInto"
       @navigate-parent="navigateParent"
+      @navigate-back="goBack"
+      @navigate-forward="goForward"
       @select="onSelect"
       @calc-dir-size="calcDirSize"
       @delete="onDelete"
@@ -90,7 +96,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath } from "../paths.js";
 import { cancelSearch, startSearch } from "../api.js";
 import { listen } from "@tauri-apps/api/event";
@@ -219,6 +225,15 @@ async function saveState() {
       // dirs across sessions too. Old files simply lack the field (undefined
       // = unlocked), which is exactly the desired fallback.
       lockedPath: t.lockedPath || "",
+      // Directory history (Alt+← / Alt+→) travels with the tab. Capped on write
+      // by MAX_HISTORY during navigation; re-capped here so a hand-edited file
+      // can't bloat the config.
+      nav: t.nav
+        ? {
+            entries: (t.nav.entries || []).slice(-MAX_HISTORY),
+            index: t.nav.index,
+          }
+        : undefined,
     })),
     // Never point at a tab we just filtered out.
     activeTabId: persistable.some((t) => t.id === activeTabId.value)
@@ -267,7 +282,16 @@ async function loadState() {
 
 // Watch for state changes and persist
 watch(
-  () => tabs.value.map((t) => ({ id: t.id, path: t.path, sortColumn: t.sortColumn, sortDirection: t.sortDirection, lockedPath: t.lockedPath || "" })),
+  () => tabs.value.map((t) => ({
+    id: t.id,
+    path: t.path,
+    sortColumn: t.sortColumn,
+    sortDirection: t.sortDirection,
+    lockedPath: t.lockedPath || "",
+    // Deep-copied so the watcher fires on entries/index changes (walking back
+    // and forth must be persisted, not just path switches).
+    nav: t.nav ? { entries: [...(t.nav.entries || [])], index: t.nav.index } : null,
+  })),
   () => { activeTabId.value && saveState(); },
   { deep: true }
 );
@@ -301,6 +325,13 @@ onMounted(async () => {
       sortDirection: "asc",
       ...t,
       lockedPath: t.lockedPath || "",
+      // History was added after the first release, so older
+      // ~/.minitc/tabs-*.json files simply don't have it. Seed it from the
+      // restored path so Alt+← has somewhere to go from the first move;
+      // `navOf` repairs any malformed shape lazily on first use.
+      nav: t.nav && Array.isArray(t.nav.entries) && t.nav.entries.length
+        ? { entries: [...t.nav.entries], index: t.nav.index }
+        : { entries: [t.path], index: 0 },
     }));
     activeTabId.value = saved.activeTabId;
   } else {
@@ -396,6 +427,9 @@ function createTab(path) {
     sortDirection: "asc",
     // Locked-tab anchor dir. Empty = not locked (see toggleTabLock).
     lockedPath: "",
+    // Per-tab directory history for Alt+← / Alt+→. Seeded with the opening
+    // directory so there is something to go back to from the very first move.
+    nav: { entries: [path], index: 0 },
     // Non-null only for a "search results" pseudo-directory: { root, pattern,
     // hits, live, searchId, done }. Kept on the tab (not in a module-level
     // variable) so two search tabs in the same panel can't tread on each other.
@@ -529,7 +563,7 @@ function jumpToLocked(id = activeTabId.value) {
   if (!tab) return { ok: false, reason: "none" };
   if (!tab.lockedPath) return { ok: false, reason: "unlocked" };
   if (tab.lockedPath === tab.path) return { ok: false, reason: "same" };
-  tab.path = tab.lockedPath;
+  setPath(tab, tab.lockedPath);
   return { ok: true, path: tab.lockedPath };
 }
 
@@ -591,7 +625,7 @@ function handleTabMenuSelect(item) {
       const root = tab && tab.search && tab.search.root;
       if (root) {
         tab.search = null;
-        tab.path = root;
+        setPath(tab, root);
       }
       break;
     }
@@ -599,6 +633,204 @@ function handleTabMenuSelect(item) {
       closeTab(id);
       break;
   }
+}
+
+// ── Navigation history (Alt+← back / Alt+→ forward) ──
+//
+// Every TAB owns its own history stack, persisted together with the tab in
+// ~/.minitc/tabs-<panelId>.json — so after a restart you can still walk back
+// the directories you visited. Shape: { entries: string[], index: number },
+// where `entries[index]` is ALWAYS the tab's current path. That makes
+// entries[0..index] the back trail and entries[index+1..] the forward trail.
+//
+// The stack is deliberately NOT a browser-global undo list: each tab is its
+// own browsing session, exactly like Total Commander's per-panel directory
+// history.
+//
+// ⚠️ EVERY path change must go through `setPath()` below — that is the single
+// place that records history. Assigning `tab.path` directly (there are several
+// such sites: locked-tab jump, tab-menu "go to search root", open-container,
+// …) silently skips the history and breaks Alt+← in a way that is very hard to
+// trace back.
+
+/// Longest history kept per tab. Bounded so a long browsing session can't grow
+/// ~/.minitc/tabs-*.json without limit; the oldest entries are dropped.
+const MAX_HISTORY = 100;
+
+/// The tab's history stack WITHOUT any healing side effect.
+///
+/// Never mutate from here — this is read by computeds, and a computed that
+/// writes reactive state re-triggers itself (the classic "computed with side
+/// effects" trap). `navOf` below is the only place allowed to repair a stack,
+/// and it is called from the navigation paths, not from render-time code.
+function peekNav(tab) {
+  if (!tab) return null;
+  if (!tab.nav || !Array.isArray(tab.nav.entries)) return null;
+  if (!Number.isInteger(tab.nav.index)) return null;
+  if (tab.nav.index < 0 || tab.nav.index >= tab.nav.entries.length) return null;
+  return tab.nav;
+}
+
+/// The tab's history stack, created on demand (tabs restored from an older
+/// config file have none) and self-healing if it was ever persisted malformed.
+///
+/// ⚠️ Call this BEFORE mutating `tab.path`, and only from the navigation paths —
+/// never from a computed (see `peekNav`). The repair branch exists solely for
+/// hand-edited / truncated config files; during normal navigation a "cursor not
+/// on the current path" state is INTENTIONAL (stepHistory moves it first), and
+/// healing it there would corrupt the stack.
+function navOf(tab) {
+  const cur = tab.path || "";
+  if (!tab.nav || !Array.isArray(tab.nav.entries)) {
+    tab.nav = { entries: cur ? [cur] : [], index: cur ? 0 : -1 };
+    return tab.nav;
+  }
+  // Defensive normalisation: a hand-edited / truncated config could leave the
+  // index out of range, which would make back/forward jump somewhere arbitrary.
+  if (!Number.isInteger(tab.nav.index)) tab.nav.index = -1;
+  if (tab.nav.index >= tab.nav.entries.length) tab.nav.index = tab.nav.entries.length - 1;
+  // Repair only a genuinely broken stack: one where the current directory isn't
+  // recorded AT ALL. A cursor merely parked elsewhere is left alone — that's the
+  // normal state between picking a destination and arriving at it.
+  if (cur && !tab.nav.entries.includes(cur)) {
+    tab.nav.entries = tab.nav.entries.slice(0, tab.nav.index + 1);
+    tab.nav.entries.push(cur);
+    tab.nav.index = tab.nav.entries.length - 1;
+  }
+  return tab.nav;
+}
+
+/// Set a tab's current directory, recording it in the tab's history.
+///
+/// `opts.record` is false for the back/forward moves themselves — those walk
+/// the existing stack instead of pushing onto it (standard browser semantics:
+/// going back then navigating somewhere new discards the forward trail).
+/// `opts.skipHeal` suppresses `navOf`'s desync repair, for callers that have
+/// already positioned the cursor on the destination (stepHistory) — there the
+/// mismatch is intentional, and healing would splice the path we came FROM
+/// back into the stack as a bogus extra entry.
+function setPath(tab, newPath, opts = {}) {
+  if (!tab || !newPath) return;
+  const oldPath = tab.path;
+  if (oldPath === newPath) return;
+
+  // Leaving the result set for a real directory (or vice versa) invalidates the
+  // stack: a `minitc://search/…` sentinel is not a directory you can return to,
+  // so we don't keep it as a history entry. The real destination becomes the
+  // new starting point instead.
+  const wasVirtual = isSearchPath(oldPath);
+  const isVirtualNow = isSearchPath(newPath);
+
+  // ⚠️ ORDER MATTERS: resolve (and if needed create/repair) the stack while
+  // `tab.path` is still the OLD directory. `navOf` anchors on `tab.path`, so
+  // calling it after the assignment below would read the desync as "current
+  // path isn't in the stack", push the new path to fix it — and then the
+  // recording logic would push the very same path a second time, leaving
+  // `entries = [.., new, new]`. Back would then appear to do nothing on the
+  // first press (it lands on the duplicate, the same directory) and only move
+  // on the second — the "have to press it twice" symptom.
+  const nav = peekNav(tab) || navOf(tab);
+
+  tab.path = newPath;
+
+  if (opts.record === false) return;
+  if (isVirtualNow) {
+    // Entering a search-results tab: nothing to remember.
+    tab.nav = { entries: [], index: -1 };
+    return;
+  }
+  if (wasVirtual) {
+    // Coming out of a search tab — start a fresh trail at the real directory.
+    nav.entries = [newPath];
+    nav.index = 0;
+    return;
+  }
+  // New navigation: everything after the current position is now unreachable.
+  nav.entries = nav.entries.slice(0, nav.index + 1);
+  nav.entries.push(newPath);
+  if (nav.entries.length > MAX_HISTORY) {
+    nav.entries = nav.entries.slice(nav.entries.length - MAX_HISTORY);
+  }
+  nav.index = nav.entries.length - 1;
+}
+
+/// True when the active tab can go back / forward.
+/// Read-only (`peekNav`, never `navOf`): computeds must not write reactive
+/// state, or they re-trigger themselves on every evaluation.
+const canGoBack = computed(() => {
+  if (isVirtual.value) return false;
+  const nav = peekNav(activeTab.value);
+  return !!nav && nav.index > 0;
+});
+
+const canGoForward = computed(() => {
+  if (isVirtual.value) return false;
+  const nav = peekNav(activeTab.value);
+  return !!nav && nav.index >= 0 && nav.index < nav.entries.length - 1;
+});
+
+/// Last segment of a path ("" for a drive root like `C:\`).
+function leafName(p) {
+  return String(p || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+}
+
+/// Move the active tab `delta` steps through its history (−1 = back, +1 =
+/// forward). Directories that no longer exist are dropped from the stack on
+/// the way, so a folder deleted (or a drive unmounted) since the last visit
+/// can't strand the panel on an error screen — we keep walking towards the
+/// next reachable entry.
+async function stepHistory(delta) {
+  const tab = activeTab.value;
+  if (!tab) return { ok: false, reason: "none" };
+  if (isVirtual.value) return { ok: false, reason: "virtual" };
+
+  const nav = navOf(tab);
+  const from = tab.path;
+  let start = nav.index;
+  let dropped = 0;
+  let i = start + delta;
+
+  while (i >= 0 && i < nav.entries.length) {
+    const candidate = nav.entries[i];
+    let alive = false;
+    try {
+      alive = await pathExists(candidate);
+    } catch {
+      alive = false;
+    }
+    if (alive) {
+      nav.index = i;
+      // Coming back to a directory: select the folder we just left, the way a
+      // browser highlights the previous page. FileList ignores the name when it
+      // isn't there (e.g. after jumping several levels at once).
+      pendingSelectName.value = leafName(from) || null;
+      setPath(tab, candidate, { record: false });
+      return { ok: true, path: candidate, dropped };
+    }
+    // Vanished — forget it and keep looking in the same direction. Splicing
+    // shifts everything after it, so `start` and `i` are corrected per
+    // direction: removing an entry BEFORE the cursor moves both left, while
+    // removing one AFTER it leaves `i` already pointing at the next candidate.
+    dropped += 1;
+    nav.entries.splice(i, 1);
+    if (delta < 0) {
+      start -= 1;
+      i -= 1;
+    }
+  }
+
+  // Nothing left in that direction. Put the cursor back where it started so the
+  // stack is left exactly as we found it (minus the dead entries).
+  nav.index = Math.max(0, Math.min(start, nav.entries.length - 1));
+  return { ok: false, reason: "edge", dropped };
+}
+
+function goBack() {
+  return stepHistory(-1);
+}
+
+function goForward() {
+  return stepHistory(1);
 }
 
 // ── Navigation ──
@@ -713,7 +945,7 @@ function navigateTo(newPath) {
   // Any explicit navigation (breadcrumb, path bar, "open containing folder")
   // leaves the search-results state — the tab is now a real directory.
   activeTab.value.search = null;
-  activeTab.value.path = newPath;
+  setPath(activeTab.value, newPath);
 }
 
 async function navigateInto(entryOrName) {
@@ -729,7 +961,7 @@ async function navigateInto(entryOrName) {
   const newPath = await entryPath(entry, activeTab.value.path);
   // Leaving the result set for a real directory: the tab is no longer virtual.
   activeTab.value.search = null;
-  activeTab.value.path = newPath;
+  setPath(activeTab.value, newPath);
 }
 
 async function navigateParent() {
@@ -746,7 +978,7 @@ async function navigateParent() {
     const parent = await getParentDir(activeTab.value.path);
     if (parent && parent.length > 0) {
       pendingSelectName.value = currentName;
-      activeTab.value.path = parent;
+      setPath(activeTab.value, parent);
     }
   } catch {
     // Already at root
@@ -1243,7 +1475,7 @@ async function handleCtxSelect(item) {
       const dir = parentDirOf(full);
       if (dir) {
         activeTab.value.search = null;
-        activeTab.value.path = dir;
+        setPath(activeTab.value, dir);
       }
       break;
     }
@@ -1485,6 +1717,13 @@ defineExpose({
   // 让「没锁定 / 已在锁定位置」这类空操作对用户可见。
   toggleLock: () => toggleTabLock(activeTabId.value),
   jumpToLocked: () => jumpToLocked(activeTabId.value),
+  // Directory history（Alt+← / Alt+→）。返回结果供 App.vue 弹 toast，让「已在
+  // 最前/最后一条」这类空操作对用户可见；`canGoBack` / `canGoForward` 让调用方
+  // 提前知道该不该处理这次按键。
+  canGoBack: () => canGoBack.value,
+  canGoForward: () => canGoForward.value,
+  goBack,
+  goForward,
   refresh,
   refreshDrives,
   // Jump the panel to an arbitrary directory (used by the search dialog's

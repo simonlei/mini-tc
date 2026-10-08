@@ -156,7 +156,7 @@ const props = defineProps({
   cutNames: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "navigate-back", "navigate-forward", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -657,9 +657,12 @@ function onCompositionStart() {
   }
 }
 
-// Mouse back button (XButton1, e.button === 3) navigates to parent, but only
-// when this panel is the active one. Matches the Backspace behaviour.
-// preventDefault on mousedown blocks any browser/Tauri back/forward side effects.
+// Mouse side buttons. XButton1 (e.button === 3) is "back" and XButton2
+// (=== 4) is "forward": they walk the panel's directory history (same as
+// Alt+← / Alt+→), NOT "go to parent" like Backspace. Both are claimed only on
+// the active panel so the other side doesn't react too.
+// preventDefault on mousedown blocks any browser/Tauri back/forward side
+// effects (WebView2 maps these to history navigation in some configurations).
 function onMouseDown(e) {
   if (e.button === 3 || e.button === 4) {
     e.preventDefault();
@@ -667,9 +670,13 @@ function onMouseDown(e) {
 }
 
 function onMouseUp(e) {
-  if (e.button === 3 && props.isActive) {
+  if (!props.isActive) return;
+  if (e.button === 3) {
     e.preventDefault();
-    emit("navigate-parent");
+    emit("navigate-back");
+  } else if (e.button === 4) {
+    e.preventDefault();
+    emit("navigate-forward");
   }
 }
 
