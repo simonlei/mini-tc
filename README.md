@@ -14,13 +14,14 @@
 - 每栏独立多 Tab 管理，Tab 状态自动持久化
 - 可编辑路径栏 + 盘符下拉切换
 - 文件列表按名称 / 大小 / 修改时间排序（名称排序时：忽略连字符 `-`，如 `-1a.txt` 按 `1a.txt` 比较；中文字符排在数字与英文字母之后，如 `0.txt` < `a.txt` < `推特.txt`；数字段按数值自然排序，`1a.jpg` < `2c.jpg` < `10b.jpg`）
-- **启动屏（splash）**：冷启动时全屏 logo + 三点循环加载。展示**至少 250ms**，并等左右两栏首次列目录都完成才淡出（250ms），另有 2500ms 硬兜底防止慢目录/网络盘把用户堵在加载页；常量 `SPLASH_MIN_SHOW_MS` / `SPLASH_FADE_MS` / `SPLASH_MAX_SHOW_MS` 在 `src/main.js` 顶部，其中淡出时长由 JS 在运行时内联写入 `transitionDuration`，是单一真源（`index.html` 里的 CSS 只是兜底，别再两处各写一份）
+- **启动屏（splash）**：冷启动时全屏 logo + 三点循环加载。splash 是 `index.html` 里的**静态元素**，几乎立刻绘制，加载工作在其下**并行**进行——它的职责是让等待可见，所以**工作一完成就必须立刻让位**。判定条件是「展示时长 ≥ 250ms（防一闪）**且** 左右两栏首次列目录都完成」，两者同时满足即淡出（250ms），另有 2500ms 硬兜底防止慢目录/网络盘把用户堵在加载页。⚠️ **计时起点必须取 `index.html` 内联脚本里的 `__MINITC_SPLASH_SHOWN_AT__`，不能取 `main.js` 里的 `performance.now()`**——后者比 splash 实际出现晚约 390ms（模块求值完才执行），MIN_SHOW 会在「早已显示」的基础上再加一段死等（实测白等约 160ms）。常量 `SPLASH_MIN_SHOW_MS` / `SPLASH_FADE_MS` / `SPLASH_MAX_SHOW_MS` 在 `src/main.js` 顶部，其中淡出时长由 JS 在运行时内联写入 `transitionDuration`，是单一真源（`index.html` 里的 CSS 只是兜底，别再两处各写一份）
+  - 埋点里 `splash:fade-start` 的 note 现在是 `shown=…ms panels=N after-ready=…ms`：**`after-ready` 才是调参依据**——它表示「数据全就绪后用户还得盯着一个已完成的动画多久」，应当恒为 0；`shown` 只是 splash 总显示时长，别拿它当延迟指标
 - **启动耗时埋点**：`src/bootLog.js` + 后端 `boot_mark` / `boot_timings` 命令，开发模式下 devtools 控制台会打印两张 `console.table`（JS 阶段 / Rust 阶段，共用同一时钟可直接对齐），Rust 侧另有 `[boot] ... ms` 逐行输出到控制台窗口。用 `localStorage.setItem("minitc-boot-log", "off")` 可关闭
-- **启动路径上的三处瘦身**（实测大头是 Tauri 固有的 WebView2 `setup`，JS 侧能砍的主要是重复 IPC 与无谓排序）：
-  - **配置批量预载**：启动要读 theme / text-preview / app-config / shortcuts / bookmarks / panel-split / view-state + 每栏 tabs-\* 共 9 份 `~/.minitc/*.json`，原本是 9 次独立 `load_config` 往返，而首屏列目录就卡在其中一次上。改为后端 `load_configs()` 一次 `read_dir` 全部读回，前端 `api.js` 用 `primeConfigs()` 在 `mount()` 之前启动（**不 await**）并缓存；`loadConfig` 内部会等这个 in-flight promise，所以子组件先于父组件 `onMounted` 跑也没问题，调用点无需改动。`saveConfig` 会回写缓存；读取失败时缓存置 `null` 退回逐文件 IPC，**不会把一次瞬时失败缓存成「配置全丢」**
+- **启动路径上的两处瘦身**（实测大头是 Tauri 固有的 WebView2 `setup`，JS 侧能砍的主要是重复探测与无谓排序）：
   - **驱动器列表缓存**：后端 `list_drives` 要遍历 A–Z 逐个 `Path::exists` + 对应答的卷调 `GetDiskFreeSpaceExW`（空光驱、断连网络盘可阻塞数百 ms），而左右两栏在 mount 和**每次窗口重新获得焦点**时都会各调一次 —— 一次切窗就是 4 次走盘。现由后端 `OnceLock<Mutex<..>>` 缓存、TTL 2 秒。**锁要持跨越探测本身**：两栏的请求在同一 tick 发出，只包缓存检查的话它俩会双双 miss 各跑一遍全盘扫描
   - **`list_directory` 不再排序**：前端 `sortedEntries` 对除 `found`（搜索顺序，仅搜索结果伪目录有意义）外的所有列都会重排，后端排的序必被丢弃，而那个比较器每次比较要 `to_lowercase()` 两次 = O(n log n) 次堆分配，故直接删掉
-  - 前两条已合并进本轮改动；第三条（`list_directory` 每条目 stat 两次 → 改 `entry.metadata()`）在实现递归搜索时已顺带修掉
+  - ❌ **反例：不要把 9 次 `load_config` 合并成 1 次 `load_configs`**。曾实现并实测为**负优化**——配置总量仅约 4 KB，瓶颈从来不是 I/O 而是 IPC 往返本身：合并后的单次调用要 **57ms**，而被它替代的 9 次并行单文件调用每个只要 ~14ms。把 9 次并行排到 1 道屏障后面，等于让页面上最慢的东西变成那道屏障。这个量级下**并行独立 > 批量串行**。静态分析（「9 次往返合并成 1 次」听起来必然更优）在这里是错的，只有实测能发现量级反了
+  - 另：`list_directory` 每条目 stat 两次（→改 `entry.metadata()`）在实现递归搜索时已顺带修掉
 - **文件预览**（Ctrl+Q）：文本（txt/md/json/log）、图片（jpg/png/gif/webp/bmp/svg/avif）、HEIC 系列（heic/heif/hif/avci）和 PDF/doc/docx；图片经 asset protocol 直接加载，无大小限制；文本预览区内可拖选文字按 Ctrl+C 复制，或点 footer「复制全部」复制整篇
   - **HEIC/HEIF 预览**：WebView2 无原生 HEIC 解码器，走 `src/heicDecoder.js` + `src/heicDecode.worker.js` —— Worker 里用 **libheif 的 WebAssembly 版**解码成 RGBA，主线程再 canvas 编成 JPEG 交给 `<img>`，图上标注「已转换为 JPEG」。wasm 约 2 MB，按需加载（`?worker` 导入 + `optimizeDeps.include` 登记），启动不受影响。设了两道防爆上限：单文件 60 MB、解码后 5000 万像素（12MP 手机照片约需 48.8 MB RGBA 缓冲）
   - **⚠️ 像素上限必须在 Worker 里 `display()` 之前判**（曾踩坑）：原本上限是在 `decodeHeic()` 返回之后才检查的，可那时 `display()` 早已跑完 —— 实测一张 12240×16320 的文件**先烧掉 4.4 s / 762 MB RGBA / 2.1 GB RSS，然后才弹「已跳过预览」**，上限等于没设。现在上限由 `heicDecoder.js` 的 `MAX_HEIC_PIXELS` 经 postMessage 传进 Worker，在分配像素缓冲前拦截

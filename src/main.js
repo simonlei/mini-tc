@@ -1,18 +1,18 @@
 import { createApp } from "vue";
 import App from "./App.vue";
 import "./style.css";
-import { mark, adopt, track, waitFor } from "./bootLog.js";
-import { primeConfigs } from "./api.js";
+import { mark, adopt, waitFor } from "./bootLog.js";
 
-// Splash timing. Boot instrumentation (see src/bootLog.js) showed the app is
-// fully working ~510 ms after the first HTML byte: both panels have listed by
-// ~124 ms after this module is evaluated, so the gate that actually decides
-// when the splash leaves is MIN_SHOW_MS, not the listing.
+// Splash timing. The splash is static markup in index.html: it paints almost
+// immediately and covers the loading work underneath, which then runs in
+// parallel. Its only job is to make waiting legible — so the moment that work
+// is done it must get out of the way (see `dismissSplash`).
 //
-// Measured, from process start: ~1520 ms of it is native WebView2 setup that
-// JS cannot shorten, then ~40 ms HTML, ~345 ms module eval, ~85 ms to list
-// both panels. So the only budget left to cut is here — every millisecond of
-// MIN_SHOW + FADE is pure dead time on top of a working UI.
+// Measured on the current build: html parsed ~43 ms, module eval ~390 ms, both
+// panels listed ~533 ms. MIN_SHOW exists only so a genuinely fast launch can't
+// flash the splash for one frame; because the clock starts at html:parsed (not
+// at module eval, which is ~390 ms later) that floor is already satisfied long
+// before the panels land, and it never adds delay to a finished load.
 const SPLASH_MIN_SHOW_MS = 250;
 const SPLASH_FADE_MS = 250;
 const SPLASH_MAX_SHOW_MS = 2500;
@@ -20,7 +20,11 @@ const SPLASH_MAX_SHOW_MS = 2500;
 // "minitc:panel-listed" once its first directory listing lands.
 const PANEL_COUNT = 2;
 
-const splashShownAt = performance.now();
+// When the splash became visible. Taken from the inline script in index.html —
+// the splash is static markup painted long before this module finishes
+// evaluating, so stamping it here would start the minimum-show window several
+// hundred ms late and hold a splash that has already been on screen all along.
+const splashShownAt = window.__MINITC_SPLASH_SHOWN_AT__ ?? performance.now();
 let panelsListed = 0;
 window.addEventListener("minitc:panel-listed", () => {
   panelsListed += 1;
@@ -32,12 +36,6 @@ mark("main.js:eval");
 // The startup timeline is only complete once the splash is off screen.
 waitFor("splash:removed");
 
-// Kick off the batched ~/.minitc read BEFORE mounting. Deliberately not
-// awaited: `loadConfig` waits on this promise internally, so the panels'
-// own loads pick it up for free while the app keeps rendering. Mounting must
-// not block on I/O.
-track("cfg:prime", primeConfigs());
-
 createApp(App).mount("#app");
 mark("vue:mounted");
 
@@ -45,18 +43,33 @@ mark("vue:mounted");
 // both panels have listed. A double rAF guarantees the panels' first frame is
 // on-screen before we start counting down, so the splash covers the *whole*
 // transition rather than racing a half-painted app.
+//
+// The splash is a *progress* indicator: it covers the loading work and gets out
+// of the way the moment that work is done. So MIN_SHOW is a floor on how long
+// it may be visible (anti-flash), never a delay to add on top of a finished
+// load — hence both conditions are ANDed, and neither may wait for the other.
+let readyAt = null;
+
 function dismissSplash() {
   const splash = document.getElementById("splash");
   if (!splash || splash.dataset.dismissing === "1") return;
 
   const elapsed = performance.now() - splashShownAt;
+  if (panelsListed >= PANEL_COUNT && readyAt === null) readyAt = elapsed;
   const ready = elapsed >= SPLASH_MIN_SHOW_MS && panelsListed >= PANEL_COUNT;
   if (!ready && elapsed < SPLASH_MAX_SHOW_MS) {
     setTimeout(dismissSplash, 30);
     return;
   }
 
-  mark("splash:fade-start", `waited=${elapsed.toFixed(0)}ms panels=${panelsListed}`);
+  // `after-ready` is the number that matters when tuning: how much dead time the
+  // user spent staring at a finished splash. It should stay at 0.
+  const afterReady = readyAt === null ? null : Math.max(0, elapsed - readyAt);
+  mark(
+    "splash:fade-start",
+    `shown=${elapsed.toFixed(0)}ms panels=${panelsListed}` +
+      (afterReady === null ? "" : ` after-ready=${afterReady.toFixed(0)}ms`)
+  );
   splash.dataset.dismissing = "1";
   // Applied here so SPLASH_FADE_MS is authoritative: the CSS duration and this
   // constant had drifted apart (0.6s vs 300ms) and the CSS silently won.

@@ -109,63 +109,25 @@ export async function cancelSearch() {
   return invoke("cancel_search");
 }
 
-/// Startup config cache.
-///
-/// Boot fires nine `load_config` calls (theme, text-preview extensions, app
-/// config, shortcuts, bookmarks, panel split, view state, and one tab list per
-/// panel). Each is a full webview → Rust → webview round-trip for a few hundred
-/// bytes, and `FilePanel`'s very first directory listing is blocked behind one
-/// of them. `primeConfigs` reads every `~/.minitc/*.json` in ONE round-trip and
-/// the individual loads then resolve from memory.
-///
-/// Callers keep using `loadConfig` unchanged — it awaits the in-flight prime
-/// before deciding, so there is no ordering requirement between this and the
-/// components' own `onMounted` loads. That matters because `FilePanel` (a
-/// child) mounts before `App`'s `onMounted` runs.
-let configCache = null;
-let configPriming = null;
-
-/// Start the batch read. Safe to call more than once; the first call wins.
-/// Resolves either way — a failure just leaves the cache disabled.
-export function primeConfigs() {
-  if (!configPriming) {
-    configPriming = invoke("load_configs")
-      .then((all) => {
-        // Keys are config names (the file stem); the backend already dropped
-        // anything whose name wouldn't survive `save_config`'s validation.
-        configCache = new Map(Object.entries(all || {}));
-      })
-      .catch(() => {
-        // No cache: every `loadConfig` falls back to its own IPC, which is
-        // exactly the pre-optimization behaviour. Never cache an empty map —
-        // that would turn a transient failure into "all config lost".
-        configCache = null;
-      });
-  }
-  return configPriming;
-}
-
 /// Load a named config blob from ~/.minitc/<name>.json.
 /// Resolves to the raw JSON string, or null when absent / unreadable.
+///
+/// Deliberately one IPC per config, issued in parallel by the boot code. An
+/// earlier version batched all of ~/.minitc into a single `load_configs` call
+/// and had every `loadConfig` await it — which sounded like a clear win (9
+/// round-trips → 1) and measured as the opposite. Boot log: the batch call
+/// took 57 ms, while the parallel single-file calls it was meant to replace
+/// took ~14 ms each. The config payload is ~4 KB total, so the cost was never
+/// I/O — it was the round-trip itself, and serializing nine of them behind one
+/// barrier made the slowest thing on the page. At this scale, parallel-and-
+/// independent beats batched-and-gated.
 export async function loadConfig(name) {
-  // Ride along with the batch read if one is in flight, otherwise we might
-  // miss the cache purely because we got here first.
-  if (configPriming) await configPriming;
-  if (configCache) {
-    // A key missing from the batch read means the file does not exist, which
-    // is what a failed single-file load would have told us too.
-    return configCache.has(name) ? configCache.get(name) : null;
-  }
   return invoke("load_config", { name });
 }
 
 /// Persist a named config blob to ~/.minitc/<name>.json.
-/// Also updates the batch cache, so a `loadConfig` right after a `saveConfig`
-/// sees the new value rather than the one captured at startup.
 export async function saveConfig(name, config) {
-  const res = await invoke("save_config", { name, config });
-  if (configCache) configCache.set(name, config);
-  return res;
+  return invoke("save_config", { name, config });
 }
 
 /// Write the given paths onto the OS clipboard as a file list.

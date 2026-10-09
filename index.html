@@ -131,9 +131,18 @@
       // <body>, so the splash markup is in the DOM (not yet painted). The main
       // bundle is a deferred module and runs after this, so these marks end up
       // first in the timeline printed by src/bootLog.js.
+      //
+      // The splash shown-timestamp belongs HERE, not in main.js. The splash is
+      // static markup painted at roughly this moment, but module evaluation
+      // finishes ~390 ms later — and main.js used to start its MIN_SHOW clock
+      // there. That made the app hold a splash it had already been showing for
+      // almost 0.6 s, adding ~160 ms of dead time *after* everything was ready.
+      // The minimum-show window is about "don't let the splash flash by", so it
+      // must be measured from when the splash actually became visible.
       window.__MINITC_BOOT_MARKS__ = [
         ["html:parsed", performance.now()],
       ];
+      window.__MINITC_SPLASH_SHOWN_AT__ = performance.now();
     </script>
     <script type="module" src="/src/main.js"></script>
   </body>

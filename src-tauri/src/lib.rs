@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1961,47 +1960,6 @@ fn load_config(name: String) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-/// Read *every* `~/.minitc/*.json` in one IPC round-trip, keyed by config name
-/// (the file stem), for the startup path.
-///
-/// mini-tc fires nine separate `load_config` calls during boot (theme,
-/// text-preview extensions, app config, shortcuts, bookmarks, panel split,
-/// view state, and one tab list per panel). Each is a full webview → Rust →
-/// webview round-trip for a few hundred bytes, and `FilePanel`'s first
-/// directory listing is blocked behind one of them. A single directory read
-/// replaces all nine.
-///
-/// Names are still validated with `is_valid_config_name` (a hand-dropped file
-/// called `..json` must not become a key we would later hand back to
-/// `save_config`), and unreadable files are simply absent from the map — the
-/// frontend treats a missing key exactly like a missing single-file load.
-#[tauri::command]
-fn load_configs() -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Some(dir) = home_dir().map(|h| h.join(".minitc")) else {
-        return out;
-    };
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !is_valid_config_name(stem) {
-            continue;
-        }
-        if let Ok(text) = fs::read_to_string(&path) {
-            out.insert(stem.to_string(), text);
-        }
-    }
-    out
-}
-
 /// Persist a named config blob to ~/.minitc/<name>.json so it is shared across
 /// every run of the binary (dev vs bundled) regardless of cwd.
 #[tauri::command]
@@ -3079,7 +3037,6 @@ pub fn run() {
             copy_items,
             move_items,
             load_config,
-            load_configs,
             save_config,
             set_clipboard_files,
             get_clipboard_files,
