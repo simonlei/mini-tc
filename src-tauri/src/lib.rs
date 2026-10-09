@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -71,7 +72,9 @@ pub struct DirectoryListing {
 
 /// A drive/volume exposed in the drive selector, paired with its capacity so
 /// the frontend can show how much free space is left on each disk.
-#[derive(Serialize)]
+/// `Clone` because `list_drives` serves cached results by cloning them out of
+/// the shared cache (each caller gets its own copy, no shared borrow).
+#[derive(Serialize, Clone)]
 pub struct DriveInfo {
     pub name: String,     // e.g. "C:\\" (or "/" on Unix)
     pub free_bytes: u64,  // space available to the caller (bytes)
@@ -164,13 +167,13 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
         });
     }
 
-    // Sort: directories first, then by name
-    result.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-
+    // Deliberately NOT sorted here. The frontend's `sortedEntries` re-sorts on
+    // every listing for every column, so any order we impose is thrown away —
+    // and it was not free: the old comparator called `to_lowercase()` on both
+    // names on every comparison, i.e. two heap allocations per O(n log n) step.
+    // The one consumer that wants the backend's order ("found" / search order)
+    // only applies to search-results tabs, and those rows come from the search
+    // command, never from here. `read_dir` order is left as-is.
     let has_parent = matches!(dir_path.parent(), Some(p) if !p.as_os_str().is_empty());
 
     Ok(DirectoryListing {
@@ -218,33 +221,70 @@ fn get_parent_dir(path: String) -> Result<String, String> {
 /// free and total space so the frontend can display remaining capacity. On
 /// other platforms, return root "/" (space left as 0 — the drive selector is
 /// hidden there anyway).
+///
+/// The A–Z probe costs one `Path::exists` per letter plus a
+/// `GetDiskFreeSpaceExW` per volume that answers, and a volume that is present
+/// but not ready (an empty optical drive, a disconnected network mount) can
+/// block for hundreds of milliseconds. mini-tc has two panels that each want
+/// the drive list on mount and again on every window-focus regain, so without
+/// a cache a single window switch pays that walk twice per panel.
+///
+/// The lock is held ACROSS the probe, not just around the cache check. Both
+/// panels fire their mount-time request within the same tick, so a
+/// check-then-probe-then-store sequence would let them both miss the cache and
+/// each run the full walk. Whoever wins does the work; the other blocks and
+/// then reads the fresh entry. Free space moves slowly, so the two-second TTL
+/// is invisible while the saving is not.
 #[tauri::command]
 fn list_drives() -> Result<Vec<DriveInfo>, String> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, Vec<DriveInfo>)>>,
+    > = std::sync::OnceLock::new();
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
     #[cfg(windows)]
     {
-        let mut drives = Vec::new();
-        let letters = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        for &letter in letters.iter() {
-            let drive = format!("{}:\\", letter as char);
-            if Path::new(&drive).exists() {
-                let (free, total) = drive_space(&drive);
-                drives.push(DriveInfo {
-                    name: drive,
-                    free_bytes: free,
-                    total_bytes: total,
-                });
-            }
+        let mut cache = CACHE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .map_err(|_| "drive cache poisoned".to_string())?;
+        let fresh = cache.as_ref().is_some_and(|(at, _)| at.elapsed() < TTL);
+        if !fresh {
+            *cache = Some((std::time::Instant::now(), probe_drives()));
         }
-        Ok(drives)
+        // `cache` is Some on both paths, so this cannot fail.
+        Ok(cache.as_ref().unwrap().1.clone())
     }
     #[cfg(not(windows))]
     {
+        // Nothing to probe (a single "/" entry) and no filesystem walk to
+        // amortize, so a cache would only add a way to serve stale data.
         Ok(vec![DriveInfo {
             name: "/".to_string(),
             free_bytes: 0,
             total_bytes: 0,
         }])
     }
+}
+
+/// Walk A–Z and collect the volumes that answer. Split out of `list_drives` so
+/// the caching wrapper reads as cache-or-probe.
+#[cfg(windows)]
+fn probe_drives() -> Vec<DriveInfo> {
+    let mut drives = Vec::new();
+    let letters = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for &letter in letters.iter() {
+        let drive = format!("{}:\\", letter as char);
+        if Path::new(&drive).exists() {
+            let (free, total) = drive_space(&drive);
+            drives.push(DriveInfo {
+                name: drive,
+                free_bytes: free,
+                total_bytes: total,
+            });
+        }
+    }
+    drives
 }
 
 /// Query free/total bytes for a Windows volume via `GetDiskFreeSpaceExW`.
@@ -1921,6 +1961,47 @@ fn load_config(name: String) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// Read *every* `~/.minitc/*.json` in one IPC round-trip, keyed by config name
+/// (the file stem), for the startup path.
+///
+/// mini-tc fires nine separate `load_config` calls during boot (theme,
+/// text-preview extensions, app config, shortcuts, bookmarks, panel split,
+/// view state, and one tab list per panel). Each is a full webview → Rust →
+/// webview round-trip for a few hundred bytes, and `FilePanel`'s first
+/// directory listing is blocked behind one of them. A single directory read
+/// replaces all nine.
+///
+/// Names are still validated with `is_valid_config_name` (a hand-dropped file
+/// called `..json` must not become a key we would later hand back to
+/// `save_config`), and unreadable files are simply absent from the map — the
+/// frontend treats a missing key exactly like a missing single-file load.
+#[tauri::command]
+fn load_configs() -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(dir) = home_dir().map(|h| h.join(".minitc")) else {
+        return out;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_valid_config_name(stem) {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(&path) {
+            out.insert(stem.to_string(), text);
+        }
+    }
+    out
+}
+
 /// Persist a named config blob to ~/.minitc/<name>.json so it is shared across
 /// every run of the binary (dev vs bundled) regardless of cwd.
 #[tauri::command]
@@ -2998,6 +3079,7 @@ pub fn run() {
             copy_items,
             move_items,
             load_config,
+            load_configs,
             save_config,
             set_clipboard_files,
             get_clipboard_files,

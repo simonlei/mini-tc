@@ -1,7 +1,8 @@
 import { createApp } from "vue";
 import App from "./App.vue";
 import "./style.css";
-import { mark, adopt, waitFor } from "./bootLog.js";
+import { mark, adopt, track, waitFor } from "./bootLog.js";
+import { primeConfigs } from "./api.js";
 
 // Splash timing. Boot instrumentation (see src/bootLog.js) showed the app is
 // fully working ~510 ms after the first HTML byte: both panels have listed by
@@ -30,6 +31,12 @@ adopt(window.__MINITC_BOOT_MARKS__);
 mark("main.js:eval");
 // The startup timeline is only complete once the splash is off screen.
 waitFor("splash:removed");
+
+// Kick off the batched ~/.minitc read BEFORE mounting. Deliberately not
+// awaited: `loadConfig` waits on this promise internally, so the panels'
+// own loads pick it up for free while the app keeps rendering. Mounting must
+// not block on I/O.
+track("cfg:prime", primeConfigs());
 
 createApp(App).mount("#app");
 mark("vue:mounted");
