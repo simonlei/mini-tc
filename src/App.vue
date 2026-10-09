@@ -253,6 +253,7 @@ import SearchDialog from "./components/SearchDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
+import { loadBookmarks, findBookmark, addBookmark, removeBookmark } from "./bookmarks.js";
 import * as alwaysOnTop from "./alwaysOnTop.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -612,6 +613,10 @@ onMounted(() => {
   // Load ~/.minitc/shortcuts.json before the first keystroke can arrive; until
   // it resolves every command simply falls back to its built-in defaults.
   track("cfg:shortcuts", loadShortcuts());
+  // ~/.minitc/bookmarks.json. Loaded here (not in FilePanel) so BOTH panels see
+  // a populated list from their first render — the store is a module singleton,
+  // so whichever dropdown opens later already reads the same data.
+  track("cfg:bookmarks", loadBookmarks());
   track("cfg:panel-split", loadPanelSplit());
   // Only needed by the About dialog — measured to confirm it's free.
   track(
@@ -1826,6 +1831,37 @@ onMounted(() => {
         }
         getActivePanelRef()?.focusList?.();
       });
+      return;
+    }
+
+    // Ctrl+D: add the active panel's current directory to the global bookmark
+    // list (~/.minitc/bookmarks.json), or remove it when it's already there.
+    // A search-results tab has no real directory to bookmark, so it's rejected
+    // rather than storing the `minitc://search/…` sentinel.
+    if (matches("bookmark.toggle", e)) {
+      // A text input owns its own keys: while renaming a bookmark the ⭐
+      // dropdown has a focused `.bm-input`, and toggling the bookmark out from
+      // under the user's cursor would be a nasty surprise.
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+        return;
+      }
+      const panel = getActivePanelRef();
+      const cur = panel?.currentPath;
+      // No panel at all, or one parked on a search-results tab → let the key
+      // fall through to the webview instead of consuming it for nothing.
+      if (!cur || panel?.isVirtual?.()) return;
+      e.preventDefault();
+      markHandled(e);
+      const existing = findBookmark(cur);
+      if (existing) {
+        removeBookmark(existing.id);
+        showToast(`已移除书签：${existing.name}`, "info");
+      } else {
+        const res = addBookmark(cur);
+        if (res.ok) showToast(`已添加书签：${res.bookmark.name}`, "success");
+      }
+      getActivePanelRef()?.focusList?.();
       return;
     }
 

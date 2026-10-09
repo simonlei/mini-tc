@@ -121,6 +121,17 @@
 
     <button v-if="!editing && !virtual" class="path-btn" @click="startEdit" title="Edit path">✎</button>
 
+    <!-- Directory bookmarks (Ctrl+D). Hidden on a search-results tab: a
+         `minitc://search/…` sentinel is not a real directory, so there is
+         nothing to bookmark. -->
+    <BookmarkMenu
+      v-if="!virtual"
+      :current-path="props.path"
+      :recent="recent"
+      @navigate="(p) => emit('navigate', p)"
+      @notify="(text, type) => emit('notify', text, type)"
+    />
+
     <button v-if="!virtual" class="path-btn" @click="copyPath" :title="copied ? 'Copied!' : 'Copy path'">
       {{ copied ? "✓" : "📋" }}
     </button>
@@ -131,6 +142,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import { pathExists, expandPath } from "../api.js";
+import BookmarkMenu from "./BookmarkMenu.vue";
 
 const props = defineProps({
   path: { type: String, default: "" },
@@ -145,9 +157,13 @@ const props = defineProps({
   // Whether ← / → have anywhere to go. Drives the buttons' disabled state.
   canBack: { type: Boolean, default: false },
   canForward: { type: Boolean, default: false },
+  // Recently visited real directories for the bookmark dropdown's "最近访问"
+  // section, most-recent-first. Supplied by FilePanel from the active tab's own
+  // history stack, so it can never drift from what Alt+← actually walks.
+  recent: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(["navigate", "back", "forward", "refresh"]);
+const emit = defineEmits(["navigate", "back", "forward", "refresh", "notify"]);
 
 const inputRef = ref(null);
 const editing = ref(false);

@@ -74,6 +74,10 @@ export const COMMANDS = [
   // 递归文件搜索（Total Commander 的 Alt+F7）。搜索面板打开后焦点在输入框里，
   // 此时按键由输入框处理（Ctrl+F 之类放行给 App.vue 的守卫），不会重复触发。
   { id: "search.open", scope: "global", label: "文件搜索", desc: "在指定目录下递归搜索文件（与 Total Commander 一致：Alt+F7）", defaults: ["Alt+F7", "Ctrl+F"] },
+  // 目录书签：把活动面板的当前目录加入 ~/.minitc/bookmarks.json，再按一次取消。
+  // 与 tab.lock 是两件不同的事——锁定是「这个标签页记住一个锚点」，书签是
+  // 「全局一份带名字的常用目录列表」，不占用任何标签页。
+  { id: "bookmark.toggle", scope: "global", label: "添加 / 移除书签", desc: "把当前目录加入书签（全局共用，再按一次移除）；也可点地址栏的 ⭐ 打开书签列表", defaults: ["Ctrl+D"] },
 
   // ── 文件列表 ──
   { id: "list.filter", scope: "fileList", label: "过滤当前目录", desc: "按文件名增量过滤", defaults: ["/"] },

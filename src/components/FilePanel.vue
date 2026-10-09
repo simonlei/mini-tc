@@ -21,10 +21,12 @@
       :virtual="isVirtual"
       :can-back="canGoBack"
       :can-forward="canGoForward"
+      :recent="recentDirs"
       @navigate="navigateTo"
       @back="goBack"
       @forward="goForward"
       @refresh="refresh({ force: true })"
+      @notify="showToast"
     />
 
     <!-- File list -->
@@ -97,7 +99,7 @@ import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
-import { entryPath, isSearchPath, parentDirOf, makeSearchPath } from "../paths.js";
+import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { cancelSearch, startSearch } from "../api.js";
 import { listen } from "@tauri-apps/api/event";
 import { mark, track } from "../bootLog.js";
@@ -767,6 +769,41 @@ const canGoForward = computed(() => {
   if (isVirtual.value) return false;
   const nav = peekNav(activeTab.value);
   return !!nav && nav.index >= 0 && nav.index < nav.entries.length - 1;
+});
+
+/// Most-recent-first list of real directories this tab has visited, for the
+/// bookmark dropdown's「最近访问」section.
+///
+/// Derived from the tab's OWN history stack rather than kept in a separate
+/// "recently visited" file: that stack is already persisted, already capped, and
+/// already drives Alt+←, so a second record of the same thing could only ever
+/// disagree with it (and would need its own invalidation rules when a directory
+/// is deleted). Read-only (`peekNav`, never `navOf`) for the same reason the
+/// canGo* computeds above avoid `navOf`.
+///
+/// Only entries up to `index` count — the forward trail is somewhere the user
+/// has not actually been yet — and duplicates collapse to their newest
+/// occurrence. Search sentinels are excluded (not directories) and the current
+/// directory is dropped: it's where the panel already is.
+const RECENT_LIMIT = 10;
+
+const recentDirs = computed(() => {
+  if (isVirtual.value) return [];
+  const nav = peekNav(activeTab.value);
+  if (!nav) return [];
+  const cur = normDir(activeTab.value?.path || "").toLowerCase();
+  const seen = new Set();
+  const out = [];
+  for (let i = nav.index; i >= 0 && out.length < RECENT_LIMIT; i--) {
+    const p = nav.entries[i];
+    if (!p || isSearchPath(p)) continue;
+    const key = normDir(p).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (key === cur) continue;
+    out.push(p);
+  }
+  return out;
 });
 
 /// Last segment of a path ("" for a drive root like `C:\`).
