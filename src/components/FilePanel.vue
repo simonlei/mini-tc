@@ -44,7 +44,11 @@
       :pending-select-name="pendingSelectName"
       :is-active="isActive"
       :cut-names="cutNames"
+      :show-hidden="showHidden"
+      :col-widths="columnWidths"
       @sort="handleSort"
+      @resize-column="onResizeColumn"
+      @reset-column-widths="onResetColumnWidth"
       @navigate="navigateInto"
       @navigate-parent="navigateParent"
       @navigate-back="goBack"
@@ -101,6 +105,17 @@ import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { cancelSearch, startSearch } from "../api.js";
+import {
+  isHiddenShown,
+  setHiddenShown,
+  toggleHidden as toggleHiddenForPanel,
+  columnWidths,
+  setColumnWidth,
+  resetColumnWidth,
+  resetColumnWidths,
+  defaultSortColumn,
+  defaultSortDirection,
+} from "../viewState.js";
 import { listen } from "@tauri-apps/api/event";
 import { mark, track } from "../bootLog.js";
 
@@ -152,6 +167,22 @@ const STORAGE_KEY = `tabs-${props.panelId}`;
 // Tab state
 const tabs = ref([]);
 const activeTabId = ref(0);
+
+// ── View state (viewState.js) ──
+// Per-panel: whether hidden entries are listed. Global: the column widths (a
+// 300px Size column means the same thing in both panels) and the sort applied
+// to newly created tabs. Both are module singletons, so no props needed.
+const showHidden = computed(() => isHiddenShown(props.panelId));
+
+// Column-width drag (FileList emits the raw pointer delta; viewState clamps).
+function onResizeColumn(key, width) {
+  setColumnWidth(key, width);
+}
+
+// Double-click on a grip: reset just that column to its default width.
+function onResetColumnWidth(key) {
+  resetColumnWidth(key);
+}
 
 const activeTab = computed(() => tabs.value.find((t) => t.id === activeTabId.value));
 
@@ -323,8 +354,8 @@ onMounted(async () => {
     // "" keeps every tab unlocked instead of leaving `undefined` in the state
     // (which would then get written back as-is by saveState).
     tabs.value = saved.tabs.map((t) => ({
-      sortColumn: "name",
-      sortDirection: "asc",
+      sortColumn: defaultSortColumn.value,
+      sortDirection: defaultSortDirection.value,
       ...t,
       lockedPath: t.lockedPath || "",
       // History was added after the first release, so older
@@ -425,8 +456,12 @@ function createTab(path) {
   const tab = {
     id: nextTabId(),
     path,
-    sortColumn: "name",
-    sortDirection: "asc",
+    // Seeded from viewState's "default sort" so a new tab opens the way the
+    // user configured. Deliberately NOT re-applied to existing tabs: those
+    // carry their own sortColumn/sortDirection in tabs-<id>.json, and silently
+    // re-sorting a tab the user already arranged would be surprising.
+    sortColumn: defaultSortColumn.value,
+    sortDirection: defaultSortDirection.value,
     // Locked-tab anchor dir. Empty = not locked (see toggleTabLock).
     lockedPath: "",
     // Per-tab directory history for Alt+← / Alt+→. Seeded with the opening
@@ -1803,6 +1838,16 @@ defineExpose({
   clearCut,
   // Forward drag-target highlighting (App.vue drives this from tauri://drag-*).
   setDragHighlight: (target) => fileListRef.value?.setDragHighlight(target),
+  // Hidden-entry visibility (viewState.js). Exposed so App.vue can serve
+  // Ctrl+H and the settings dialog without reaching into this panel's refs.
+  // Returns the NEW state, which is what the toast needs.
+  isHiddenShown: () => isHiddenShown(props.panelId),
+  toggleHidden: () => {
+    toggleHiddenForPanel(props.panelId);
+    return isHiddenShown(props.panelId);
+  },
+  setHiddenShown: (v) => setHiddenShown(props.panelId, v),
+  resetColumnWidths: () => resetColumnWidths(),
 });
 </script>
 

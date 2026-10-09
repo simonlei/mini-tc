@@ -6,6 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "lint:imports": "node scripts/lint-imports.js",
     "tauri": "tauri"
   },
   "dependencies": {

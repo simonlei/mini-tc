@@ -1,8 +1,22 @@
 <template>
-  <div class="file-list" ref="listContainer" tabindex="0" title="按 / 过滤当前目录文件" @keydown="onKeydown" @mousedown="onMouseDown" @mouseup="onMouseUp" @compositionstart="onCompositionStart">
+  <div
+    class="file-list"
+    ref="listContainer"
+    tabindex="0"
+    title="按 / 过滤当前目录文件"
+    :style="columnWidthVars"
+    @keydown="onKeydown"
+    @mousedown="onMouseDown"
+    @mouseup="onMouseUp"
+    @compositionstart="onCompositionStart"
+  >
     <!-- Column headers. The leading "顺序" column only appears for a
      search-results tab, where the backend's own ordering (grouped by parent
-     directory) is meaningful — a real listing has no such order to preserve. -->
+     directory) is meaningful — a real listing has no such order to preserve.
+
+     Each fixed-width column carries a resize grip on its right edge. The grip
+     is a child of the header cell (not a separate flex item) so it can sit
+     flush in the gutter without disturbing the column's own width. -->
     <div class="file-header">
       <div v-if="allowFoundSort" class="col-found sortable" @click="$emit('sort', 'found')">
         顺序
@@ -11,19 +25,28 @@
       <div class="col-name sortable" @click="$emit('sort', 'name')">
         Name
         <span class="sort-arrow" v-if="sortColumn === 'name'">{{ sortDirection === "asc" ? "▲" : "▼" }}</span>
+        <span class="col-grip" title="拖动调整列宽，双击恢复默认" @pointerdown.stop.prevent="startResize($event, 'name')" @click.stop @dblclick.stop="resetWidth('name')"></span>
       </div>
       <div class="col-size sortable" @click="$emit('sort', 'size')">
         Size
         <span class="sort-arrow" v-if="sortColumn === 'size'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+        <span class="col-grip" title="拖动调整列宽，双击恢复默认" @pointerdown.stop.prevent="startResize($event, 'size')" @click.stop @dblclick.stop="resetWidth('size')"></span>
       </div>
       <div class="col-type sortable" @click="$emit('sort', 'type')">
         Type
         <span class="sort-arrow" v-if="sortColumn === 'type'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+        <span class="col-grip" title="拖动调整列宽，双击恢复默认" @pointerdown.stop.prevent="startResize($event, 'type')" @click.stop @dblclick.stop="resetWidth('type')"></span>
       </div>
       <div class="col-modified sortable" @click="$emit('sort', 'modified')">
         Modified
         <span class="sort-arrow" v-if="sortColumn === 'modified'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+        <span class="col-grip" title="拖动调整列宽，双击恢复默认" @pointerdown.stop.prevent="startResize($event, 'modified')" @click.stop @dblclick.stop="resetWidth('modified')"></span>
       </div>
+      <!-- Elastic filler: every column now has a literal width, so whatever the
+           panel has left over becomes empty space at the right edge (the
+           Explorer model). Without this the last column would stretch and the
+           user's widths would silently mean nothing. -->
+      <div class="col-gutter"></div>
     </div>
 
     <!-- Incremental filename filter bar. Always in the DOM (just moved
@@ -69,6 +92,7 @@
         <div class="col-size"></div>
         <div class="col-type"></div>
         <div class="col-modified"></div>
+        <div class="col-gutter"></div>
       </div>
 
       <!-- Actual file entries (search-filtered) -->
@@ -124,6 +148,7 @@
         </div>
         <div class="col-type">{{ entry.is_dir ? "" : entry.extension }}</div>
         <div class="col-modified">{{ formatDate(entry.modified) }}</div>
+        <div class="col-gutter"></div>
       </div>
 
       <!-- Empty / no-match state -->
@@ -134,7 +159,7 @@
 </template>
 
 <script setup>
-import { computed, ref, watch, nextTick } from "vue";
+import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import { startNativeDrag } from "../api.js";
 import { entryPath, isSearchPath } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
@@ -154,9 +179,16 @@ const props = defineProps({
   pendingSelectName: { type: String, default: null },
   isActive: { type: Boolean, default: false },
   cutNames: { type: Array, default: () => [] },
+  // Show entries the backend flagged as hidden (dotfiles, hidden/system
+  // attributes). The backend ALWAYS returns them — the filter lives here so
+  // toggling the switch is instant and costs no directory re-listing.
+  showHidden: { type: Boolean, default: false },
+  // Live column widths, owned by viewState.js. Passed in (rather than imported)
+  // so this component stays a pure view and the panel can drive it.
+  colWidths: { type: Object, default: () => ({}) },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "navigate-back", "navigate-forward", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "navigate-back", "navigate-forward", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename", "resize-column", "reset-column-widths"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -337,11 +369,23 @@ const sortedEntries = computed(() => {
   return list;
 });
 
+// Filtered view: hide hidden entries (unless the user asked for them), then
+// apply the incremental filename filter.
+//
+// Hidden filtering happens HERE rather than in the backend for two reasons:
+// the toggle must be instant (no re-listing of a large directory), and both
+// panels can disagree (per-panel `showHidden`) while the listing is shared
+// per-request. `is_hidden` is still used for the `.is-hidden` dimming style,
+// so a shown hidden file is visibly dimmed rather than looking like a bug.
+const visibleEntries = computed(() =>
+  props.showHidden ? sortedEntries.value : sortedEntries.value.filter((e) => !e.is_hidden)
+);
+
 // Filtered view: when searching, keep only names containing the query (case-insensitive).
 const displayedEntries = computed(() => {
-  if (!searchQuery.value) return sortedEntries.value;
+  if (!searchQuery.value) return visibleEntries.value;
   const q = searchQuery.value.toLowerCase();
-  return sortedEntries.value.filter((e) => e.name.toLowerCase().includes(q));
+  return visibleEntries.value.filter((e) => e.name.toLowerCase().includes(q));
 });
 
 const searchEmptyMessage = computed(() => {
@@ -1200,6 +1244,234 @@ function setDragHighlight(target) {
   }
 }
 
+// ── Column widths ──
+//
+// Fed as CSS variables on the root element rather than inline styles per cell:
+// one write restyles every header cell and every row at once (there can be
+// thousands of rows), and the columns keep their declarative CSS
+// (`width: var(--col-size)`) instead of every cell needing a :style binding.
+//
+// The var carries the user's SET width, not the rendered width, so nothing here
+// can destroy the stored setting — resize the window smaller and the columns
+// must not "stick" at whatever happened to fit.
+//
+// Name is handled specially. CSS already shrinks it to fit (it's the only
+// `flex-shrink: 1` column) down to zero, which covers the common case. But if
+// the panel is narrower than Size+Type+Modified alone, the row overflows with
+// Name pinned at 0 — and then something has to give. We scale the THREE trailing
+// columns down together (equal ratio, so they stay visually consistent and every
+// one of them stays readable) rather than letting the last one get clipped.
+// Name is left at 0: it's the only column with somewhere to hide, and the
+// panel's path bar still says which directory you're in.
+//
+// Render-only: `scale` is applied on top of the stored widths and never written
+// back, so widening the window restores the user's exact settings.
+const containerWidth = ref(0);
+let scaleRaf = null;
+
+// Floor for each trailing column when the extreme case forces a scale-down.
+// Below these the content stops being parseable (a truncated date is worse than
+// a smaller one that still reads as a date).
+//
+// Read from the stylesheet rather than duplicated here: the CSS `min-width`
+// declarations are the single source of truth, and a stale copy here would
+// silently compute a scale factor that fights the browser's own clamping.
+//
+// Only called when `scale < 1` (a panel too narrow for the three columns even
+// with Name at 0) — i.e. never during normal use, so the forced style
+// calculation it implies costs nothing in the common case.
+const SCALE_FLOORS = { size: 60, type: 48, modified: 96 };
+
+function readScaleFloors() {
+  const root = listContainer.value;
+  if (!root || typeof getComputedStyle !== "function") return SCALE_FLOORS;
+  const out = { ...SCALE_FLOORS };
+  // Probe on the header row, which is the only place these classes exist
+  // outside the (possibly empty) entries list.
+  const probe = root.querySelector(".file-header");
+  if (!probe) return out;
+  for (const key of Object.keys(out)) {
+    const el = probe.querySelector(`.col-${key}`);
+    if (!el) continue;
+    const px = parseFloat(getComputedStyle(el).minWidth);
+    if (Number.isFinite(px) && px > 0) out[key] = px;
+  }
+  return out;
+}
+
+const widthScale = computed(() => {
+  const avail = containerWidth.value;
+  if (!avail) return 1;
+  const w = props.colWidths || {};
+
+  const others = ["size", "type", "modified"]
+    .filter((k) => Number.isFinite(w[k]))
+    .map((k) => w[k]);
+
+  // `found` is a fixed 44px and not resizable — only present on a search tab,
+  // and it sits BEFORE the columns we may scale, so it must be subtracted from
+  // the space those get (otherwise we'd shrink them to make room for a column
+  // that never moves).
+  const foundW = props.allowFoundSort ? 44 : 0;
+  const othersNeed = others.reduce((a, b) => a + b, 0);
+  const nameW = Number.isFinite(w.name) ? w.name : 0;
+  // Everything fits, or the shortfall is Name's to absorb (CSS does that).
+  if (foundW + othersNeed + nameW <= avail) return 1;
+
+  // Extreme case: not even the trailing columns fit on their own. Scale them,
+  // leaving nothing for Name.
+  const target = Math.max(avail - foundW, 1);
+  return Math.min(1, target / Math.max(othersNeed, 1));
+});
+
+function measureContainer() {
+  if (scaleRaf) cancelAnimationFrame(scaleRaf);
+  scaleRaf = requestAnimationFrame(() => {
+    scaleRaf = null;
+    containerWidth.value = listContainer.value?.clientWidth || 0;
+  });
+}
+
+// Re-measure on panel resize (the wrapper flexes with the window and with the
+// split separator) and when the width set changes. `ResizeObserver` on the
+// root covers both window resizes and separator drags.
+let sizeObserver = null;
+onMounted(() => {
+  measureContainer();
+  if (typeof ResizeObserver !== "undefined" && listContainer.value) {
+    sizeObserver = new ResizeObserver(measureContainer);
+    sizeObserver.observe(listContainer.value);
+  }
+  // The separator drag changes our width without firing window resize; the
+  // observer above catches it too, but window resize needs its own listener in
+  // some webview configurations.
+  window.addEventListener("resize", measureContainer);
+});
+
+onBeforeUnmount(() => {
+  sizeObserver?.disconnect();
+  sizeObserver = null;
+  window.removeEventListener("resize", measureContainer);
+  if (scaleRaf) cancelAnimationFrame(scaleRaf);
+  scaleRaf = null;
+});
+
+// one write restyles every header cell and every row at once (there can be
+// thousands of rows), and the columns keep their declarative CSS
+// (`width: var(--col-size)`) instead of every cell needing a :style binding.
+//
+// The var carries the user's SET width, not the rendered width, so nothing here
+// can destroy the stored setting — resize the window smaller and the columns
+// must not "stick" at whatever happened to fit.
+//
+// `scale` applies ONLY to the three trailing columns. Name is emitted at its set
+// width and left for CSS to shrink (down to 0): it is the designated sacrifice,
+// so scaling it too would defeat the whole point. Each scaled column also gets a
+// hard floor, because a scale factor computed from the raw widths could
+// otherwise push Modified below legibility.
+const columnWidthVars = computed(() => {
+  const out = {};
+  const scale = widthScale.value;
+  const w = props.colWidths || {};
+  const floors = scale < 1 ? readScaleFloors() : SCALE_FLOORS;
+  for (const key of Object.keys(w)) {
+    const set = w[key];
+    if (!Number.isFinite(set)) continue;
+    if (key === "name") {
+      out["--col-name"] = `${Math.round(set)}px`;
+      continue;
+    }
+    const floor = floors[key] ?? 0;
+    out[`--col-${key}`] = `${Math.max(floor, Math.round(set * scale))}px`;
+  }
+  return out;
+});
+
+// Drag state for a column-resize. Pointer capture on the grip means the drag
+// keeps tracking even when the cursor leaves the 7px handle or the window
+// edge, and `pointerup`/`pointercancel` release it — no global listeners, no
+// leak if the component unmounts mid-drag (capture dies with the element).
+let resize = null;
+
+function startResize(e, key) {
+  if (!props.colWidths || !Number.isFinite(props.colWidths[key])) return;
+  e.currentTarget.setPointerCapture(e.pointerId);
+  // Start from the user's stored width, NOT the rendered one. The rendered
+  // width can be smaller than the stored one (CSS shrinks Name when the panel
+  // is narrow), and basing the drag on it would make the column impossible to
+  // widen again — every drag would start from the squeezed value.
+  resize = { key, startX: e.clientX, startWidth: props.colWidths[key] };
+  window.addEventListener("pointermove", onResizeMove);
+  window.addEventListener("pointerup", onResizeEnd);
+  window.addEventListener("pointercancel", onResizeEnd);
+}
+
+function onResizeMove(e) {
+  if (!resize) return;
+  emit("resize-column", resize.key, resize.startWidth + (e.clientX - resize.startX));
+}
+
+function onResizeEnd() {
+  window.removeEventListener("pointermove", onResizeMove);
+  window.removeEventListener("pointerup", onResizeEnd);
+  window.removeEventListener("pointercancel", onResizeEnd);
+  resize = null;
+}
+
+// Double-click a grip = back to that column's default width (the usual
+// file-manager gesture).
+function resetWidth(key) {
+  emit("reset-column-widths", key);
+}
+
+// Selection is stored as indices into `displayedEntries`, so anything that
+// filters that list invalidates them. Toggling `showHidden` is the one case we
+// can hit WITHOUT `props.entries` changing (the watcher further up already
+// re-anchors on that), so re-map here as well — matching rows by entry
+// identity, which is stable, rather than by index. Without this, pressing
+// Ctrl+H with row 3 selected would silently leave a *different* file selected.
+let shownSnapshot = displayedEntries.value;
+
+// Runs post-flush so it always captures the list AFTER every filter change;
+// the remap watcher below (pre-flush) therefore still sees the previous list.
+watch(
+  displayedEntries,
+  (v) => { shownSnapshot = v; },
+  { flush: "post" }
+);
+
+watch(
+  () => props.showHidden,
+  () => {
+    const prev = shownSnapshot;
+    const next = displayedEntries.value;
+    // Selected / active rows we want to keep, identified by identity.
+    const keepSel = new Set();
+    for (const i of selectedIndices.value) {
+      const e = prev[i];
+      if (e) keepSel.add(e);
+    }
+    const keepActive = activeIndex.value >= 0 ? prev[activeIndex.value] : null;
+    const keepAnchor = anchorIndex.value >= 0 ? prev[anchorIndex.value] : null;
+
+    const nextSel = new Set();
+    let nextActive = -1;
+    let nextAnchor = -1;
+    next.forEach((e, i) => {
+      if (keepSel.has(e)) nextSel.add(i);
+      if (e === keepActive) nextActive = i;
+      if (e === keepAnchor) nextAnchor = i;
+    });
+
+    selectedIndices.value = nextSel;
+    activeIndex.value = nextActive;
+    anchorIndex.value = nextAnchor;
+    // Re-emit so the panel's `selectedEntry` (used by Ctrl+Q preview, F2 rename,
+    // Delete, …) follows the remap instead of pointing at the old row.
+    emitSelection();
+  }
+);
+
 defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList, setDragHighlight });
 </script>
 
@@ -1302,28 +1574,92 @@ defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSel
    job is to make the "顺序" header label align with the rows beneath it), so
    it just reserves width. */
 .col-found {
-  flex: none;
+  flex: 0 0 auto;
   width: 44px;
 }
 
+/* Every column has a literal user-set width (the Name column included), so the
+   row is: fixed columns + one flexible filler at the end. That keeps a dragged
+   width meaning exactly what the user set and leaves any surplus as blank
+   space at the right — the Explorer model.
+
+   The one column that yields when the panel is too narrow is `name`: it's
+   `flex: 0 1 auto` with a `min-width` floor, so it absorbs the shortfall (and
+   ellipsises) while the other three keep the widths the user chose. That's
+   deliberate — a too-narrow Name still reads as a truncated filename, whereas
+   a silently squeezed Size/Type/Modified column just looks broken. The
+   `min-width` stops it collapsing to nothing when the panel really is tiny.
+   `.col-gutter` (`flex: 1 1 auto`) is what gets squeezed to 0 first. */
+/* Priority order when the panel is too narrow: Size / Type / Modified keep their
+   set widths, Name absorbs the shortfall.
+
+   Name is `flex: 0 1 auto` (the only shrinkable column) with `min-width: 0` —
+   it can go all the way to zero, which is what makes the guarantee hold. A
+   non-zero `min-width` here would let Name push past its share and squeeze
+   Modified off the edge instead. A fully collapsed Name is the correct outcome:
+   the filename is still legible through the panel's own path bar, whereas a
+   clipped Modified column loses information the user explicitly sized.
+
+   The three trailing columns are `flex: 0 0 auto` (never shrink) — but they DO
+   carry a `min-width`, matching the SCALE_FLOORS in the script above. Those
+   floors add up to 204px, which is more than a very narrow panel can offer; the
+   min-width lets the browser shave the last few pixels off rather than clip a
+   column outright, and because it equals the floor the content stays readable.
+   In practice Name is already 0 by the time this matters. */
 .col-name {
-  flex: 1;
+  flex: 0 1 auto;
+  width: var(--col-name, 240px);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .col-size {
-  width: 80px;
+  flex: 0 0 auto;
+  width: var(--col-size, 80px);
+  min-width: 60px;
   text-align: right;
 }
 
 .col-type {
-  width: 60px;
+  flex: 0 0 auto;
+  width: var(--col-type, 60px);
+  min-width: 48px;
 }
 
 .col-modified {
-  width: 140px;
+  flex: 0 0 auto;
+  width: var(--col-modified, 140px);
+  min-width: 96px;
+}
+
+/* Absorbs whatever width the fixed columns don't use. Present on the header and
+   on every row so their cells stay in the same x positions. */
+.col-gutter {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Resize grip on a column's right edge. Absolutely positioned inside the
+   header cell so it overlays the padding instead of taking layout space —
+   otherwise the handle itself would widen the column it resizes. */
+.col-grip {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.col-grip:hover {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+.file-header > div {
+  position: relative;
 }
 
 .file-entries {

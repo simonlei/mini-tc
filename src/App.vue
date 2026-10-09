@@ -86,10 +86,13 @@
       </div>
     </div>
 
-    <!-- General settings dialog (app-wide options, own page) -->
+    <!-- General settings dialog (app-wide options, own page). `values` merges
+         the app-config blob with live viewState, because the dialog's schema
+         addresses every row by a flat key and the `view.*` rows are owned by
+         viewState.js rather than by app-config.json. -->
     <GeneralSettingsDialog
       v-if="generalSettingsVisible"
-      :values="appConfig"
+      :values="generalSettingsValues"
       @close="onGeneralSettingsClose"
       @save="onGeneralSettingsSave"
     />
@@ -241,7 +244,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
 import VideoPreview from "./components/VideoPreview.vue";
@@ -254,6 +257,14 @@ import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, set
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import { loadBookmarks, findBookmark, addBookmark, removeBookmark } from "./bookmarks.js";
+import {
+  loadViewState,
+  applyViewState,
+  toggleHidden as toggleHiddenForPanel,
+  setPreviewRestore,
+  consumePreviewRestore,
+  snapshot as viewStateSnapshot,
+} from "./viewState.js";
 import * as alwaysOnTop from "./alwaysOnTop.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -311,6 +322,12 @@ const generalSettingsVisible = ref(false);
 // option were off).
 const appConfig = ref({ videoPreviewAlwaysOnTop: false });
 
+// Rows whose keys start with this prefix belong to viewState.js
+// (~/.minitc/view-state.json), everything else to app-config.json. Keeping the
+// split key-driven means the dialog's schema stays declarative — it doesn't
+// need to know which store a row lives in.
+const VIEW_PREFIX = "view.";
+
 function openGeneralSettings() {
   helpMenuOpen.value = false;
   configMenuOpen.value = false;
@@ -321,14 +338,48 @@ function onGeneralSettingsClose() {
   generalSettingsVisible.value = false;
 }
 
+// Flat map handed to the dialog: app-config rows verbatim, view-state rows
+// flattened onto their `view.*` keys. Rebuilt on open (and after each save) so
+// the dialog always sees current values — including changes the user made
+// outside it (Ctrl+H toggles showHidden behind its back).
+const generalSettingsValues = computed(() => {
+  const v = viewStateSnapshot();
+  return {
+    ...appConfig.value,
+    "view.showHiddenLeft": v.showHidden.left,
+    "view.showHiddenRight": v.showHidden.right,
+    "view.defaultSortColumn": v.defaultSortColumn,
+    "view.defaultSortDirection": v.defaultSortDirection,
+  };
+});
+
 function onGeneralSettingsSave(values) {
-  appConfig.value = { ...values };
   generalSettingsVisible.value = false;
-  // Apply the preference immediately rather than waiting for the next preview
-  // state change, so turning the option off un-pins a currently-open preview.
+
+  // Split the flat result back into its two stores.
+  const app = {};
+  const view = {};
+  for (const [k, v] of Object.entries(values)) {
+    if (k.startsWith(VIEW_PREFIX)) view[k.slice(VIEW_PREFIX.length)] = v;
+    else app[k] = v;
+  }
+
+  appConfig.value = { ...app };
+  applyViewState({
+    showHidden: {
+      left: view.showHiddenLeft === true,
+      right: view.showHiddenRight === true,
+    },
+    defaultSortColumn: view.defaultSortColumn,
+    defaultSortDirection: view.defaultSortDirection,
+  });
+  saveAppConfig();
+
+  // Apply the window pin preference immediately rather than waiting for the
+  // next preview state change, so turning the option off un-pins a
+  // currently-open preview.
   alwaysOnTop.setEnabled(appConfig.value.videoPreviewAlwaysOnTop);
   alwaysOnTop.sync(previewVisible.value && previewKind.value === "video");
-  saveAppConfig();
 }
 
 async function loadAppConfig() {
@@ -618,6 +669,12 @@ onMounted(() => {
   // so whichever dropdown opens later already reads the same data.
   track("cfg:bookmarks", loadBookmarks());
   track("cfg:panel-split", loadPanelSplit());
+  // ~/.minitc/view-state.json — hidden-file visibility, column widths, default
+  // sort. Module singleton, so the panels read the same live values once this
+  // resolves; until then they fall back to the built-in defaults.
+  track("cfg:view-state", loadViewState());
+  // Restore the previous session's preview once both panels have content.
+  track("app:restorePreview", restorePreview());
   // Only needed by the About dialog — measured to confirm it's free.
   track(
     "app:getVersion",
@@ -1448,6 +1505,88 @@ function closePreview() {
   }
 }
 
+// ── Preview persistence ──
+//
+// Watch the primitives (not the open/close call sites) so every path that
+// changes the preview — Ctrl+Q, ↑/↓ clip navigation, autoplay advance, Esc,
+// panel switches, the selection-follow watcher — funnels through here and
+// ~/.minitc/view-state.json can never drift out of sync with what's on screen.
+watch(
+  () => ({
+    visible: previewVisible.value,
+    panel: previewPanel.value,
+    kind: previewKind.value,
+    path: previewFilePath.value,
+    name: previewFileName.value,
+    bytes: previewFileBytes.value,
+    asText: previewAsText.value,
+  }),
+  (s) => {
+    // `unsupported` is a placeholder with nothing to render, so it's not worth
+    // restoring — record "no preview" for it rather than the path.
+    setPreviewRestore(
+      s.visible && (s.kind === "file" || s.kind === "video")
+        ? { ...s }
+        : null
+    );
+  },
+  { deep: true }
+);
+
+// Re-open the preview that was on screen when the app last exited.
+//
+// Runs after view-state has loaded AND both panels have listed (otherwise the
+// preview would cover an empty panel, and the file list behind it wouldn't have
+// the previewed file selected). A file deleted while the app was closed simply
+// means the restore is skipped — `showFilePreview`-equivalent state is applied
+// directly rather than going through togglePreview(), because there is no
+// selection to derive it from yet.
+async function restorePreview() {
+  // Must wait for the load itself, not just for App.onMounted to have kicked it
+  // off — `consumePreviewRestore()` reads the value that loadViewState fills in.
+  await loadViewState();
+  const p = consumePreviewRestore();
+  if (!p) return;
+  // Wait for both panels' first listing (each fires once; the listener is
+  // removed as soon as both have arrived).
+  await new Promise((resolve) => {
+    let seen = 0;
+    const onListed = () => {
+      seen += 1;
+      if (seen >= 2) {
+        window.removeEventListener("minitc:panel-listed", onListed);
+        resolve();
+      }
+    };
+    window.addEventListener("minitc:panel-listed", onListed);
+    // Safety net: if a panel somehow never reports (error path already fires
+    // it, but a panic before that would hang us), restore anyway.
+    setTimeout(() => {
+      window.removeEventListener("minitc:panel-listed", onListed);
+      resolve();
+    }, 3000);
+  });
+
+  if (!(await pathExists(p.path))) return;
+
+  previewPanel.value = p.panel;
+  previewKind.value = p.kind;
+  previewFilePath.value = p.path;
+  previewFileName.value = p.name;
+  previewFileBytes.value = p.bytes;
+  previewAsText.value = p.kind === "file" && p.asText === true;
+  previewVisible.value = true;
+
+  // The preview occupies the opposite panel, so the source list is the one the
+  // user was looking at — make it active and re-select the file so Esc /
+  // Ctrl+Q behave exactly as if the preview had never been closed.
+  const source = p.panel === "left" ? "right" : "left";
+  activePanel.value = source;
+  const panel = source === "left" ? leftPanel.value : rightPanel.value;
+  if (p.name) panel?.restoreByNames?.([p.name]);
+  panel?.focusList?.();
+}
+
 // When entries are deleted in a panel, check whether the whole directory got
 // emptied. The preview always shows a file from the OPPOSITE panel (the source
 // panel), so if that source panel is now empty there is nothing left to
@@ -1861,6 +2000,30 @@ onMounted(() => {
         const res = addBookmark(cur);
         if (res.ok) showToast(`已添加书签：${res.bookmark.name}`, "success");
       }
+      getActivePanelRef()?.focusList?.();
+      return;
+    }
+
+    // Ctrl+H: show / hide hidden entries (dotfiles, hidden & system attributes)
+    // in the ACTIVE panel. The two panels keep independent state, so this
+    // never touches the other side. Filtering is purely front-end (the backend
+    // always returns the full listing), so the toggle is instant even in a
+    // directory with thousands of entries — no re-listing.
+    if (matches("view.toggleHidden", e)) {
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+        return;
+      }
+      const panelId = activePanel.value;
+      const now = toggleHiddenForPanel(panelId);
+      e.preventDefault();
+      markHandled(e);
+      showToast(
+        `${now ? "已显示" : "已隐藏"}隐藏文件（${panelId === "left" ? "左" : "右"}栏）`,
+        "info"
+      );
+      // The row set changed under the cursor, so put keyboard focus back on
+      // the list rather than leaving it on <body>.
       getActivePanelRef()?.focusList?.();
       return;
     }

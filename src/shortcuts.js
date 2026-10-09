@@ -78,6 +78,10 @@ export const COMMANDS = [
   // 与 tab.lock 是两件不同的事——锁定是「这个标签页记住一个锚点」，书签是
   // 「全局一份带名字的常用目录列表」，不占用任何标签页。
   { id: "bookmark.toggle", scope: "global", label: "添加 / 移除书签", desc: "把当前目录加入书签（全局共用，再按一次移除）；也可点地址栏的 ⭐ 打开书签列表", defaults: ["Ctrl+D"] },
+  // 显示 / 隐藏隐藏文件（点文件、加点的目录、系统属性文件）。作用于**活动面板**
+  // —— 左右栏各自独立（viewState.js），因为双栏本来就常用于「一边看带点的、一边
+  // 看干净的」对比。切换纯前端过滤，不重新列目录，所以大目录下也是瞬时生效。
+  { id: "view.toggleHidden", scope: "global", label: "显示 / 隐藏隐藏文件", desc: "切换活动面板是否列出隐藏文件（以点开头的名称、隐藏或系统属性）", defaults: ["Ctrl+H"] },
 
   // ── 文件列表 ──
   { id: "list.filter", scope: "fileList", label: "过滤当前目录", desc: "按文件名增量过滤", defaults: ["/"] },
