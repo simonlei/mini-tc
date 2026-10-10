@@ -60,6 +60,28 @@ export async function deleteWithAdmin(path) {
   return invoke("delete_with_admin", { path });
 }
 
+/// Report whether the context menu should offer "以管理员身份运行" for
+/// `path`. Resolved by the backend from the extension plus a cheap content
+/// sniff (PE signature / script has a command) — deliberately NOT via the
+/// registry's file associations, which would flag every document whose class
+/// happens to register a `runas` verb. Always false off Windows.
+export async function isExecutable(path) {
+  return invoke("is_executable", { path });
+}
+
+/// Launch `path` with administrator privileges (Windows only); the OS shows
+/// the UAC prompt. Resolves as soon as the elevated process has started — it
+/// does not wait for it, so nothing needs refreshing afterwards. `.bat`/`.cmd`
+/// go through `cmd /c`, `.ps1` through PowerShell, `.msi`/`.msp` through
+/// msiexec, everything else is launched directly.
+///
+/// Rejects with a message when the user dismisses the UAC dialog
+/// ("已取消管理员权限请求") — callers should treat that as a no-op rather
+/// than an error.
+export async function runAsAdmin(path) {
+  return invoke("run_as_admin", { path });
+}
+
 // Rename a file or directory. `oldPath` is the full source path; `newName` is
 // the bare new file name (no directory component).
 export async function renameFile(oldPath, newName) {

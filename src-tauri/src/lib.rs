@@ -1198,13 +1198,291 @@ fn delete_permanently(path: String) -> Result<(), DeleteError> {
     Ok(())
 }
 
-/// Delete a path with administrator privileges (Windows only). Uses
-/// ShellExecuteW with the "runas" verb to spawn an elevated PowerShell that
-/// runs `Remove-Item -Recurse -Force`, bypassing the recycle bin (an elevated
-/// delete cannot reliably use the per-user recycle bin). The OS shows the UAC
-/// prompt; this command returns immediately after the elevated process is
-/// launched — it does NOT wait for completion — so the frontend should
-/// delay-refresh the listing to pick up the result.
+/// Message returned when the user dismisses the UAC consent dialog. Shared by
+/// every elevated-launch path so the frontend can tell "declined" apart from a
+/// real failure with a single substring check.
+pub const ELEVATION_CANCELLED: &str = "已取消管理员权限请求";
+
+/// Launch `file` with administrator privileges via ShellExecuteW's "runas"
+/// verb. Shared by `delete_with_admin` and `run_as_admin` — the UAC plumbing
+/// (verb string, wide-string marshalling, the HINSTANCE<=32 error convention,
+/// ERROR_CANCELLED decoding) is identical for both, so it lives here once.
+///
+/// Note on the working directory: ShellExecuteW takes it as the `directory`
+/// argument, which the target process inherits as its CWD. Many exes load
+/// resources relative to their own folder, so callers pass the file's parent.
+#[cfg(windows)]
+fn shell_execute_elevated(
+    file: &str,
+    params: Option<&str>,
+    work_dir: Option<&Path>,
+    show_cmd: i32,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide_verb: Vec<u16> = "runas\0".encode_utf16().collect();
+    let wide_file: Vec<u16> = std::ffi::OsStr::new(file)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_params: Vec<u16> = match params {
+        Some(p) => std::ffi::OsStr::new(p)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect(),
+        None => Vec::new(),
+    };
+    let wide_dir: Vec<u16> = match work_dir {
+        Some(d) => d
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let result = unsafe {
+        ShellExecuteW(
+            0,
+            wide_verb.as_ptr(),
+            wide_file.as_ptr(),
+            if wide_params.is_empty() {
+                std::ptr::null()
+            } else {
+                wide_params.as_ptr()
+            },
+            if wide_dir.is_empty() {
+                std::ptr::null()
+            } else {
+                wide_dir.as_ptr()
+            },
+            show_cmd,
+        )
+    };
+
+    // ShellExecuteW returns HINSTANCE > 32 on success. A value <= 32 means the
+    // launch failed — most commonly 1223 (ERROR_CANCELLED) when the user
+    // declines the UAC prompt.
+    if result as usize <= 32 {
+        debug_log(&format!(
+            "shell_execute_elevated failed: file={} params={:?} code={}",
+            file, params, result
+        ));
+        if result as i32 == 1223 {
+            return Err(ELEVATION_CANCELLED.to_string());
+        }
+        return Err(format!("提权启动失败 (code={})", result));
+    }
+    debug_log(&format!("shell_execute_elevated ok: file={}", file));
+    Ok(())
+}
+
+/// How a given file has to be launched in order to actually run it.
+/// `.bat` cannot be handed to ShellExecuteW directly (the OS would ask for an
+/// association), and `.msi` / `.msp` are meaningless without msiexec's verb,
+/// so the frontend's single "run as administrator" action expands into these.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExeKind {
+    /// Launch the file itself (`.exe`, `.lnk`, …). ShellExecuteW resolves
+    /// shortcuts itself, so a `.lnk` needs no target lookup here.
+    Direct,
+    /// `.bat` / `.cmd` → `cmd.exe /c "<path>"`
+    CmdScript,
+    /// `.ps1` → `powershell.exe -Command "& '<path>'"`
+    PowerShell,
+    /// `.msi` → `msiexec /i "<path>"`
+    Msi,
+    /// `.msp` (patch) → `msiexec /p "<path>"`
+    Msp,
+}
+
+/// True when the file starts with a real DOS/PE header (`MZ` … `PE\0\0`).
+/// Checking only the `MZ` pair would accept renamed binaries; validating the
+/// `e_lfanew` pointer to the PE signature rejects files whose extension lies
+/// (e.g. a text file named `setup.exe`), which must not be offered as a
+/// runnable target.
+#[cfg(windows)]
+fn has_pe_header(p: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match fs::File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut mz = [0u8; 2];
+    if f.read_exact(&mut mz).is_err() || &mz != b"MZ" {
+        return false;
+    }
+    // e_lfanew lives at 0x3C; it points at the PE signature 4 bytes earlier.
+    if f.seek(SeekFrom::Start(0x3C)).is_err() {
+        return false;
+    }
+    let mut off = [0u8; 4];
+    if f.read_exact(&mut off).is_err() {
+        return false;
+    }
+    let pe_off = u32::from_le_bytes(off) as u64;
+    if pe_off < 0x40 || pe_off > 1 << 20 {
+        return false;
+    }
+    if f.seek(SeekFrom::Start(pe_off)).is_err() {
+        return false;
+    }
+    let mut sig = [0u8; 4];
+    f.read_exact(&mut sig).is_ok() && &sig == b"PE\0\0"
+}
+
+/// Decide whether a script file actually contains a runnable command.
+/// A batch/ps1 file whose every non-blank line is a comment is a stub, and
+/// Explorer-style menus have no business offering to run it. UTF-16 scripts
+/// (with a BOM) are decoded as such; anything undecodable falls back to
+/// lossy UTF-8, which is enough for the comment check.
+#[cfg(windows)]
+fn script_has_command(p: &Path) -> bool {
+    use std::io::Read;
+
+    let mut buf = vec![0u8; 16 * 1024];
+    let n = match fs::File::open(p).and_then(|mut f| f.read(&mut buf)) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    buf.truncate(n);
+    let text = if buf.starts_with(&[0xFF, 0xFE]) || buf.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = buf[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(&buf).to_string()
+    };
+
+    for line in text.lines() {
+        let l = line.trim().trim_start_matches('@').trim();
+        if l.is_empty() {
+            continue;
+        }
+        let lower = l.to_ascii_lowercase();
+        if lower.starts_with("rem ") || lower == "rem" || lower.starts_with("::") {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Classify `path` as a runnable target, or `None` when it isn't one.
+///
+/// Deliberately extension-driven plus a cheap content sniff, with NO file
+/// association lookup: asking the registry which application owns `.txt`
+/// would mean showing "run as administrator" for every document whose class
+/// happens to have a `runas` verb — an expensive and surprising lookup, and
+/// not what a file manager's menu is for.
+#[cfg(windows)]
+fn executable_kind(path: &str) -> Option<ExeKind> {
+    let p = Path::new(path);
+    if !p.is_file() {
+        return None;
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "exe" | "com" | "scr" | "pif" => has_pe_header(p).then_some(ExeKind::Direct),
+        // A shortcut is resolved by the shell itself; whatever it points at is
+        // the user's business. Explorer offers "Run as administrator" for any
+        // .lnk too, so no target inspection is needed.
+        "lnk" => Some(ExeKind::Direct),
+        "bat" | "cmd" => script_has_command(p).then_some(ExeKind::CmdScript),
+        "ps1" | "psm1" | "psd1" => script_has_command(p).then_some(ExeKind::PowerShell),
+        "msi" => Some(ExeKind::Msi),
+        "msp" => Some(ExeKind::Msp),
+        _ => None,
+    }
+}
+
+/// Report whether the context menu should offer "以管理员身份运行" for `path`.
+///
+/// This is a separate command (rather than a field on every listing entry)
+/// because the answer needs the file's *content*, not just its name, and
+/// right-click is the only moment it is needed.
+#[tauri::command]
+fn is_executable(path: String) -> bool {
+    #[cfg(windows)]
+    {
+        executable_kind(&path).is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        // No UAC concept on this platform, so the entry must never appear.
+        let _ = path;
+        false
+    }
+}
+
+/// Launch a file with administrator privileges (Windows only).
+///
+/// Returns as soon as the elevated process has been started — it does not
+/// wait for it, so there is nothing for the frontend to refresh afterwards.
+#[tauri::command]
+fn run_as_admin(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在: {}", path));
+    }
+
+    #[cfg(windows)]
+    {
+        let kind = executable_kind(&path)
+            .ok_or_else(|| format!("该文件类型不支持以管理员身份运行: {}", path))?;
+        // cwd = the file's own folder, so an exe that loads resources next to
+        // itself finds them.
+        let work_dir = p.parent().map(|d| d.to_path_buf());
+        match kind {
+            ExeKind::Direct => {
+                shell_execute_elevated(&path, None, work_dir.as_deref(), 1 /* SW_SHOWNORMAL */)
+            }
+            ExeKind::CmdScript => {
+                // `cmd /c` needs the whole command wrapped in an extra pair of
+                // quotes so a path containing spaces stays one argument; the
+                // trailing quote is what cmd treats as the closing one.
+                let params = format!("/c \"{}\"", path);
+                shell_execute_elevated("cmd.exe", Some(&params), work_dir.as_deref(), 1)
+            }
+            ExeKind::PowerShell => {
+                let escaped = path.replace('\'', "''");
+                let script = format!("& '{}'", escaped);
+                let params = format!("-NoProfile -ExecutionPolicy Bypass -Command \"{}\"", script);
+                shell_execute_elevated("powershell.exe", Some(&params), work_dir.as_deref(), 1)
+            }
+            ExeKind::Msi => {
+                let params = format!("/i \"{}\"", path);
+                shell_execute_elevated("msiexec.exe", Some(&params), work_dir.as_deref(), 1)
+            }
+            ExeKind::Msp => {
+                let params = format!("/p \"{}\"", path);
+                shell_execute_elevated("msiexec.exe", Some(&params), work_dir.as_deref(), 1)
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        Err("以管理员身份运行仅支持 Windows".to_string())
+    }
+}
+
+/// Delete a file or directory with administrator privileges (Windows only).
+/// Uses an elevated PowerShell that runs `Remove-Item -Recurse -Force`,
+/// bypassing the recycle bin (an elevated delete cannot reliably use the
+/// per-user recycle bin). The OS shows the UAC prompt; this command returns
+/// immediately after the elevated process is launched — it does NOT wait for
+/// completion — so the frontend should delay-refresh the listing to pick up
+/// the result.
 #[tauri::command]
 fn delete_with_admin(path: String) -> Result<(), String> {
     let p = Path::new(&path);
@@ -1214,8 +1492,6 @@ fn delete_with_admin(path: String) -> Result<(), String> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
         // Escape single quotes for PowerShell's single-quoted string literal so
         // paths containing quotes / special characters survive intact.
         let escaped = path.replace('\'', "''");
@@ -1226,37 +1502,12 @@ fn delete_with_admin(path: String) -> Result<(), String> {
         // -Command takes a double-quoted string; the path is single-quoted
         // inside, so paths with spaces are handled as a single argument.
         let params = format!("-NoProfile -WindowStyle Hidden -Command \"{}\"", script);
-
-        let wide_verb: Vec<u16> = "runas\0".encode_utf16().collect();
-        let wide_file: Vec<u16> = std::ffi::OsStr::new("powershell.exe")
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let wide_params: Vec<u16> = std::ffi::OsStr::new(&params)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let result = unsafe {
-            ShellExecuteW(
-                0,
-                wide_verb.as_ptr(),
-                wide_file.as_ptr(),
-                wide_params.as_ptr(),
-                std::ptr::null(),
-                0, // SW_HIDE — keep the PowerShell window invisible
-            )
-        };
-        // ShellExecuteW returns HINSTANCE > 32 on success. A value <= 32 means
-        // the launch failed — most commonly 1223 (ERROR_CANCELLED) when the
-        // user declines the UAC prompt.
-        if result as usize <= 32 {
-            if result as i32 == 1223 {
-                return Err("用户取消了管理员权限请求".to_string());
-            }
-            return Err(format!("提权删除启动失败 (code={})", result));
-        }
-        Ok(())
+        shell_execute_elevated(
+            "powershell.exe",
+            Some(&params),
+            None,
+            0, // SW_HIDE — keep the PowerShell window invisible
+        )
     }
 
     #[cfg(not(windows))]
@@ -3031,6 +3282,8 @@ pub fn run() {
             delete_to_trash,
             delete_permanently,
             delete_with_admin,
+            is_executable,
+            run_as_admin,
             rename_file,
             create_directory,
             open_file,
@@ -3093,5 +3346,150 @@ mod tests {
         assert!(name_matches(&pats, "main.rs", false));
         assert!(name_matches(&pats, "Cargo.toml", false));
         assert!(!name_matches(&pats, "main.js", false));
+    }
+
+    /// Write `bytes` to a temp file named `name` and return its path.
+    #[cfg(windows)]
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("mini-tc-test-{}", name));
+        fs::write(&p, bytes).expect("write temp fixture");
+        p
+    }
+
+    /// A minimal but structurally valid PE image: `MZ`, e_lfanew → `PE\0\0`.
+    #[cfg(windows)]
+    fn fake_pe() -> Vec<u8> {
+        let mut v = vec![0u8; 0x40];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        v.extend_from_slice(b"PE\0\0");
+        v
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pe_header_requires_real_pe_signature() {
+        let real = temp_file("real.exe", &fake_pe());
+        assert!(has_pe_header(&real));
+        assert_eq!(
+            executable_kind(&real.to_string_lossy()),
+            Some(ExeKind::Direct)
+        );
+
+        // An "exe" that is really text: `MZ` present, no PE signature behind
+        // e_lfanew → must be rejected rather than offered as runnable.
+        let mut fake = fake_pe();
+        fake.truncate(0x40);
+        fake[0x3C..0x40].copy_from_slice(&0x9999u32.to_le_bytes());
+        let liar = temp_file("liar.exe", &fake);
+        assert!(!has_pe_header(&liar));
+        assert_eq!(executable_kind(&liar.to_string_lossy()), None);
+
+        let plain = temp_file("plain.exe", b"just a text file");
+        assert!(!has_pe_header(&plain));
+
+        // Not even MZ.
+        let bogus = temp_file("bogus.exe", &[0x00u8; 128]);
+        assert!(!has_pe_header(&bogus));
+
+        let _ = fs::remove_file(&real);
+        let _ = fs::remove_file(&liar);
+        let _ = fs::remove_file(&plain);
+        let _ = fs::remove_file(&bogus);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn e_lfanew_pointing_outside_the_file_is_rejected() {
+        // Guards the `pe_off` sanity bound: a crafted MZ header pointing far
+        // past EOF must not be accepted (and must not seek into oblivion).
+        let mut v = vec![0u8; 0x40];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&(1u32 << 21).to_le_bytes());
+        let p = temp_file("far.exe", &v);
+        assert!(!has_pe_header(&p));
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn script_detection_ignores_comment_only_files() {
+        let runnable = temp_file(
+            "run.bat",
+            b"@echo off\r\nREM set up the environment\r\n:: note\r\necho hello\r\n",
+        );
+        assert!(script_has_command(&runnable));
+        assert_eq!(
+            executable_kind(&runnable.to_string_lossy()),
+            Some(ExeKind::CmdScript)
+        );
+
+        // A stub whose every line is a comment is not something to "run".
+        let stub = temp_file("stub.cmd", b"REM nothing here\r\n:: still nothing\r\n\r\n");
+        assert!(!script_has_command(&stub));
+        assert_eq!(executable_kind(&stub.to_string_lossy()), None);
+
+        // Empty file → no command.
+        let empty = temp_file("empty.ps1", b"");
+        assert!(!script_has_command(&empty));
+        assert_eq!(executable_kind(&empty.to_string_lossy()), None);
+
+        // UTF-16LE with BOM (PowerShell's default for non-ASCII scripts).
+        let mut u16_script: Vec<u8> = vec![0xFF, 0xFE];
+        for c in "# note\r\nWrite-Host 'hi'".encode_utf16() {
+            u16_script.extend_from_slice(&c.to_le_bytes());
+        }
+        let u16p = temp_file("u16.ps1", &u16_script);
+        assert!(script_has_command(&u16p));
+        assert_eq!(
+            executable_kind(&u16p.to_string_lossy()),
+            Some(ExeKind::PowerShell)
+        );
+
+        let _ = fs::remove_file(&runnable);
+        let _ = fs::remove_file(&stub);
+        let _ = fs::remove_file(&empty);
+        let _ = fs::remove_file(&u16p);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn extension_routing_covers_installer_and_shortcut() {
+        // Content is irrelevant for these two classes — the extension alone
+        // decides, and no file association lookup happens.
+        let msi = temp_file("setup.msi", b"\xD0\xCF\x11\xE0 not really an MSI");
+        assert_eq!(executable_kind(&msi.to_string_lossy()), Some(ExeKind::Msi));
+
+        let msp = temp_file("fix.msp", b"patch");
+        assert_eq!(executable_kind(&msp.to_string_lossy()), Some(ExeKind::Msp));
+
+        let lnk = temp_file("app.lnk", b"\x00\x01 shortcut placeholder");
+        assert_eq!(
+            executable_kind(&lnk.to_string_lossy()),
+            Some(ExeKind::Direct)
+        );
+
+        // Plain documents and directories are never offered.
+        let txt = temp_file("notes.txt", b"hello");
+        assert_eq!(executable_kind(&txt.to_string_lossy()), None);
+        assert_eq!(
+            executable_kind(&std::env::temp_dir().to_string_lossy()),
+            None
+        );
+
+        // Extension matching is case-insensitive.
+        let upper = temp_file("UPPER.EXE", &fake_pe());
+        assert_eq!(
+            executable_kind(&upper.to_string_lossy()),
+            Some(ExeKind::Direct)
+        );
+
+        let _ = fs::remove_file(&msi);
+        let _ = fs::remove_file(&msp);
+        let _ = fs::remove_file(&lnk);
+        let _ = fs::remove_file(&txt);
+        let _ = fs::remove_file(&upper);
     }
 }

@@ -102,7 +102,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { cancelSearch, startSearch } from "../api.js";
 import {
@@ -277,6 +277,11 @@ const archiveTools = ref([]);
 const ctxMenu = ref({ visible: false, x: 0, y: 0, items: [] });
 // Which entry the open menu was invoked on (null = background).
 const ctxEntry = ref(null);
+// Whether the row the open menu was invoked on is a runnable target, resolved
+// by the backend at right-click time. Kept out of `ctxEntry` on purpose: it's
+// derived from the file's CONTENT (PE signature / script body), not from the
+// listing row, and must never make the row itself look different.
+const ctxIsExecutable = ref(false);
 
 // Lightweight toast (mirrors App.vue's, kept local so this panel is self-contained).
 const toast = ref({ visible: false, text: "", type: "info" });
@@ -1504,6 +1509,16 @@ function closeCtxMenu() {
   ctxMenu.value = { ...ctxMenu.value, visible: false };
 }
 
+// Does this row belong to the pending "cut" set? Mirrors FileList's isCut():
+// names collide across parents in a search-results tab, so fall back to the
+// absolute path there.
+function isEntryCut(entry) {
+  if (!entry) return false;
+  if ((cutNames.value || []).includes(entry.name)) return true;
+  if (!isSearchPath(activeTab.value?.path || "")) return false;
+  return (cutNames.value || []).includes(entry.path || "");
+}
+
 // Which entries an "extract" action applies to. When the right-clicked row is
 // part of a multi-selection, every selected archive is extracted (in listing
 // order); otherwise just the right-clicked archive. Non-archives inside the
@@ -1536,6 +1551,20 @@ function buildMenuItems(entry) {
     items.push({ label: "进入目录", action: "open" });
   } else {
     items.push({ label: "打开", action: "open" });
+  }
+  // "Run as administrator" is Windows-only and only meaningful for a
+  // runnable target, so the entry is appended at all only when the backend
+  // said yes. A file that is marked for a pending move is disabled: elevating
+  // "a file that is about to be moved away" is a confusing combination, and
+  // the elevated copy would keep running after the cut completes.
+  if (ctxIsExecutable.value) {
+    // `isEntryCut` mirrors FileList's own cut test (name, plus path in a
+    // search-results tab where names collide across parents).
+    items.push({
+      label: "以管理员身份运行",
+      action: "run-as-admin",
+      disabled: isEntryCut(entry),
+    });
   }
   // In a search-results tab, double-click / Enter opens the FILE wherever it
   // lives rather than navigating — so the containing directory (which may be
@@ -1608,6 +1637,20 @@ async function onCtxMenu({ entry, x, y }) {
   // Ensure the archive-tool list is available before building the menu (first
   // right-click only; afterwards it's cached and instant).
   await ensureArchiveTools();
+  // Whether to offer "以管理员身份运行" needs the backend (extension + PE
+  // header / script body check), so it has to be resolved before the menu is
+  // built. Both probes are one-shot and cheap after the first right-click.
+  ctxIsExecutable.value = false;
+  if (entry && !entry.is_dir) {
+    try {
+      const full = await entryPath(entry, activeTab.value?.path || "");
+      ctxIsExecutable.value = await isExecutable(full);
+    } catch (e) {
+      // A row we can't even resolve to a path can't be launched; just leave the
+      // entry out rather than showing an action that would fail.
+      console.warn("is_executable failed:", e);
+    }
+  }
   ctxMenu.value = { visible: true, x, y, items: buildMenuItems(entry) };
 }
 
@@ -1644,6 +1687,9 @@ async function handleCtxSelect(item) {
     case "refresh":
       refresh({ force: true });
       break;
+    case "run-as-admin":
+      await doRunAsAdmin(entry);
+      break;
     case "new-folder":
       await doNewFolder();
       break;
@@ -1660,6 +1706,26 @@ async function handleCtxSelect(item) {
     case "add-to-archive":
       await doAddToArchive();
       break;
+  }
+}
+
+// Launch an entry elevated (UAC prompt shown by the OS). Only ever applies to
+// the row that was right-clicked — deliberately not to the whole selection:
+// "run these three programs as admin" is not a thing anyone means.
+async function doRunAsAdmin(entry) {
+  try {
+    const full = await entryPath(entry, activeTab.value?.path || "");
+    await runAsAdmin(full);
+    // No toast on success: the elevated window coming up IS the feedback, and a
+    // toast would linger while the user is dealing with the UAC/child window.
+  } catch (e) {
+    const msg = String(e);
+    // Declining the UAC prompt is a deliberate user choice, not a failure.
+    if (msg.includes("已取消")) {
+      showToast("已取消管理员权限请求", "info");
+    } else {
+      showToast("以管理员身份运行失败：" + msg, "error");
+    }
   }
 }
 
