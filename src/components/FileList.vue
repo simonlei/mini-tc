@@ -140,8 +140,8 @@
           <template v-if="entry.is_dir">
             <!-- Directory size (Space key). Keyed by path in a search-results tab, where
                  two same-named folders can both be listed at once. -->
-            <span v-if="dirSizes[dirKey(entry)] !== undefined">{{ formatSize(dirSizes[dirKey(entry)]) }}</span>
-            <span v-else-if="dirSizes[dirKey(entry)] === -1">...</span>
+            <span v-if="dirSizes[dirKey(entry)] === -1">...</span>
+            <span v-else-if="dirSizes[dirKey(entry)] !== undefined">{{ formatSize(dirSizes[dirKey(entry)]) }}</span>
             <span v-else>&lt;DIR&gt;</span>
           </template>
           <template v-else>{{ formatSize(entry.size) }}</template>

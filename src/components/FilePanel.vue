@@ -208,8 +208,57 @@ const selectedEntries = ref([]);
 const cutNames = ref([]);
 const hasParent = ref(false);
 const drives = ref([]);
-const dirSizes = ref({});
+// Directory sizes (the Space key) are bucketed PER TAB and stamped with the
+// path they were measured in. A single flat map cannot work: the passive
+// re-list fired on every window-focus regain travels the exact same
+// `loadDirectory` path as a real navigation, and the old code cleared the map
+// in that branch — so alt-tabbing away and back threw away every size the user
+// had just computed even though not one directory had changed. Bucketing by
+// tab also stops a name-keyed size from leaking across tabs ("Documents" in
+// the left tab must not display the right tab's number). The path stamp is
+// what invalidates: navigating a tab to a new directory resets its bucket.
+const EMPTY_DIR_SIZES = {};
+const dirSizesByTab = ref({});
 const pendingSelectName = ref(null);
+
+// The active tab's size map, but only while its bucket is still stamped with
+// the directory currently on screen. Belt-and-braces: `setPath` already drops
+// the bucket the moment a tab leaves a directory, so in practice the stamp
+// always matches — it stays because it costs nothing and keeps this computed
+// correct even if a future caller writes `tab.path` without going through
+// `setPath` (which would otherwise resurrect another directory's numbers).
+const dirSizes = computed(() => {
+  const tab = activeTab.value;
+  if (!tab) return EMPTY_DIR_SIZES;
+  const b = dirSizesByTab.value[tab.id];
+  return b && b.path === tab.path ? b.sizes : EMPTY_DIR_SIZES;
+});
+
+// Forget everything measured in `tabId`. Called when the tab changes directory:
+// the sizes described a snapshot of that folder's contents, and once the user
+// walks away they may well add or delete files inside it — a number that is
+// confidently wrong is worse than a blank cell, which at least invites a
+// second Space. Deliberately NOT called for a re-list of the SAME directory
+// (window-focus regain, ↻, post-paste), which is the bug this replaced.
+function dropDirSizes(tabId) {
+  if (!dirSizesByTab.value[tabId]) return;
+  const next = { ...dirSizesByTab.value };
+  delete next[tabId];
+  dirSizesByTab.value = next;
+}
+
+// Read-modify-write a tab's bucket. Every writer goes through here so the
+// path stamp is written in exactly one place, and so a late-arriving async
+// result can be pinned to the (tab, path) it was requested for instead of
+// landing on whatever directory happens to be showing now.
+function updateDirSizes(tabId, path, fn) {
+  const cur = dirSizesByTab.value[tabId];
+  const base = cur && cur.path === path ? cur.sizes : EMPTY_DIR_SIZES;
+  dirSizesByTab.value = {
+    ...dirSizesByTab.value,
+    [tabId]: { path, sizes: fn(base) },
+  };
+}
 
 // Per-tab listing cache so switching tabs is instant (no per-tab "Loading…"
 // flash). Keyed by tab id → { path, entries, hasParent }. Background-preloaded
@@ -522,6 +571,10 @@ function closeTab(id) {
 
   // Drop any cached listing for the closed tab.
   if (tabCache.value[id]) delete tabCache.value[id];
+  // Same for its measured directory sizes — a closed tab can never show them
+  // again, and the map is keyed by tab id so they would otherwise sit there
+  // for the lifetime of the window.
+  dropDirSizes(id);
 
   const closing = tabs.value[idx];
   // A still-running scan would keep walking the disk and pushing batches at a
@@ -770,6 +823,15 @@ function setPath(tab, newPath, opts = {}) {
 
   tab.path = newPath;
 
+  // Leaving this directory discards the sizes measured in it (see
+  // `dropDirSizes`). This is the single choke point every navigation passes
+  // through — breadcrumb, parent, history, bookmarks, lock-jump, search-result
+  // drill-down — so hooking it here is what makes "switching directory clears
+  // the sizes" true everywhere at once. Note what does NOT come through here:
+  // re-listing the directory the tab is already on (window-focus regain, ↻,
+  // post-paste), which is exactly the case that must keep them.
+  dropDirSizes(tab.id);
+
   if (opts.record === false) return;
   if (isVirtualNow) {
     // Entering a search-results tab: nothing to remember.
@@ -950,7 +1012,13 @@ async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
     selectedEntry.value = null;
     selectedEntries.value = [];
     cutNames.value = [];
-    dirSizes.value = {};
+    // `dirSizes` is deliberately NOT cleared here. This branch is reached both
+    // by a real navigation and by the passive `refresh()` that fires on every
+    // window-focus regain (it doesn't pass `silent`), so clearing here threw
+    // away measured sizes on every alt-tab. Invalidation is now handled by the
+    // per-tab path stamp inside the `dirSizes` computed: the numbers survive a
+    // re-list of the SAME directory and disappear the moment the tab points
+    // somewhere else.
   }
   try {
     // A search-results tab has no directory to list — its rows live in the
@@ -1241,23 +1309,34 @@ async function calcDirSize(entryOrName) {
   const entry =
     typeof entryOrName === "string" ? { name: entryOrName } : entryOrName;
   if (!entry || !entry.name) return;
-  const fullPath = await entryPath(entry, activeTab.value.path);
+  // Pin the target BEFORE the first await. `getDirSize` walks the whole tree
+  // and can take seconds on a big folder; a measurement that lands after the
+  // user navigated away (or switched tabs) describes a row that is no longer
+  // on screen, and writing it would stamp the wrong directory — showing folder
+  // B's size on folder A, or resurrecting sizes after a directory change.
+  const tabId = activeTabId.value;
+  const path = activeTab.value.path;
+  const fullPath = await entryPath(entry, path);
   // Key the cache the same way FileList reads it: by path in a search-results
   // tab (same-named folders from different parents can both be listed).
-  const key = isSearchPath(activeTab.value.path)
-    ? fullPath
-    : entry.name;
+  const key = isSearchPath(path) ? fullPath : entry.name;
+  const moved = () =>
+    activeTabId.value !== tabId || activeTab.value?.path !== path;
   // Show loading state
-  dirSizes.value = { ...dirSizes.value, [key]: -1 };
+  updateDirSizes(tabId, path, (m) => ({ ...m, [key]: -1 }));
   try {
     const size = await getDirSize(fullPath);
-    dirSizes.value = { ...dirSizes.value, [key]: size };
+    if (moved()) return;
+    updateDirSizes(tabId, path, (m) => ({ ...m, [key]: size }));
   } catch (e) {
     console.error("Failed to calculate dir size:", e);
+    if (moved()) return;
     // Remove the loading placeholder on error
-    const next = { ...dirSizes.value };
-    delete next[key];
-    dirSizes.value = next;
+    updateDirSizes(tabId, path, (m) => {
+      const next = { ...m };
+      delete next[key];
+      return next;
+    });
   }
 }
 
@@ -1304,16 +1383,22 @@ async function onDelete(targets, opts = {}) {
   if (successPaths.length) {
     const removed = new Set(successPaths);
     entries.value = entries.value.filter((e) => !removed.has(e.path));
-    const next = { ...dirSizes.value };
+    const tab = activeTab.value;
     // Drop both keyings — the row may have been cached under its name (real
-    // directory) or its path (search-results tab).
-    successNames.forEach((n) => delete next[n]);
-    successPaths.forEach((p) => delete next[p]);
-    dirSizes.value = next;
+    // directory) or its path (search-results tab). Written through
+    // `updateDirSizes` so the bucket's path stamp survives; a deleted folder's
+    // size would otherwise linger and be resurrected on a later re-list.
+    if (tab) {
+      updateDirSizes(tab.id, tab.path, (m) => {
+        const next = { ...m };
+        successNames.forEach((n) => delete next[n]);
+        successPaths.forEach((p) => delete next[p]);
+        return next;
+      });
+    }
     // Keep the tab's own snapshot in sync — it is the source of truth for a
     // search tab, and anything that re-applies it (a refresh, a tab switch back)
     // would otherwise resurrect the deleted rows.
-    const tab = activeTab.value;
     if (tab && tab.search) {
       tab.search.hits = tab.search.hits.filter((e) => !removed.has(e.path));
     }
