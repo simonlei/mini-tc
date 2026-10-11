@@ -2211,25 +2211,33 @@ fn build_mount_point_buffer(target: &Path) -> Result<Vec<u8>, String> {
         return Result::Err("链接目标为空".to_string());
     }
 
-    // The substitute name uses the NT object-manager form and is
-    // NUL-terminated.
+    // The substitute name uses the NT object-manager form.
     let mut substitute: Vec<u16> = "\\??\\".encode_utf16().collect();
     substitute.extend_from_slice(&target_w);
-    substitute.push(0);
 
     // The print name is left empty, matching what Windows itself writes: two
     // junctions created by `mklink` / `New-Item -ItemType Junction` both came
     // back from `fsutil reparsepoint query` with PrintNameLength = 0. Only the
     // substitute name is stored; Explorer derives the display name from it.
-    // `substitute` already carries the NUL; the length field must exclude it,
-    // which is exactly what Windows writes.
-    let sub_len: u32 = ((substitute.len() - 1) * 2) as u32;
+    //
+    // The length field must exclude the NUL, which is exactly what Windows
+    // writes — verified against its own output for
+    // `D:\tctest-junction\verify\target`: SubstLen = 72 (36 chars x 2, NUL
+    // excluded), PrintOff = 74 (past the NUL), PrintLen = 0.
+    let sub_len: u32 = (substitute.len() * 2) as u32;
     let print_offset: u32 = sub_len + 2;
     let print_len: u32 = 0;
 
-    // Everything after `Reserved`: the four u16 fields plus the path buffer
-    // (substitute name and its NUL, which is already counted above).
-    let reparse_data_length: u32 = 8 + sub_len + print_len + 2;
+    // Everything after `Reserved`: the four u16 name fields (8 bytes), both
+    // name buffers, and **both NUL terminators** — one per name, even though
+    // the print name is empty. Per the documented formula
+    // `4*sizeof(ushort) + SubstituteNameLength + PrintNameLength + 2*sizeof(char)`,
+    // which for the reference junction gives 8 + 72 + 0 + 4 = 84 — precisely
+    // the 0x54 that `fsutil` reports as its data length.
+    //
+    // Getting this wrong by even 2 bytes is what produced ERROR_ACCESS_DENIED
+    // in the first version.
+    let reparse_data_length: u32 = 8 + sub_len + print_len + 4;
     // A u16 length field cannot describe a longer path, and the wrap-around
     // would silently produce a buffer Windows rejects with an opaque error.
     if reparse_data_length > u16::MAX as u32 || sub_len > u16::MAX as u32 {
@@ -2244,7 +2252,11 @@ fn build_mount_point_buffer(target: &Path) -> Result<Vec<u8>, String> {
     buf.extend_from_slice(&(sub_len as u16).to_ne_bytes());
     buf.extend_from_slice(&(print_offset as u16).to_ne_bytes());
     buf.extend_from_slice(&(print_len as u16).to_ne_bytes());
-    for unit in substitute {
+    for unit in substitute
+        .iter()
+        .chain(std::iter::once(&0u16))
+        .chain(std::iter::once(&0u16))
+    {
         buf.extend_from_slice(&unit.to_ne_bytes());
     }
     Result::Ok(buf)
@@ -2261,7 +2273,6 @@ fn create_reparse_point(target: &Path, dest: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_000A;
-    const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
@@ -2303,10 +2314,14 @@ fn create_reparse_point(target: &Path, dest: &Path) -> Result<(), String> {
 
     // The destination must already exist as a directory — that is what we are
     // about to turn into a reparse point.
+    //
+    // `GENERIC_WRITE` alone is enough to set a reparse point. Asking for
+    // `GENERIC_READ` as well makes `CreateFileW` fail with ACCESS_DENIED on a
+    // fresh directory, which is where the first version's `code=5` came from.
     let handle = unsafe {
         CreateFileW(
             dest_w.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -2314,41 +2329,59 @@ fn create_reparse_point(target: &Path, dest: &Path) -> Result<(), String> {
             0,
         )
     };
-    if handle != INVALID_HANDLE {
-        let mut returned = 0u32;
-        let ok = unsafe {
-            DeviceIoControl(
-                handle,
-                FSCTL_SET_REPARSE_POINT,
-                buf.as_ptr(),
-                buf.len() as u32,
-                std::ptr::null_mut(),
-                0,
-                &mut returned,
-                std::ptr::null(),
-            )
-        };
-        unsafe { CloseHandle(handle) };
-        if ok != 0 {
-            return Result::Ok(());
-        }
-        // Fall through: a symbolic link may still be creatable where a junction
-        // is not (for instance across volumes).
+    if handle == INVALID_HANDLE {
+        // Surface *this* failure rather than letting the symbolic-link attempt
+        // below overwrite it with its own, less relevant, error code.
+        let open_err = unsafe { GetLastError() };
+        return Result::Err(format!(
+            "无法打开目标目录以创建链接 (code={})：{}",
+            open_err,
+            dest.display()
+        ));
     }
 
+    let mut returned = 0u32;
     let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            buf.as_ptr(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null(),
+        )
+    };
+    let io_err = if ok == 0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
+    unsafe { CloseHandle(handle) };
+    if ok != 0 {
+        return Result::Ok(());
+    }
+
+    // Fall through: a symbolic link may still be creatable where a junction is
+    // not (for instance when the target is on another volume). Report the
+    // junction error if the fallback also fails — it is the more informative
+    // of the two.
+    let sl_ok = unsafe {
         CreateSymbolicLinkW(
             dest_w.as_ptr(),
             target_w.as_ptr(),
             SYMLINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
         )
     };
-    if ok != 0 {
+    if sl_ok != 0 {
         Result::Ok(())
     } else {
+        let sl_err = unsafe { GetLastError() };
+        let io_err = io_err.unwrap_or(sl_err);
         Result::Err(format!(
             "创建链接失败 (code={})：{}",
-            unsafe { GetLastError() },
+            io_err,
             dest.display()
         ))
     }
@@ -4538,6 +4571,10 @@ mod link_tests {
 mod reparse_buffer_tests {
     use super::*;
 
+    /// The junction Windows itself created on this machine, used as the
+    /// reference for every field value below.
+    const REFERENCE_TARGET: &str = r"D:\tctest-junction\verify\target";
+
     #[cfg(windows)]
     fn fields(buf: &[u8]) -> (u32, u16, [u16; 4]) {
         let u16at = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
@@ -4595,9 +4632,21 @@ mod reparse_buffer_tests {
         let (_, data_len, f) = fields(&buf);
         let [sub_off, sub_len, print_off, print_len] = f;
 
-        // 8 bytes of name fields + the substitute name + its NUL.
-        let expected = 8 + sub_len as u32 + print_len as u32 + 2;
-        assert_eq!(data_len as u32, expected, "four u16 fields + name + NUL");
+        // 8 bytes of name fields + both name buffers + BOTH NULs (4 bytes
+        // even though the print name is empty). For the reference junction
+        // this yields 0x54 = 84, the value `fsutil` reports.
+        let expected = 8 + sub_len as u32 + print_len as u32 + 4;
+        assert_eq!(
+            data_len as u32, expected,
+            "four u16 fields + 2 names + 2 NULs"
+        );
+        // Cross-check against the reference junction, whose substitute name is
+        // 36 chars (72 bytes): 8 + 72 + 0 + 4 = 84 = 0x54, exactly what
+        // `fsutil reparsepoint query` reports as its data length.
+        let reference = build_mount_point_buffer(Path::new(REFERENCE_TARGET)).expect("buffer");
+        let (_, reference_len, rf) = fields(&reference);
+        assert_eq!(rf[1], 72, "the reference junction's SubstituteNameLength");
+        assert_eq!(reference_len, 0x54, "and the data length fsutil reports");
         assert_eq!(
             buf.len(),
             8 + data_len as usize,
@@ -4606,11 +4655,13 @@ mod reparse_buffer_tests {
 
         assert_eq!(sub_off, 0);
         assert_eq!(print_off, sub_len + 2, "print offset points past the NUL");
-        let nul_at_sub_end = 16 + sub_len as usize;
+        // Two NULs: one closing the substitute name, one for the empty print
+        // name. Both are counted in ReparseDataLength.
+        let first_nul = 16 + sub_len as usize;
         assert_eq!(
-            &buf[nul_at_sub_end..nul_at_sub_end + 2],
-            &[0, 0],
-            "the substitute name must be NUL-terminated"
+            &buf[first_nul..first_nul + 4],
+            &[0, 0, 0, 0],
+            "both names need a NUL terminator, even the empty print name"
         );
     }
 
