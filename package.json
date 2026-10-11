@@ -7,6 +7,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint:imports": "node scripts/lint-imports.js",
+    "test": "node scripts/rename-rules-check.mjs && node scripts/selection-remap-check.mjs",
+    "check": "npm run lint:imports && npm test",
     "tauri": "tauri"
   },
   "dependencies": {

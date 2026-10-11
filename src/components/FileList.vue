@@ -1424,12 +1424,24 @@ function resetWidth(key) {
   emit("reset-column-widths", key);
 }
 
-// Selection is stored as indices into `displayedEntries`, so anything that
-// filters that list invalidates them. Toggling `showHidden` is the one case we
-// can hit WITHOUT `props.entries` changing (the watcher further up already
-// re-anchors on that), so re-map here as well — matching rows by entry
-// identity, which is stable, rather than by index. Without this, pressing
-// Ctrl+H with row 3 selected would silently leave a *different* file selected.
+// Selection is stored as indices into `displayedEntries`, so *anything* that
+// reorders or filters that list invalidates them. Three inputs can do that:
+//
+//   1. `props.entries`      — directory contents changed (a separate watcher
+//                             above re-anchors the selection from scratch)
+//   2. `sortColumn` /
+//      `sortDirection`      — clicking a column header REORDERS rows
+//   3. `searchQuery`        — the `/` filter hides rows
+//   4. `showHidden`         — Ctrl+H adds or removes hidden rows
+//
+// Only case 4 used to be handled. That is a data-loss bug, not a cosmetic one:
+// select row 3, click "Modified" to re-sort, press Delete — and the row now at
+// index 3 is a *different file*. F2 renames the wrong one too, and Enter in the
+// filter box opens the wrong file.
+//
+// The fix is to watch the composed list rather than each cause, so a new filter
+// cannot be forgotten. Rows are matched by entry identity (stable), never by
+// index.
 let shownSnapshot = displayedEntries.value;
 
 // Runs post-flush so it always captures the list AFTER every filter change;
@@ -1440,37 +1452,57 @@ watch(
   { flush: "post" }
 );
 
-watch(
-  () => props.showHidden,
-  () => {
-    const prev = shownSnapshot;
-    const next = displayedEntries.value;
-    // Selected / active rows we want to keep, identified by identity.
-    const keepSel = new Set();
-    for (const i of selectedIndices.value) {
-      const e = prev[i];
-      if (e) keepSel.add(e);
+watch(displayedEntries, () => {
+  const prev = shownSnapshot;
+  const next = displayedEntries.value;
+  // `sortedEntries` rebuilds the array on every dependency change, so the
+  // reference always differs even when the rows did not actually move. Skip
+  // that case: remapping is not free, and moving the caret out from under the
+  // user for a no-op would be its own bug.
+  if (prev.length === next.length) {
+    let same = true;
+    for (let i = 0; i < next.length; i += 1) {
+      if (prev[i] !== next[i]) {
+        same = false;
+        break;
+      }
     }
-    const keepActive = activeIndex.value >= 0 ? prev[activeIndex.value] : null;
-    const keepAnchor = anchorIndex.value >= 0 ? prev[anchorIndex.value] : null;
-
-    const nextSel = new Set();
-    let nextActive = -1;
-    let nextAnchor = -1;
-    next.forEach((e, i) => {
-      if (keepSel.has(e)) nextSel.add(i);
-      if (e === keepActive) nextActive = i;
-      if (e === keepAnchor) nextAnchor = i;
-    });
-
-    selectedIndices.value = nextSel;
-    activeIndex.value = nextActive;
-    anchorIndex.value = nextAnchor;
-    // Re-emit so the panel's `selectedEntry` (used by Ctrl+Q preview, F2 rename,
-    // Delete, …) follows the remap instead of pointing at the old row.
-    emitSelection();
+    if (same) return;
   }
-);
+  // Selected / active rows we want to keep, identified by identity.
+  const keepSel = new Set();
+  for (const i of selectedIndices.value) {
+    const e = prev[i];
+    if (e) keepSel.add(e);
+  }
+  const keepActive = activeIndex.value >= 0 ? prev[activeIndex.value] : null;
+  const keepAnchor = anchorIndex.value >= 0 ? prev[anchorIndex.value] : null;
+  // An in-place rename must follow the entry too: the row's identity object is
+  // the same, but the list is rebuilt, and the rename input must stay on the row
+  // the user is actually editing rather than jumping to whatever lands at that
+  // index.
+  const keepRenaming =
+    renamingIndex.value >= 0 ? prev[renamingIndex.value] : null;
+
+  const nextSel = new Set();
+  let nextActive = -1;
+  let nextAnchor = -1;
+  let nextRenaming = -1;
+  next.forEach((e, i) => {
+    if (keepSel.has(e)) nextSel.add(i);
+    if (e === keepActive) nextActive = i;
+    if (e === keepAnchor) nextAnchor = i;
+    if (e === keepRenaming) nextRenaming = i;
+  });
+
+  selectedIndices.value = nextSel;
+  activeIndex.value = nextActive;
+  anchorIndex.value = nextAnchor;
+  renamingIndex.value = nextRenaming;
+  // Re-emit so the panel's `selectedEntry` (used by Ctrl+Q preview, F2 rename,
+  // Delete, …) follows the remap instead of pointing at the old row.
+  emitSelection();
+});
 
 defineExpose({ moveSelection, selectName, getNextVideoEntry, selectAll, clearSelection, restoreByNames, startRename, startRenameByEntry, focusList, setDragHighlight });
 </script>
