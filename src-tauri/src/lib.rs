@@ -1665,6 +1665,7 @@ fn check_no_nested_target(src: &Path, dest_item: &Path) -> Result<(), String> {
 }
 
 /// How to handle a destination that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverwriteAction {
     /// Leave the destination alone: it does not exist, or it is a directory that
     /// should be *merged* into (both source and destination are directories, and
@@ -1686,30 +1687,74 @@ enum OverwriteAction {
 /// data-loss bug: deleting `root/a` to replace it would wipe the source
 /// `root/a/a` (which lives inside `root/a`) along with everything else. Merging
 /// keeps both sides and, for a move, simply empties the now-redundant source.
+///
+/// The two dimensions are deliberately separate parameters:
+///
+/// - `overwrite_leaves` — the user's answer to the conflict dialog. Applies to
+///   leaf conflicts only (file-vs-file, or a type mismatch): replace vs skip.
+/// - `merge_dirs` — whether a directory-vs-directory conflict may be merged
+///   (`Leave`, i.e. recurse into it) at all. Merging is not optional for a move
+///   onto an existing directory (there is no other safe answer), but a plain
+///   copy must still honour "don't overwrite" by skipping the whole folder.
+///
+/// They used to be one `overwrite: bool`, which forced the merge-move path to
+/// pass `true` and silently overrode the user's "don't overwrite" for every
+/// *leaf* inside the merged tree.
 fn plan_overwrite(
     src: &Path,
     dest_item: &Path,
-    overwrite: bool,
+    overwrite_leaves: bool,
+    merge_dirs: bool,
 ) -> Result<OverwriteAction, String> {
     if !dest_item.exists() {
         return Result::Ok(OverwriteAction::Leave);
     }
     if src.is_dir() && dest_item.is_dir() {
-        // Merge the directories rather than replace. If the user declined to
-        // overwrite, skip instead of touching the existing folder.
-        return Result::Ok(if overwrite {
+        // Merge the directories rather than replace. If merging is not allowed,
+        // skip instead of touching the existing folder.
+        return Result::Ok(if merge_dirs {
             OverwriteAction::Leave
         } else {
             OverwriteAction::Skip
         });
     }
-    if overwrite {
+    if overwrite_leaves {
         if !src.exists() {
             return Result::Err(format!("源已不存在，中止覆盖: {}", src.display()));
         }
         Result::Ok(OverwriteAction::Replace)
     } else {
         Result::Ok(OverwriteAction::Skip)
+    }
+}
+
+/// Decision for one task in the copy loop, plus whether it taints the source.
+///
+/// A "tainted" task means the top-level source it came from is NOT safe to
+/// delete: the user declined to overwrite (a skip), or the policy check failed.
+/// Both are silent — neither produces an error message the caller could act on —
+/// so they must be reported separately or a move will delete data that never
+/// reached the destination.
+///
+/// Split out from `copy_all` so it can be unit-tested without an `AppHandle`
+/// (which only exists to emit progress events).
+fn plan_task_action(
+    src: &Path,
+    dest: &Path,
+    overwrite_leaves: bool,
+    merge_dirs: bool,
+) -> (OverwriteAction, bool, Option<String>) {
+    // Self-overwrite: the destination *is* the source (e.g. merging a folder
+    // into itself). Counted as a skip and, crucially, treated as "not copied".
+    if dest.exists() && same_path(src, dest) {
+        return (OverwriteAction::Skip, true, None);
+    }
+    match plan_overwrite(src, dest, overwrite_leaves, merge_dirs) {
+        Result::Ok(action) => {
+            let taints = matches!(action, OverwriteAction::Skip);
+            (action, taints, None)
+        }
+        Result::Err(e) => (OverwriteAction::Skip, true, Some(e)),
     }
 }
 
@@ -1808,21 +1853,39 @@ fn copy_file_with_progress(
 /// Copy all `sources` into `dest_dir`, emitting `copy-progress` events so the
 /// frontend can render a progress bar.
 ///
-/// Conflict policy is driven by `overwrite`:
-/// - `false`: any destination that already exists is left untouched and counted
-///   in `*skipped` (the user chose to skip via the dialog).
-/// - `true`: the existing destination is removed first, then replaced.
+/// Conflict policy is driven by two independent flags:
+/// - `overwrite_leaves`: whether a leaf conflict (file-vs-file, or a type
+///   mismatch) is replaced or skipped. This is the user's dialog answer.
+/// - `merge_dirs`: whether a directory-vs-directory conflict may be merged.
+///   True for moves (there is no other safe answer) and for copies the user
+///   confirmed; false makes a same-named folder skip entirely.
 ///
 /// Genuine IO failures are returned in the error vector.
+///
+/// `moved_sources` collects the sources that were copied **in full** — no
+/// error and no skip anywhere in their tree. A move may only delete a source
+/// that appears here: "the user chose not to overwrite" produces a *skip*, not
+/// an error, so judging success by `errors.is_empty()` alone would delete
+/// files that were never written to the destination.
 fn copy_all(
     app: &tauri::AppHandle,
     sources: &[PathBuf],
     dest_dir: &Path,
-    overwrite: bool,
+    overwrite_leaves: bool,
+    merge_dirs: bool,
     skipped: &mut usize,
+    moved_sources: &mut Vec<PathBuf>,
 ) -> Vec<String> {
     let mut tasks: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    // How many tasks each top-level source contributed, so we can attribute a
+    // nested skip/failure back to the source it came from. Parallel to the
+    // sources that were accepted for copying.
+    let mut ranges: Vec<(usize, usize, PathBuf)> = Vec::new();
+    // Sources tainted by a skip or a failure anywhere in their subtree: a move
+    // must leave these alone, otherwise a "don't overwrite" answer turns into
+    // silent data loss. Grown alongside `ranges` and filled in the task loop.
+    let mut tainted: Vec<bool> = Vec::new();
 
     for src in sources {
         if !src.exists() {
@@ -1852,7 +1915,7 @@ fn copy_all(
             errors.push(e);
             continue;
         }
-        match plan_overwrite(src, &dest_item, overwrite) {
+        match plan_overwrite(src, &dest_item, overwrite_leaves, merge_dirs) {
             Result::Err(e) => {
                 errors.push(e);
                 continue;
@@ -1875,38 +1938,66 @@ fn copy_all(
                 // and let the recursive copy add/replace its children.
             }
         }
+        let task_start = tasks.len();
         collect_copy_tasks(src, &dest_item, &mut tasks);
+        // An empty range means the source produced no copyable tasks at all
+        // (e.g. a dangling symlink). Nothing reached the destination, so it
+        // must not be reported as moved — mark it tainted right away.
+        let produced_nothing = tasks.len() == task_start;
+        ranges.push((task_start, tasks.len(), src.clone()));
+        if produced_nothing {
+            tainted.push(true);
+        } else {
+            tainted.push(false);
+        }
     }
 
     let total_bytes: u64 = tasks.iter().map(|t| t.2).sum();
     let file_total = tasks.len();
     let mut copied: u64 = 0;
+    // `ranges` is sorted by task index, so a moving cursor attributes each task
+    // to its top-level source in O(n) overall.
+    let mut cursor = 0usize;
 
     for (i, (src, dest, size)) in tasks.iter().enumerate() {
+        while cursor < ranges.len() && i >= ranges[cursor].1 {
+            cursor += 1;
+        }
+        let tainted_slot: Option<usize> = if cursor < ranges.len() && i >= ranges[cursor].0 {
+            Some(cursor)
+        } else {
+            None
+        };
         // Nested conflict (inside a copied directory): honor the same policy.
-        // Skip a self-overwrite (dest is also the source) to avoid deleting it.
-        if dest.exists() && same_path(src, dest) {
-            *skipped += 1;
+        // A skip taints the source: the user declined to overwrite, so that
+        // content stayed behind and the source must not be deleted.
+        let (action, taints, err) = plan_task_action(src, dest, overwrite_leaves, merge_dirs);
+        if taints {
+            if let Some(t) = tainted_slot {
+                tainted[t] = true;
+            }
+        }
+        if let Some(msg) = err {
+            errors.push(msg);
             continue;
         }
-        match plan_overwrite(src, dest, overwrite) {
-            Result::Err(e) => {
-                errors.push(e);
-                continue;
-            }
-            Result::Ok(OverwriteAction::Skip) => {
+        match action {
+            OverwriteAction::Skip => {
                 *skipped += 1;
                 continue;
             }
-            Result::Ok(OverwriteAction::Replace) => {
+            OverwriteAction::Replace => {
                 // Replace a leaf conflict; directory-vs-directory is merged via
                 // `Leave` (the create_dir_all below is a no-op on existing dirs).
                 if let Err(e) = remove_recursive(dest) {
                     errors.push(format!("无法覆盖 {}: {}", dest.display(), e));
+                    if let Some(t) = tainted_slot {
+                        tainted[t] = true;
+                    }
                     continue;
                 }
             }
-            Result::Ok(OverwriteAction::Leave) => {}
+            OverwriteAction::Leave => {}
         }
         emit_progress(
             app,
@@ -1940,6 +2031,17 @@ fn copy_all(
                 src.file_name().unwrap().to_string_lossy(),
                 e
             ));
+            if let Some(t) = tainted_slot {
+                tainted[t] = true;
+            }
+        }
+    }
+
+    // Hand back only the sources that went across complete and untouched, so a
+    // move can delete exactly those and nothing else.
+    for (idx, (_start, _end, src)) in ranges.iter().enumerate() {
+        if !tainted[idx] {
+            moved_sources.push(src.clone());
         }
     }
 
@@ -1962,7 +2064,17 @@ fn copy_items(
     }
     let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
     let mut skipped = 0;
-    let errors = copy_all(&app, &srcs, dest_path, overwrite, &mut skipped);
+    // A copy never deletes its sources; the list is collected but unused.
+    let mut moved_sources: Vec<PathBuf> = Vec::new();
+    let errors = copy_all(
+        &app,
+        &srcs,
+        dest_path,
+        overwrite,
+        overwrite,
+        &mut skipped,
+        &mut moved_sources,
+    );
     Result::Ok(CopyResult { errors, skipped })
 }
 
@@ -2018,19 +2130,26 @@ fn move_items(
             continue;
         }
         if dest_item.exists() {
-            match plan_overwrite(src_path, &dest_item, overwrite)? {
-                OverwriteAction::Skip => {
+            // `merge_dirs` is true whenever we already decided to merge (a move
+            // onto an existing directory has no other safe answer), but leaf
+            // conflicts still follow the user's answer.
+            match plan_overwrite(src_path, &dest_item, overwrite, true) {
+                Result::Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+                Ok(OverwriteAction::Skip) => {
                     skipped += 1;
                     continue;
                 }
-                OverwriteAction::Replace => {
+                Ok(OverwriteAction::Replace) => {
                     // Leaf conflict: remove the destination, then rename below.
                     if let Err(e) = remove_recursive(&dest_item) {
                         errors.push(format!("无法覆盖 {}: {}", name, e));
                         continue;
                     }
                 }
-                OverwriteAction::Leave => {
+                Ok(OverwriteAction::Leave) => {
                     // Directory merge: cannot rename onto an existing dir, so
                     // defer to a copy+delete that merges the trees.
                     merge_move.push(src_path.to_path_buf());
@@ -2048,51 +2167,71 @@ fn move_items(
     // Cross-volume items: copy with progress, then delete the original.
     if !cross_volume.is_empty() {
         let mut cv_skipped = 0;
-        let copy_errors = copy_all(&app, &cross_volume, dest_path, overwrite, &mut cv_skipped);
-        let copy_failed = !copy_errors.is_empty();
+        let mut cv_moved: Vec<PathBuf> = Vec::new();
+        let copy_errors = copy_all(
+            &app,
+            &cross_volume,
+            dest_path,
+            overwrite,
+            overwrite,
+            &mut cv_skipped,
+            &mut cv_moved,
+        );
         errors.extend(copy_errors);
         skipped += cv_skipped;
-        // Only delete the sources when the copy reported no error at all. A
-        // partial copy followed by a source delete is unrecoverable data loss,
-        // so on any failure we keep the source and let the user retry.
-        if copy_failed {
-            errors.push("复制未完成，已保留源文件（未删除源以避免数据丢失）".to_string());
-        } else {
-            for src_path in &cross_volume {
+        // Delete exactly those sources that crossed over complete and
+        // untouched. A source absent from `cv_moved` either hit an IO error or
+        // was skipped because the user declined to overwrite — deleting those
+        // would silently destroy data that never reached the destination, so
+        // they stay put and are reported instead.
+        for src_path in &cv_moved {
+            let name = src_path.file_name().unwrap().to_string_lossy().to_string();
+            if let Err(e) = remove_recursive(src_path) {
+                errors.push(format!("删除源失败 {}: {}", name, e));
+            }
+        }
+        for src_path in &cross_volume {
+            if !cv_moved.contains(src_path) {
                 let name = src_path.file_name().unwrap().to_string_lossy().to_string();
-                let dest_item = dest_path.join(&name);
-                if dest_item.exists() {
-                    if let Err(e) = remove_recursive(src_path) {
-                        errors.push(format!("删除源失败 {}: {}", name, e));
-                    }
-                }
+                errors.push(format!("{} 未完全搬走，已保留源文件", name));
             }
         }
     }
 
     // Directory-merge moves: copy with progress (merge semantics engage because
-    // `overwrite` is forced true so a same-named destination is merged, not
-    // replaced), then remove the now-empty source directory.
+    // `merge_dirs` is true — a same-named destination is merged, not replaced),
+    // then remove the now-empty source directory.
     if !merge_move.is_empty() {
         let mut m_skipped = 0;
-        let copy_errors = copy_all(&app, &merge_move, dest_path, true, &mut m_skipped);
-        let copy_failed = !copy_errors.is_empty();
+        let mut m_moved: Vec<PathBuf> = Vec::new();
+        // `merge_dirs = true` — a move onto an existing directory must merge.
+        // `overwrite_leaves` stays the user's answer, so a conflicting *file*
+        // inside the merged tree is skipped rather than silently replaced.
+        let copy_errors = copy_all(
+            &app,
+            &merge_move,
+            dest_path,
+            overwrite,
+            true,
+            &mut m_skipped,
+            &mut m_moved,
+        );
         errors.extend(copy_errors);
         skipped += m_skipped;
-        if copy_failed {
-            errors.push("合并移动未完成，已保留源目录（未删除源以避免数据丢失）".to_string());
-        } else {
-            for src_path in &merge_move {
+        // Delete only sources whose whole tree went across cleanly. Anything
+        // left behind (a skipped conflict, an IO error) keeps its source
+        // directory: `remove_recursive` would happily delete those leftovers
+        // with the empty shell, which is exactly the data loss we must avoid.
+        for src_path in &m_moved {
+            let name = src_path.file_name().unwrap().to_string_lossy().to_string();
+            if let Err(e) = remove_recursive(src_path) {
+                errors.push(format!("清理源目录失败 {}: {}", name, e));
+            }
+        }
+        for src_path in &merge_move {
+            if !m_moved.contains(src_path) {
                 let name = src_path.file_name().unwrap().to_string_lossy().to_string();
-                if src_path.exists() {
-                    // The source's contents have been merged into the destination
-                    // folder, so it should be empty now. Remove it; if anything
-                    // remains (leftovers / delete failure) the remove fails and we
-                    // keep the source — safer than forcing data loss.
-                    if let Err(e) = remove_recursive(src_path) {
-                        errors.push(format!("清理源目录失败 {}: {}", name, e));
-                    }
-                }
+                errors.push(format!("{} 未完全合并，已保留源目录", name));
             }
         }
     }
@@ -3491,5 +3630,257 @@ mod tests {
         let _ = fs::remove_file(&lnk);
         let _ = fs::remove_file(&txt);
         let _ = fs::remove_file(&upper);
+    }
+}
+
+/// Tests for the overwrite policy that guards every delete-after-copy.
+///
+/// The scenarios below are the ones that used to lose data, so they are
+/// written against the real filesystem in a temp directory rather than against
+/// `plan_overwrite`'s return value: each bug showed up precisely *between*
+/// correctly-behaving pieces (a skip that is not an error, a directory that
+/// merges, a source that must survive).
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+
+    /// Create a unique scratch directory for one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-overwrite-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn write(path: &Path, body: &str) {
+        if let Some(p) = path.parent() {
+            fs::create_dir_all(p).expect("create parent");
+        }
+        fs::write(path, body).expect("write file");
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e))
+    }
+
+    // ── plan_overwrite: the decision table ────────────────────────────────
+    //
+    // src kind × dest state × overwrite_leaves × merge_dirs.
+
+    #[test]
+    fn plan_leaves_absent_destination_untouched() {
+        let dir = scratch("absent");
+        let src = dir.join("f.txt");
+        write(&src, "x");
+        let dest = dir.join("missing.txt");
+        for &ow in &[true, false] {
+            for &mg in &[true, false] {
+                let got = plan_overwrite(&src, &dest, ow, mg).expect("plan");
+                assert!(
+                    matches!(got, OverwriteAction::Leave),
+                    "absent dest must be Leave (ow={ow} mg={mg}), got {got:?}"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_directory_conflict_follows_merge_dirs_only() {
+        let dir = scratch("dirconflict");
+        let src = dir.join("src");
+        let dest = dir.join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        // The decisive case: merging must NOT depend on overwrite_leaves. A
+        // merge-move always passes merge_dirs=true while the user may have said
+        // "don't overwrite"; coupling the two (as the old single `overwrite`
+        // bool did) is what made the merge path force-replace its leaves.
+        assert!(matches!(
+            plan_overwrite(&src, &dest, true, true).expect("plan"),
+            OverwriteAction::Leave
+        ));
+        assert!(matches!(
+            plan_overwrite(&src, &dest, false, true).expect("plan"),
+            OverwriteAction::Leave
+        ));
+        // Not merging → skip, regardless of the leaf flag.
+        assert!(matches!(
+            plan_overwrite(&src, &dest, true, false).expect("plan"),
+            OverwriteAction::Skip
+        ));
+        assert!(matches!(
+            plan_overwrite(&src, &dest, false, false).expect("plan"),
+            OverwriteAction::Skip
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_leaf_conflict_replaces_only_with_overwrite() {
+        let dir = scratch("leafconflict");
+        let src = dir.join("s.txt");
+        let dest = dir.join("d.txt");
+        write(&src, "new");
+        write(&dest, "old");
+        assert!(matches!(
+            plan_overwrite(&src, &dest, true, true).expect("plan"),
+            OverwriteAction::Replace
+        ));
+        assert!(matches!(
+            plan_overwrite(&src, &dest, false, true).expect("plan"),
+            OverwriteAction::Skip
+        ));
+        // A type mismatch counts as a leaf, even with merging enabled.
+        let sdir = dir.join("sd");
+        let dfile = dir.join("df");
+        fs::create_dir_all(&sdir).unwrap();
+        write(&dfile, "f");
+        assert!(matches!(
+            plan_overwrite(&sdir, &dfile, true, true).expect("plan"),
+            OverwriteAction::Replace
+        ));
+        assert!(matches!(
+            plan_overwrite(&sdir, &dfile, false, true).expect("plan"),
+            OverwriteAction::Skip
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── The end-to-end guarantee: a skipped source is never reported as moved.
+
+    /// The decision that a merge-move depends on: "don't overwrite" plus
+    /// "merge directories" must skip a clashing leaf and taint its source.
+    ///
+    /// This is the exact combination that used to be impossible to express.
+    /// The old single `overwrite: bool` forced the merge path to pass `true`
+    /// (to get the directory merge) and that same `true` then reached every
+    /// leaf inside the tree, replacing files the user had chosen to keep.
+    #[test]
+    fn merge_with_no_overwrite_skips_leaf_and_taints() {
+        let dir = scratch("taint");
+        let src = dir.join("clash.txt");
+        let dest = dir.join("dest.txt");
+        write(&src, "source");
+        write(&dest, "DEST-ORIGINAL");
+
+        let (action, taints, err) = plan_task_action(&src, &dest, false, true);
+        assert!(
+            err.is_none(),
+            "a plain conflict is not an error, got {err:?}"
+        );
+        assert!(
+            matches!(action, OverwriteAction::Skip),
+            "'don't overwrite' must skip even while merging, got {action:?}"
+        );
+        assert!(taints, "a skip must taint the source so it is not deleted");
+        assert_eq!(
+            read(&dest),
+            "DEST-ORIGINAL",
+            "destination must be untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror image: with "overwrite" the same leaf is replaced and the
+    /// source stays deletable. Guards against over-correcting into
+    /// "never replace anything".
+    #[test]
+    fn merge_with_overwrite_replaces_leaf_and_stays_clean() {
+        let dir = scratch("ow");
+        let src = dir.join("clash.txt");
+        let dest = dir.join("dest.txt");
+        write(&src, "source");
+        write(&dest, "old");
+
+        let (action, taints, err) = plan_task_action(&src, &dest, true, true);
+        assert!(err.is_none());
+        assert!(
+            matches!(action, OverwriteAction::Replace),
+            "'overwrite' must replace, got {action:?}"
+        );
+        assert!(
+            !taints,
+            "a replace is a completed copy, source is deletable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A missing source is an error, not a silent skip.
+    #[test]
+    fn plan_task_reports_missing_source() {
+        let dir = scratch("missing");
+        let dest = dir.join("d.txt");
+        write(&dest, "d");
+        let (_, taints, err) = plan_task_action(&dir.join("gone.txt"), &dest, true, true);
+        assert!(err.is_some(), "a vanished source must surface as an error");
+        assert!(taints);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A source with no conflicts anywhere must stay deletable — the fix must
+    /// not degrade into "never delete anything".
+    #[test]
+    fn clean_tree_never_taints() {
+        let dir = scratch("clean");
+        let src = dir.join("src");
+        write(&src.join("a.txt"), "a");
+        let src_file = src.join("a.txt");
+        let dest_dir = dir.join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        // The directory task itself (create) plus the file task.
+        let (_, taints_dir, _) = plan_task_action(&src, &dest_dir.join("src"), true, true);
+        let (_, taints_file, err) =
+            plan_task_action(&src_file, &dest_dir.join("src").join("a.txt"), true, true);
+        assert!(err.is_none());
+        assert!(!taints_dir, "a fresh directory must not taint");
+        assert!(!taints_file, "a fresh file must not taint");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Merging a directory into itself (the `root/a/a` → `root/` case) hits the
+    /// self-overwrite guard. It must skip rather than delete — that guard is
+    /// what stops the destination (which is also the source's parent) from
+    /// being removed out from under the copy.
+    #[test]
+    fn self_overwrite_skips_and_taints() {
+        let dir = scratch("self");
+        let src = dir.join("a");
+        write(&src.join("keep.txt"), "k");
+        let (action, taints, err) = plan_task_action(&src, &src, true, true);
+        assert!(err.is_none());
+        assert!(
+            matches!(action, OverwriteAction::Skip),
+            "a self-overwrite must skip, got {action:?}"
+        );
+        assert!(taints);
+        assert_eq!(read(&src.join("keep.txt")), "k", "nothing may be deleted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `remove_recursive` uses `remove_dir_all`, which deletes leftovers. This
+    /// is why a merge-move must consult the tainted list instead of removing
+    /// the source "if it still exists" — the source always exists, and removing
+    /// it wipes whatever was skipped. Pin the behaviour so nobody reintroduces
+    /// a naive existence check.
+    #[test]
+    fn remove_recursive_would_delete_leftovers() {
+        let dir = scratch("leftover");
+        let merged = dir.join("merged");
+        write(&merged.join("kept.txt"), "still here");
+        // Simulate "copied successfully, source not yet deleted".
+        remove_recursive(&merged).expect("remove");
+        assert!(
+            !merged.exists(),
+            "documents that remove_recursive is destructive for leftovers — \
+             this is the behaviour the taint check exists to route around"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
