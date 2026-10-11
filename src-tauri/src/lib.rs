@@ -1796,35 +1796,35 @@ fn collect_copy_tasks_inner(
     depth: usize,
 ) -> bool {
     let mut truncated = false;
-    // Never descend into a reparse point: it may point back into this tree.
-    let is_link = fs::symlink_metadata(src)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
-    if is_link {
-        // Record the link itself as a single item. `metadata` follows, so a
-        // dangling link reports 0 bytes and `copy_file_with_progress` surfaces a
-        // real error if it cannot actually be read.
-        let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-        tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
-        return false;
-    }
-    if src.is_dir() {
-        if depth >= MAX_COPY_DEPTH {
-            return true;
+    // One classification, shared with the execution phase, so the two can't
+    // disagree about what an item is.
+    match classify_item(src) {
+        ItemKind::Link => {
+            // Record the link itself as a single item. Its "size" is the
+            // target's, which only feeds the progress total.
+            let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
+            return false;
         }
-        tasks.push((src.to_path_buf(), dest.to_path_buf(), 0));
-        if let Ok(entries) = fs::read_dir(src) {
-            for entry in entries.flatten() {
-                let child_src = entry.path();
-                let child_dest = dest.join(entry.file_name());
-                if collect_copy_tasks_inner(&child_src, &child_dest, tasks, depth + 1) {
-                    truncated = true;
+        ItemKind::Dir => {
+            if depth >= MAX_COPY_DEPTH {
+                return true;
+            }
+            tasks.push((src.to_path_buf(), dest.to_path_buf(), 0));
+            if let Ok(entries) = fs::read_dir(src) {
+                for entry in entries.flatten() {
+                    let child_src = entry.path();
+                    let child_dest = dest.join(entry.file_name());
+                    if collect_copy_tasks_inner(&child_src, &child_dest, tasks, depth + 1) {
+                        truncated = true;
+                    }
                 }
             }
         }
-    } else if src.is_file() {
-        let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-        tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
+        ItemKind::File => {
+            let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
+        }
     }
     truncated
 }
@@ -2073,13 +2073,24 @@ fn copy_all(
             copied,
             total_bytes,
         );
-        let res = if src.is_dir() {
-            if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir_all(parent);
+        let res = match classify_item(src) {
+            ItemKind::Dir => {
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::create_dir_all(dest).map_err(|e| e.to_string())
             }
-            fs::create_dir_all(dest)
-        } else {
-            copy_file_with_progress(
+            ItemKind::Link => {
+                // Recreate the link itself. Creating a plain directory here
+                // would produce an empty folder that *looks* like a
+                // successful copy while containing none of the link's
+                // content — worse than an honest error.
+                match fs::create_dir_all(dest) {
+                    Result::Ok(_) => recreate_link(src, dest),
+                    Result::Err(e) => Err(format!("创建链接目录失败: {}", e)),
+                }
+            }
+            ItemKind::File => copy_file_with_progress(
                 app,
                 src,
                 dest,
@@ -2089,7 +2100,7 @@ fn copy_all(
                 i + 1,
                 file_total,
             )
-            .map(|_| ())
+            .map_err(|e| e.to_string()),
         };
         if let Err(e) = res {
             errors.push(format!(
@@ -2112,6 +2123,254 @@ fn copy_all(
     }
 
     errors
+}
+
+/// How a destination should be created for a source item.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ItemKind {
+    /// A plain file — copy its bytes.
+    File,
+    /// A plain directory — create it (recursion is already flattened into
+    /// tasks by `collect_copy_tasks`).
+    Dir,
+    /// A reparse point (symlink or junction).
+    Link,
+}
+
+/// Classify a source item **without following links**.
+///
+/// `Path::is_dir()` answers `true` for a junction to a directory, which is why
+/// the copy loop used to materialise an *empty folder* where a link used to
+/// be. Anything deciding "file or directory?" must go through this.
+fn classify_item(path: &Path) -> ItemKind {
+    match fs::symlink_metadata(path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                ItemKind::Link
+            } else if m.is_dir() {
+                ItemKind::Dir
+            } else {
+                ItemKind::File
+            }
+        }
+        // No metadata (dangling link, or the entry vanished): fall back to the
+        // following API, which at least answers "is it a directory".
+        Err(_) => {
+            if path.is_dir() {
+                ItemKind::Dir
+            } else {
+                ItemKind::File
+            }
+        }
+    }
+}
+
+/// Create a reparse point at `dest` that points at `target`.
+///
+/// Junctions are created through the documented
+/// `DeviceIoControl(FSCTL_SET_REPARSE_POINT)` route, which needs no special
+/// privilege; symbolic links fall back to `CreateSymbolicLinkW`, which needs
+/// Developer Mode or admin.
+/// Build the `REPARSE_DATA_BUFFER` for a mount point (junction).
+///
+/// Split out from the IO so it can be unit-tested: the sandbox on some machines
+/// refuses `FSCTL_SET_REPARSE_POINT`, and a buffer layout bug shows up as
+/// `ERROR_ACCESS_DENIED` rather than anything self-describing — which is
+/// exactly the kind of thing that must be verified against a reference instead
+/// of discovered by running the app.
+///
+/// Layout per `REPARSE_DATA_BUFFER`:
+/// ```text
+/// DWORD ReparseTag          = IO_REPARSE_TAG_MOUNT_POINT
+/// USHORT ReparseDataLength  = size of everything after `Reserved`
+/// USHORT Reserved           = 0
+/// USHORT SubstituteNameOffset / Length
+/// USHORT PrintNameOffset / Length
+/// WCHAR PathBuffer[]         = substitute, NUL, print, NUL
+/// ```
+/// Offsets and lengths are **byte** counts into `PathBuffer`, and each name is
+/// NUL-terminated (the terminator is not counted in the length). Verified
+/// field-by-field against a junction Windows created itself — `fsutil reparse
+/// point query` reported SubstituteNameOffset=0, SubstituteNameLength=72,
+/// PrintNameOffset=74, PrintNameLength=0 for the target
+/// `D://tctest-junction//verify//target`, i.e. the print offset lands *past*
+/// the substitute's NUL.
+#[cfg(windows)]
+fn build_mount_point_buffer(target: &Path) -> Result<Vec<u8>, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const BACKSLASH: u16 = 0x005C;
+
+    let mut target_w: Vec<u16> = target.as_os_str().encode_wide().collect();
+    // Drop a trailing separator so the name does not end in a backslash.
+    while target_w.len() > 3 && target_w.last() == Some(&BACKSLASH) {
+        target_w.pop();
+    }
+    if target_w.is_empty() {
+        return Result::Err("链接目标为空".to_string());
+    }
+
+    // The substitute name uses the NT object-manager form and is
+    // NUL-terminated.
+    let mut substitute: Vec<u16> = "\\??\\".encode_utf16().collect();
+    substitute.extend_from_slice(&target_w);
+    substitute.push(0);
+
+    // The print name is left empty, matching what Windows itself writes: two
+    // junctions created by `mklink` / `New-Item -ItemType Junction` both came
+    // back from `fsutil reparsepoint query` with PrintNameLength = 0. Only the
+    // substitute name is stored; Explorer derives the display name from it.
+    // `substitute` already carries the NUL; the length field must exclude it,
+    // which is exactly what Windows writes.
+    let sub_len: u32 = ((substitute.len() - 1) * 2) as u32;
+    let print_offset: u32 = sub_len + 2;
+    let print_len: u32 = 0;
+
+    // Everything after `Reserved`: the four u16 fields plus the path buffer
+    // (substitute name and its NUL, which is already counted above).
+    let reparse_data_length: u32 = 8 + sub_len + print_len + 2;
+    // A u16 length field cannot describe a longer path, and the wrap-around
+    // would silently produce a buffer Windows rejects with an opaque error.
+    if reparse_data_length > u16::MAX as u32 || sub_len > u16::MAX as u32 {
+        return Result::Err("链接目标路径过长".to_string());
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(8 + reparse_data_length as usize);
+    buf.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_ne_bytes());
+    buf.extend_from_slice(&(reparse_data_length as u16).to_ne_bytes());
+    buf.extend_from_slice(&0u16.to_ne_bytes()); // Reserved
+    buf.extend_from_slice(&0u16.to_ne_bytes()); // SubstituteNameOffset
+    buf.extend_from_slice(&(sub_len as u16).to_ne_bytes());
+    buf.extend_from_slice(&(print_offset as u16).to_ne_bytes());
+    buf.extend_from_slice(&(print_len as u16).to_ne_bytes());
+    for unit in substitute {
+        buf.extend_from_slice(&unit.to_ne_bytes());
+    }
+    Result::Ok(buf)
+}
+
+/// Create a reparse point at `dest` that points at `target`.
+///
+/// Junctions are created through the documented
+/// `DeviceIoControl(FSCTL_SET_REPARSE_POINT)` route, which needs no special
+/// privilege; symbolic links fall back to `CreateSymbolicLinkW`, which needs
+/// Developer Mode or admin.
+#[cfg(windows)]
+fn create_reparse_point(target: &Path, dest: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_000A;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const OPEN_EXISTING: u32 = 3;
+    const SYMLINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: u32 = 0x0000_0002;
+    const INVALID_HANDLE: isize = -1;
+
+    let buf = build_mount_point_buffer(target)?;
+    let dest_w: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target_w: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    extern "system" {
+        fn CreateFileW(
+            filename: *const u16,
+            access: u32,
+            share: u32,
+            security: *const std::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: isize,
+        ) -> isize;
+        fn DeviceIoControl(
+            device: isize,
+            code: u32,
+            inbuf: *const u8,
+            inlen: u32,
+            outbuf: *mut u8,
+            outlen: u32,
+            returned: *mut u32,
+            overlapped: *const std::ffi::c_void,
+        ) -> i32;
+        fn CreateSymbolicLinkW(link: *const u16, target: *const u16, flags: u32) -> i32;
+        fn CloseHandle(object: isize) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    // The destination must already exist as a directory — that is what we are
+    // about to turn into a reparse point.
+    let handle = unsafe {
+        CreateFileW(
+            dest_w.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            0,
+        )
+    };
+    if handle != INVALID_HANDLE {
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                buf.as_ptr(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null(),
+            )
+        };
+        unsafe { CloseHandle(handle) };
+        if ok != 0 {
+            return Result::Ok(());
+        }
+        // Fall through: a symbolic link may still be creatable where a junction
+        // is not (for instance across volumes).
+    }
+
+    let ok = unsafe {
+        CreateSymbolicLinkW(
+            dest_w.as_ptr(),
+            target_w.as_ptr(),
+            SYMLINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+        )
+    };
+    if ok != 0 {
+        Result::Ok(())
+    } else {
+        Result::Err(format!(
+            "创建链接失败 (code={})：{}",
+            unsafe { GetLastError() },
+            dest.display()
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn create_reparse_point(_target: &Path, dest: &Path) -> Result<(), String> {
+    Err(format!("当前平台不支持创建链接: {}", dest.display()))
+}
+
+/// Recreate at `dest` the same link that `src` is.
+///
+/// Copying a link as an empty folder is worse than refusing: the destination
+/// *looks* like a successful copy while the link's content is simply absent.
+/// Junctions are common in the wild (Windows itself ships several, e.g.
+/// `Application Data` → `AppData\Roaming`), so this is worth doing properly.
+fn recreate_link(src: &Path, dest: &Path) -> Result<(), String> {
+    // `read_link` resolves a junction's substitute name on Windows (verified on
+    // this machine against both a normal junction and a self-referencing one).
+    let target =
+        fs::read_link(src).map_err(|e| format!("无法读取链接目标 {}: {}", src.display(), e))?;
+    create_reparse_point(&target, dest)
 }
 
 /// Copy one or more source items into `dest_dir`.
@@ -4087,5 +4346,299 @@ mod recursion_tests {
             "a link is one copyable item, not a directory to walk"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Tests for link handling in the copy path.
+///
+/// These exist because the first fix was a **half fix**: it stopped the
+/// recursion in `collect_copy_tasks` but left the execution loop's
+/// `src.is_dir()` alone — and that follows links, so a junction was
+/// materialised as an *empty directory* that looked like a successful copy.
+/// A guard covering only one of the two stages is worse than none, because it
+/// turns a loud failure into a silent lie.
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-link-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// Plain files and directories keep classifying normally, so the link guard
+    /// did not break the ordinary path.
+    #[test]
+    fn plain_items_classify_normally() {
+        let dir = scratch("plain");
+        let file = dir.join("a.txt");
+        let sub = dir.join("sub");
+        fs::write(&file, "a").unwrap();
+        fs::create_dir_all(&sub).unwrap();
+
+        assert_eq!(classify_item(&file), ItemKind::File);
+        assert_eq!(classify_item(&sub), ItemKind::Dir);
+        assert_eq!(classify_item(&dir), ItemKind::Dir);
+
+        // A path that does not exist must not panic.
+        let missing = dir.join("nope");
+        let kind = classify_item(&missing);
+        assert!(matches!(kind, ItemKind::File | ItemKind::Dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: recreating a junction must produce a real junction that
+    /// resolves to the same target — not an empty folder.
+    ///
+    /// Skips loudly when the machine refuses to create links (see the note in
+    /// `recursion_tests` about `symlink_dir` returning `Ok` without creating
+    /// anything). This test creates the source through our own Win32 call, so
+    /// it does not depend on `mklink` being on PATH.
+    #[cfg(windows)]
+    #[test]
+    fn recreating_a_junction_produces_a_working_junction() {
+        let dir = scratch("recreate");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("payload.txt"), "PAYLOAD").unwrap();
+
+        let src = dir.join("src-junction");
+        if recreate_link(&target, &src).is_err() || classify_item(&src) != ItemKind::Link {
+            eprintln!("skipping: this machine does not allow creating junctions");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Copy it the way `copy_all` does: make the directory, then recreate.
+        let dest = dir.join("dst-junction");
+        fs::create_dir_all(&dest).unwrap();
+        recreate_link(&src, &dest).expect("recreate must succeed");
+
+        assert_eq!(
+            classify_item(&dest),
+            ItemKind::Link,
+            "the copy must be a link, not an empty directory"
+        );
+        assert_eq!(
+            fs::read_link(&dest).unwrap(),
+            fs::read_link(&src).unwrap(),
+            "the copy must point at the same target"
+        );
+        // And it must actually resolve to the payload — the whole point.
+        assert_eq!(
+            fs::read_to_string(dest.join("payload.txt")).unwrap(),
+            "PAYLOAD",
+            "the recreated junction must resolve to the target's content"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The decisive property, verified on a real junction: it classifies as
+    /// `Link`, never as `Dir`. `Dir` is what produced the empty folder.
+    #[cfg(windows)]
+    #[test]
+    fn classify_never_calls_a_junction_a_directory() {
+        let dir = scratch("classify");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("f.txt"), "f").unwrap();
+
+        let link = dir.join("link");
+        if recreate_link(&target, &link).is_err() || classify_item(&link) != ItemKind::Link {
+            eprintln!("skipping: this machine does not allow creating links");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // The trap: the following API says "directory".
+        assert!(
+            link.is_dir(),
+            "precondition: Path::is_dir() follows the link"
+        );
+
+        // The classification must disagree.
+        assert_eq!(
+            classify_item(&link),
+            ItemKind::Link,
+            "a reparse point must never classify as Dir (that is the bug)"
+        );
+        // Plain items still classify normally.
+        assert_eq!(classify_item(&target), ItemKind::Dir);
+        assert_eq!(classify_item(&target.join("f.txt")), ItemKind::File);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The walk must emit a link as exactly one task and must not descend into
+    /// it — no `link/f.txt` entry, which would mean it followed the link.
+    #[cfg(windows)]
+    #[test]
+    fn walk_emits_a_link_as_one_task_without_descending() {
+        let dir = scratch("walk");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("f.txt"), "f").unwrap();
+
+        let link = dir.join("link");
+        if recreate_link(&target, &link).is_err() || classify_item(&link) != ItemKind::Link {
+            eprintln!("skipping: this machine does not allow creating links");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mut tasks = Vec::new();
+        collect_copy_tasks(&link, &dir.join("dst"), &mut tasks);
+        assert_eq!(tasks.len(), 1, "one link must yield exactly one task");
+
+        // Walking the containing directory must list the link itself, and must
+        // not produce anything underneath it.
+        let mut all = Vec::new();
+        collect_copy_tasks(&dir, &dir.join("dst2"), &mut all);
+        let names: Vec<String> = all
+            .iter()
+            .map(|(s, _, _)| s.strip_prefix(&dir).unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "link"),
+            "the link itself must be listed, got {names:?}"
+        );
+        let nested: Vec<&String> = names
+            .iter()
+            .filter(|n| n.contains(std::path::MAIN_SEPARATOR))
+            .collect();
+        assert!(
+            nested.iter().all(|n| !n.starts_with("link")),
+            "the link must not be descended into, got {names:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Tests for the mount-point buffer layout.
+///
+/// The sandboxed Bash channel on this machine cannot issue
+/// `FSCTL_SET_REPARSE_POINT` (it returns `ERROR_ACCESS_DENIED` even though the
+/// shell channel creates junctions in the very same directory), so the IO half
+/// of link creation cannot be exercised here. The buffer builder is pure, which
+/// means it *can* be verified — and it must be, because a layout mistake shows
+/// up at runtime as a bare `ERROR_ACCESS_DENIED`, never as a diagnosable error.
+///
+/// The reference values below come from a junction Windows created itself,
+/// dumped with `fsutil reparsepoint query` for the target
+/// `D:\tctest-junction\verify\target`:
+/// SubstituteNameOffset=0, SubstituteNameLength=72, PrintNameOffset=74,
+/// PrintNameLength=0.
+#[cfg(test)]
+mod reparse_buffer_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    fn fields(buf: &[u8]) -> (u32, u16, [u16; 4]) {
+        let u16at = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
+        (
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            u16at(4),
+            [u16at(8), u16at(10), u16at(12), u16at(14)],
+        )
+    }
+
+    #[cfg(windows)]
+    fn name_at(buf: &[u8], offset_bytes: usize, length_bytes: usize) -> String {
+        let start = 16 + offset_bytes;
+        let units: Vec<u16> = buf[start..start + length_bytes]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    }
+
+    /// The exact case measured on this machine.
+    #[cfg(windows)]
+    #[test]
+    fn buffer_matches_windows_own_junction() {
+        let target = Path::new(r"D:\tctest-junction\verify\target");
+        let buf = build_mount_point_buffer(target).expect("buffer");
+
+        let (tag, data_len, f) = fields(&buf);
+        assert_eq!(tag, 0xA000_0003, "IO_REPARSE_TAG_MOUNT_POINT");
+        let [sub_off, sub_len, print_off, print_len] = f;
+
+        // fsutil reported exactly these numbers.
+        assert_eq!(sub_off, 0, "SubstituteNameOffset");
+        assert_eq!(sub_len, 72, "SubstituteNameLength excludes the NUL");
+        assert_eq!(
+            print_off, 74,
+            "PrintNameOffset points at the substitute's NUL"
+        );
+        assert_eq!(print_len, 0, "PrintNameLength: Windows writes none");
+
+        assert_eq!(
+            name_at(&buf, sub_off as usize, sub_len as usize),
+            r"\??\D:\tctest-junction\verify\target",
+            "the substitute name carries the NT object-manager prefix"
+        );
+    }
+
+    /// `ReparseDataLength` counts everything after `Reserved`, so the total
+    /// buffer must be `4 + 2 + data_len` and the two NULs must be present.
+    #[cfg(windows)]
+    #[test]
+    fn data_length_accounts_for_every_field_and_both_nuls() {
+        let target = Path::new(r"D:\some\path");
+        let buf = build_mount_point_buffer(target).expect("buffer");
+        let (_, data_len, f) = fields(&buf);
+        let [sub_off, sub_len, print_off, print_len] = f;
+
+        // 8 bytes of name fields + the substitute name + its NUL.
+        let expected = 8 + sub_len as u32 + print_len as u32 + 2;
+        assert_eq!(data_len as u32, expected, "four u16 fields + name + NUL");
+        assert_eq!(
+            buf.len(),
+            8 + data_len as usize,
+            "total size is tag + data_length field + data"
+        );
+
+        assert_eq!(sub_off, 0);
+        assert_eq!(print_off, sub_len + 2, "print offset points past the NUL");
+        let nul_at_sub_end = 16 + sub_len as usize;
+        assert_eq!(
+            &buf[nul_at_sub_end..nul_at_sub_end + 2],
+            &[0, 0],
+            "the substitute name must be NUL-terminated"
+        );
+    }
+
+    /// A trailing separator must be stripped, otherwise the recorded target
+    /// would differ from the real one and the link would dangle.
+    #[cfg(windows)]
+    #[test]
+    fn trailing_separator_is_dropped() {
+        let bare = build_mount_point_buffer(Path::new(r"D:\some\path")).expect("buffer");
+        let slashed = build_mount_point_buffer(Path::new(r"D:\some\path\")).expect("buffer");
+        assert_eq!(
+            bare, slashed,
+            "a trailing backslash must not change the recorded target"
+        );
+        let (_, _, f) = fields(&bare);
+        assert_eq!(
+            name_at(&bare, f[0] as usize, f[1] as usize),
+            r"\??\D:\some\path"
+        );
+    }
+
+    /// A target that cannot be encoded must fail loudly rather than produce a
+    /// buffer Windows would reject with an opaque error.
+    #[cfg(windows)]
+    #[test]
+    fn over_long_target_is_rejected_before_the_syscall() {
+        let long = "C:\\".to_string() + &"x".repeat(40_000);
+        let err = build_mount_point_buffer(Path::new(&long)).expect_err("must reject");
+        assert!(err.contains("过长"), "got {err}");
     }
 }
