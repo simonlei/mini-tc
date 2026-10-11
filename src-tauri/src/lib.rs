@@ -1758,22 +1758,75 @@ fn plan_task_action(
     }
 }
 
+/// Depth ceiling for [`collect_copy_tasks`].
+///
+/// The recursive walk is a genuine loop risk: a junction pointing at one of its
+/// own ancestors re-enters itself forever. On Windows that is bounded only by
+/// `MAX_PATH` (~260 chars), so the walk bottoms out around depth 30 having
+/// produced a tree of ghost directories — a corrupted copy, not a crash. Cap
+/// the depth so the damage is bounded, and report it instead of silently
+/// truncating. Matches `MAX_SEARCH_DEPTH`, which the search already applies.
+const MAX_COPY_DEPTH: usize = 64;
+
 /// Walk a single source (file or directory) and append every file (with its
 /// destination path and byte size) plus every directory (size 0) to `tasks`.
-fn collect_copy_tasks(src: &Path, dest: &Path, tasks: &mut Vec<(PathBuf, PathBuf, u64)>) {
+///
+/// Reparse points (symlinks **and** junctions) are recorded as plain files
+/// rather than descended into. `Path::is_dir` *follows* links, so a junction
+/// reports `true` and `read_dir` happily lists the target's contents — for a
+/// junction pointing at its own ancestor that is an unbounded loop. (Verified
+/// on Windows: the walk reaches depth 31 and stops only because the path
+/// exceeds `MAX_PATH`.) `symlink_metadata().file_type().is_symlink()` does *not*
+/// follow — it is `true` for a `mklink /J` junction, while `is_dir()` is
+/// `false` — which is the guard the search and `dir_size` already rely on.
+///
+/// Descending `link → its own ancestor` is the dangerous shape; a junction
+/// pointing at a *sibling* would merely copy that tree twice, which is the
+/// user's intent, so links are copied rather than skipped.
+///
+/// Returns `true` if the walk was cut short by [`MAX_COPY_DEPTH`].
+fn collect_copy_tasks(src: &Path, dest: &Path, tasks: &mut Vec<(PathBuf, PathBuf, u64)>) -> bool {
+    collect_copy_tasks_inner(src, dest, tasks, 0)
+}
+
+fn collect_copy_tasks_inner(
+    src: &Path,
+    dest: &Path,
+    tasks: &mut Vec<(PathBuf, PathBuf, u64)>,
+    depth: usize,
+) -> bool {
+    let mut truncated = false;
+    // Never descend into a reparse point: it may point back into this tree.
+    let is_link = fs::symlink_metadata(src)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        // Record the link itself as a single item. `metadata` follows, so a
+        // dangling link reports 0 bytes and `copy_file_with_progress` surfaces a
+        // real error if it cannot actually be read.
+        let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
+        return false;
+    }
     if src.is_dir() {
+        if depth >= MAX_COPY_DEPTH {
+            return true;
+        }
         tasks.push((src.to_path_buf(), dest.to_path_buf(), 0));
         if let Ok(entries) = fs::read_dir(src) {
             for entry in entries.flatten() {
                 let child_src = entry.path();
                 let child_dest = dest.join(entry.file_name());
-                collect_copy_tasks(&child_src, &child_dest, tasks);
+                if collect_copy_tasks_inner(&child_src, &child_dest, tasks, depth + 1) {
+                    truncated = true;
+                }
             }
         }
     } else if src.is_file() {
         let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
         tasks.push((src.to_path_buf(), dest.to_path_buf(), size));
     }
+    truncated
 }
 
 /// Emit a progress event for the current copy state.
@@ -1939,7 +1992,20 @@ fn copy_all(
             }
         }
         let task_start = tasks.len();
-        collect_copy_tasks(src, &dest_item, &mut tasks);
+        let hit_depth_limit = collect_copy_tasks(src, &dest_item, &mut tasks);
+        if hit_depth_limit {
+            // Silently dropping the tail would look like a successful copy
+            // while quietly losing data, and a move would then delete the
+            // source. Report it and taint the source so nothing is deleted.
+            errors.push(format!(
+                "目录层级超过 {} 层，已停止复制: {}（为避免符号链接成环，其更深的内容未复制）",
+                MAX_COPY_DEPTH,
+                src.display()
+            ));
+            ranges.push((task_start, tasks.len(), src.clone()));
+            tainted.push(true);
+            continue;
+        }
         // An empty range means the source produced no copyable tasks at all
         // (e.g. a dangling symlink). Nothing reached the destination, so it
         // must not be reported as moved — mark it tainted right away.
@@ -3880,6 +3946,145 @@ mod overwrite_tests {
             !merged.exists(),
             "documents that remove_recursive is destructive for leftovers — \
              this is the behaviour the taint check exists to route around"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Tests for the recursion guards in [`collect_copy_tasks`].
+///
+/// The defect was found by experiment, not by reading — and the experiment
+/// contradicted the obvious guess. Measured on this machine:
+///
+/// - `symlink_metadata(loop).file_type().is_symlink()` is **true** for a
+///   junction (`mklink /J`), while `is_dir()` is **false**. So the claim
+///   "is_symlink() lies about junctions" is *wrong*; the search, `dir_size` and
+///   `clear_readonly_recursive` already guard correctly.
+/// - The actual trap is `Path::is_dir()`, which **follows** the link: it
+///   returns `true` for a junction, and `read_dir` then lists the target's
+///   contents. A junction pointing at its own ancestor therefore re-enters
+///   itself indefinitely.
+/// - It does **not** crash. The walk bottoms out at **depth 31**, where the
+///   path finally exceeds `MAX_PATH` (~260 chars). The damage is a silent tree
+///   of ~30 ghost directories plus a "success" report — corruption, not abort.
+///
+/// Also measured, and worth knowing before writing more link tests here: this
+/// machine **cannot create reparse points**. Both `symlink_dir` and
+/// `CreateSymbolicLinkW(DIRECTORY | ALLOW_UNPRIVILEGED_CREATE)` return `Ok`
+/// while creating nothing (`exists()` = false) — a sandbox blocks it. So a test
+/// that asserts link behaviour must verify the link exists and skip loudly if
+/// not; asserting without checking would silently test nothing.
+
+#[cfg(test)]
+mod recursion_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-recursion-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn plain_tree_is_walked_completely() {
+        let dir = scratch("plain");
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("sub").join("b.txt"), "b").unwrap();
+
+        let mut tasks = Vec::new();
+        let truncated = collect_copy_tasks(&src, &dir.join("dst"), &mut tasks);
+        assert!(!truncated, "a 2-level tree is nowhere near the cap");
+        // root dir + a.txt + sub + sub/b.txt
+        assert_eq!(tasks.len(), 4, "every file and directory must be listed");
+        let names: Vec<String> = tasks
+            .iter()
+            .map(|(s, _, _)| s.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(names.contains(&"b.txt".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The depth cap must *report* rather than silently truncate: a truncated
+    /// walk in a move would delete the source's uncopied tail.
+    #[test]
+    fn exceeding_the_depth_cap_is_reported() {
+        let dir = scratch("deep");
+        let src = dir.join("src");
+        let mut cur = src.clone();
+        for i in 0..(MAX_COPY_DEPTH + 5) {
+            cur = cur.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&cur).unwrap();
+        fs::write(cur.join("leaf.txt"), "leaf").unwrap();
+
+        let mut tasks = Vec::new();
+        let truncated = collect_copy_tasks(&src, &dir.join("dst"), &mut tasks);
+        assert!(
+            truncated,
+            "exceeding MAX_COPY_DEPTH must be reported, not silently accepted"
+        );
+        assert!(
+            tasks.len() <= MAX_COPY_DEPTH + 1,
+            "walk must stop at the cap (got {} tasks)",
+            tasks.len()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The link guard itself, exercised through a real reparse point when the
+    /// machine allows creating one.
+    ///
+    /// ⚠️ Creating links is unreliable in some environments: on the machine
+    /// that developed this fix, both `symlink_dir` and `CreateSymbolicLinkW`
+    /// returned success while creating nothing (`exists()` = false), because a
+    /// sandbox blocks reparse points. Hence: if the link cannot be created,
+    /// skip loudly rather than assert something vacuous. The depth-cap and
+    /// plain-tree tests above cover the platform-independent logic.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_is_copied_as_one_item_not_walked() {
+        use std::os::windows::fs::symlink_dir;
+
+        let dir = scratch("follows");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("f.txt"), "f").unwrap();
+        let link = dir.join("link");
+
+        if symlink_dir(&target, &link).is_err() || !link.exists() {
+            eprintln!("skipping: this machine does not allow creating links");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // The trap: `Path::is_dir()` follows the link, which is what made the
+        // old walk recurse into it.
+        assert!(
+            link.is_dir(),
+            "Path::is_dir() follows the link — the trap the guard routes around"
+        );
+        // The guard: `symlink_metadata` sees the reparse point.
+        let meta = fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "symlink_metadata must identify the reparse point"
+        );
+
+        let mut tasks = Vec::new();
+        collect_copy_tasks(&link, &dir.join("dst"), &mut tasks);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "a link is one copyable item, not a directory to walk"
         );
         let _ = fs::remove_dir_all(&dir);
     }
