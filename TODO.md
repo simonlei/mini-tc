@@ -125,6 +125,13 @@
     - **测试有效性已验证**：把 `plan_overwrite` 的目录分支回退成旧的耦合写法（`if merge_dirs && overwrite_leaves`）重跑，`plan_directory_conflict_follows_merge_dirs_only` **确实失败**，恢复后全绿。另一次返工：第一版测试在测试体内**复刻了一遍生产逻辑**（手工调 `collect_copy_tasks` + 手工判 taint），看着端到端、其实测的是测试自己的副本，已重写为直接调 `plan_task_action`。**判据：测试调的必须是生产代码实际走的路径；全绿的测试和没测试一样，必须验证它能抓住回退**。
     - 前端零改动（`CopyResult{errors, skipped}` 字段名与语义未变，只多几条更准确的错误文案）。`cargo check` / `cargo fmt --check` 均 exit 0。**待用户双击 `dev.bat` 实测**（4 个场景：合并移动选「否」→ 目标文件内容不变 + 源目录保留；选「是」→ 内容替换 + 源目录移除；同卷移动正常；目标在源内部仍被拒绝）。
 - [x] **修复：复制跟随目录联接（junction）无限嵌套** — ⚠️ **本条的原始描述三条全错，已按实测修正**。原写「junction 的 `is_symlink()` 返回 false / 三处递归都没深度保护 / 栈溢出 abort 进程」，在本机建真实 junction 跑探针后逐条推翻：
+
+  - 🚨 **后续修复（2026-10-11，`6d6d769`）：上一版只修了一半 —— 用户实测「复制后出现的是空目录，不是联接」。** 根因：**守卫只加在「收集任务」阶段，执行阶段仍用 `src.is_dir()`，而该方法跟随链接、对 junction 返回 true，于是走进 `create_dir_all` 分支留下空目录**。空目录比报错更糟 —— 看起来像复制成功而内容全无。**教训：加守卫必须覆盖同一决策链上的每一环，只改一处等于把「明显的失败」变成「静默的谎言」。**
+    - 修法：① 新增 `ItemKind { File, Dir, Link }` + `classify_item(path)`（走 `symlink_metadata` 不跟随），**收集与执行两阶段共用同一判定**；② 新增 `recreate_link(src, dest)`：读出源链接目标后在目标位置重建同类型链接（junction 走 `FSCTL_SET_REPARSE_POINT`，无需管理员；失败回退 `CreateSymbolicLinkW`）；③ 把缓冲区构造抽成**纯函数** `build_mount_point_buffer`，因为沙箱不允许端到端验证字节布局，而布局错了只表现为无从诊断的 `ERROR_ACCESS_DENIED`。
+    - 🚨 **缓冲区布局第一版凭理解写，全错**。用 `fsutil reparsepoint query` 导出 Windows 自己创建的 junction 后发现三处不符：substitute name 带 NT 前缀 `\??\`（不是单个反斜杠）；**Windows 根本不写 print name**（`PrintNameLength = 0`，我写了完整路径）；`SubstituteNameLength` **不含**结尾 NUL 但 `PrintNameOffset` 指向 NUL 之后（差 2 字节）。现已与实测逐项一致（`SubstLen=72`/`PrintOff=74`/`PrintLen=0`，并验证过随路径长度变化）。
+    - **测试当场抓出两个真实缺陷**（`reparse_buffer_tests`）：`PrintNameLength` 写了多余内容；超长目标因 u16 回绕**未被拒绝**（会产出一个被 Windows 拒绝且无从诊断的缓冲区）。现已改为在系统调用前显式检查长度。
+    - **沙箱事实**：从 Bash 通道同时拦截 reparse point 的**创建与读取**（`symlink_dir` 返回 `Ok` 却没建出链接、`fs::read` 报 code=5），而独立 shell 工具在**同一目录**能成功建 junction —— 据此确认阻塞来自沙箱而非代码。**端到端行为必须由用户在 `dev.bat`（不受沙箱限制）中验证。**
+    - `cargo test --lib` 全库 **38 passed / 0 failed**；`cargo check` / `cargo fmt --check` 均 exit 0。
   - ❌「`is_symlink()` 对 junction 返回 false」—— **实测为 `true`**（`symlink_metadata` 上 `is_symlink=true`、`is_dir=false`）。所以搜索（`829`）、`dir_size`（`423`）、`clear_readonly_recursive`（`1125`）**本来就守得对**，无需改动。
   - ❌「三处递归都没有深度保护」—— 只有 `collect_copy_tasks` 有问题；另两处走 `DirEntry::file_type()` / `symlink_metadata()`，不跟随链接。
   - ❌「栈溢出 abort 进程」—— **不会崩**。Windows 的 `MAX_PATH`（约 260 字符）在**深度 31** 处兜底，遍历自然终止（实测路径 `loop\loop\loop\…`）。
