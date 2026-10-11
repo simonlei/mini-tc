@@ -124,6 +124,15 @@
       @send-to-panel="onSearchSendToPanel"
     />
 
+    <!-- Batch rename (Ctrl+M) -->
+    <BatchRenameDialog
+      v-if="batchRenameVisible"
+      :items="batchRenameItems"
+      :existing="batchRenameExisting"
+      @close="closeBatchRename"
+      @applied="onBatchRenameApplied"
+    />
+
     <!-- Main content: two panels with a draggable separator -->
     <div class="main-content">
       <div class="left-panel-wrapper" :style="{ flex: leftFlex + ' 1 0%' }">
@@ -158,6 +167,7 @@
           @activate="onPanelActivate('left')"
           @open-video="openVideo"
           @deleted="onPanelDeleted"
+          @batch-rename="onPanelBatchRename"
         />
       </div>
 
@@ -197,6 +207,7 @@
           @activate="onPanelActivate('right')"
           @open-video="openVideo"
           @deleted="onPanelDeleted"
+          @batch-rename="onPanelBatchRename"
         />
       </div>
     </div>
@@ -253,6 +264,7 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import GeneralSettingsDialog from "./components/GeneralSettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import SearchDialog from "./components/SearchDialog.vue";
+import BatchRenameDialog from "./components/BatchRenameDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
@@ -528,6 +540,88 @@ function onSearchSendToPanel({ panel: which, ...payload } = {}) {
       : `${which === "right" ? "右" : "左"}栏已载入 ${payload.hits?.length || 0} 个搜索结果`,
     "success"
   );
+}
+
+// ── Batch rename (Ctrl+M) ──
+// The dialog owns the rules and the preview; this side only decides WHICH
+// items go in (the active panel's selection, as absolute paths — a rename must
+// not depend on a list index staying valid) and cleans up afterwards.
+const batchRenameVisible = ref(false);
+const batchRenameItems = ref([]);
+// Lower-cased names already present in the target directory, so the plan can
+// flag "目标已存在同名项" BEFORE anything is renamed. Null for a
+// search-results tab — its rows span many folders, so there is no single set.
+const batchRenameExisting = ref(null);
+// Panel + focused element to hand the keyboard back to on close, mirroring the
+// search dialog (otherwise Esc leaves focus stranded on <body>).
+let batchRenameReturnPanel = "left";
+let batchRenameReturnFocus = null;
+let batchRenamePanelId = "";
+
+// Open the dialog over `panelId`'s selection (defaults to the active panel).
+// The panel id is a parameter rather than a read of `activePanel` because the
+// context-menu entry fires from a panel that may not be the active one — the
+// user right-clicked there, and that row is what they mean to rename.
+async function openBatchRename(panelIdArg) {
+  configMenuOpen.value = false;
+  helpMenuOpen.value = false;
+  if (batchRenameVisible.value) return;
+
+  const panelId = panelIdArg || activePanel.value;
+  const panel = panelId === "left" ? leftPanel.value : rightPanel.value;
+  const entries = panel?.selectedEntries;
+  const dir = panel?.currentPath;
+  if (!entries || entries.length === 0 || !dir) {
+    showToast("请先选中文件或文件夹", "error");
+    return;
+  }
+
+  // Absolute paths, resolved once — the dialog re-reads them on every keystroke
+  // while the list underneath may re-sort or filter.
+  const items = await Promise.all(
+    entries.map(async (e) => ({ path: await entryPath(e, dir), name: e.name }))
+  );
+
+  batchRenamePanelId = panelId;
+  batchRenameReturnPanel = panelId;
+  batchRenameReturnFocus = document.activeElement;
+  batchRenameItems.value = items;
+  batchRenameExisting.value = panel?.isVirtual?.()
+    ? null
+    : new Set((panel?.entryNames || []).map((n) => String(n).toLowerCase()));
+  batchRenameVisible.value = true;
+}
+
+// Context-menu "批量重命名…" on a panel. Make that panel the active one first
+// so the dialog, the refresh afterwards and the restored keyboard focus all
+// agree on which side is being worked on.
+function onPanelBatchRename({ panelId } = {}) {
+  if (previewVisible.value && previewPanel.value === panelId) return;
+  activePanel.value = panelId;
+  openBatchRename(panelId);
+}
+
+function closeBatchRename() {
+  batchRenameVisible.value = false;
+  const target = batchRenameReturnFocus;
+  const panel = batchRenameReturnPanel === "left" ? leftPanel.value : rightPanel.value;
+  nextTick(() => {
+    if (target && target !== document.body && target.isConnected) {
+      target.focus();
+      if (document.activeElement === target) return;
+    }
+    panel?.focusList?.();
+  });
+}
+
+// The renames already happened (the dialog ran them); hand the [oldPath,
+// newName] pairs to the panel so it updates its listing the right way for its
+// kind of tab, and report what changed.
+function onBatchRenameApplied({ count, pairs } = {}) {
+  const panel = batchRenamePanelId === "left" ? leftPanel.value : rightPanel.value;
+  panel?.applyRenames?.(pairs);
+  nextTick(() => panel?.focusList?.());
+  showToast(`已重命名 ${count || 0} 项`, "success");
 }
 
 const updateDialog = ref({
@@ -1774,6 +1868,10 @@ onMounted(() => {
     // cursor behind the overlay).
     if (searchVisible.value) return;
 
+    // Same for the batch-rename dialog: it owns Esc (capture phase) and its
+    // rule inputs. Ctrl+M itself is re-checked below so it isn't swallowed.
+    if (batchRenameVisible.value) return;
+
     // Esc: close the current preview (image / text / pdf / video / unsupported)
     // and return the source file list to the file that was just previewed. When
     // no preview is open, this is a no-op — Esc no longer cancels selection on
@@ -1875,6 +1973,22 @@ onMounted(() => {
       transferToOtherPanel(isMove ? "cut" : "copy");
       // Focus stays on the SOURCE panel (like TC): the user usually wants to
       // keep working through the same selection. doPaste refreshes both panels.
+      return;
+    }
+
+    // Ctrl+M: batch rename the active panel's selection. Plain Ctrl combo with
+    // no webview-native meaning, so it is consumed even while an input has
+    // focus — except in a rename box, which is a text field where Ctrl+M
+    // clearly means "insert a newline", not "rename files".
+    if (matches("list.batchRename", e)) {
+      const t = e.target;
+      if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
+      // Already open: let the key reach the dialog's own inputs rather than
+      // reopening (and resetting) it.
+      if (batchRenameVisible.value) return;
+      e.preventDefault();
+      markHandled(e);
+      openBatchRename();
       return;
     }
 

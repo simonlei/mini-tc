@@ -159,7 +159,7 @@ const props = defineProps({
   panelId: { type: String, required: true },
 });
 
-const emit = defineEmits(["activate", "open-video", "deleted", "drop-move"]);
+const emit = defineEmits(["activate", "open-video", "deleted", "drop-move", "batch-rename"]);
 
 // Config name → ~/.minitc/tabs-<panelId>.json (unified cross-run store).
 const STORAGE_KEY = `tabs-${props.panelId}`;
@@ -1573,6 +1573,10 @@ function buildMenuItems(entry) {
     items.push({ label: "打开所在目录", action: "open-container" });
   }
   items.push({ label: "重命名", action: "rename" });
+  // Batch rename works off the whole selection (the right-clicked row when it
+  // is the only one selected), so it's most useful with several rows picked.
+  // Enabled even for a single row — one item is a legitimate batch of one.
+  items.push({ label: "批量重命名…", action: "batch-rename" });
   items.push({ label: "复制路径", action: "copy-path" });
 
   const extractSet = extractTargets(entry);
@@ -1696,6 +1700,13 @@ async function handleCtxSelect(item) {
     case "rename":
       fileListRef.value?.startRenameByEntry?.(entry);
       break;
+    case "batch-rename":
+      // The dialog itself lives in App.vue (it needs to sit above BOTH panels
+      // and own the keyboard while it's open), so the panel just asks for it.
+      // The right-click already selected the row, so Ctrl+M afterwards would
+      // do the same thing — this is the discoverable equivalent.
+      emit("batch-rename", { panelId: props.panelId });
+      break;
     case "extract": {
       // Batch case: the menu item carries the full set of selected archives
       // (see extractTargets); fall back to the right-clicked row alone.
@@ -1707,6 +1718,31 @@ async function handleCtxSelect(item) {
       await doAddToArchive();
       break;
   }
+}
+
+// Reflect a finished batch rename in the listing.
+//
+// A real directory just re-lists. A search-results tab must NOT: `refresh()`
+// there is deliberately a no-op for a passive call (a rescan behind the user's
+// back is exactly what the focus-regain path avoids), so the renamed rows would
+// keep showing their old names forever. Patch them in place instead — the same
+// trick the single-row `onRename` uses, where the entries array keeps its
+// identity and FileList's watcher never fires.
+function applyRenames(pairs) {
+  const list = pairs || [];
+  if (list.length === 0) return;
+  if (isSearchPath(activeTab.value?.path || "")) {
+    for (const [oldPath, newName] of list) {
+      const row = entries.value.find((e) => e.path === oldPath);
+      if (!row) continue;
+      const base = parentDirOf(oldPath) || oldPath;
+      row.name = newName;
+      row.extension = newName.includes(".") ? newName.split(".").pop().toUpperCase() : "";
+      row.path = base + "\\" + newName;
+    }
+    return;
+  }
+  refresh();
 }
 
 // Launch an entry elevated (UAC prompt shown by the OS). Only ever applies to
@@ -1931,6 +1967,10 @@ defineExpose({
   selectedEntry,
   selectedEntries,
   currentPath: computed(() => activeTab.value?.path || ""),
+  // Names currently in the listing, used by the batch-rename dialog to flag a
+  // target that already exists. A plain array (not a Set) so Vue's `defineExpose`
+  // wrapping stays a cheap pass-through; the caller lower-cases into a Set.
+  entryNames: computed(() => entries.value.map((e) => e.name)),
   // Tab 管理（由 App.vue 的全局快捷键 Ctrl+T / Ctrl+W 驱动，作用于活动面板）
   addTab,
   closeActiveTab: () => closeTab(activeTabId.value),
@@ -1984,6 +2024,10 @@ defineExpose({
   selectAll: () => fileListRef.value?.selectAll(),
   clearSelection: () => fileListRef.value?.clearSelection(),
   restoreByNames: (names) => fileListRef.value?.restoreByNames(names),
+  // Reflect a finished batch rename ([[oldPath, newName], …]). The panel owns
+  // this because "what does a refresh mean" is panel knowledge: a real directory
+  // re-lists, a search-results tab patches its detached rows in place.
+  applyRenames,
   focusList: () => fileListRef.value?.focusList(),
   setCutNames,
   clearCut,

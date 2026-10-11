@@ -105,6 +105,12 @@ export const COMMANDS = [
   // Meta (Cmd) variant is "Shift+Meta+Backspace", not "Meta+Shift+Backspace".
   { id: "list.deletePermanent", scope: "fileList", label: "永久删除", desc: "不经过回收站，直接抹除（不可恢复）", defaults: ["Shift+Delete", "Ctrl+Shift+Backspace", "Shift+Meta+Backspace"] },
   { id: "list.rename", scope: "fileList", label: "重命名", defaults: ["F2"] },
+  // 批量重命名。F2 handles the single-row inline case; Ctrl+M always opens the
+  // batch dialog (which also works on one item — it just has nothing to
+  // sequence). Kept out of the fileList scope because the dialog is opened from
+  // App.vue (it needs the panel's absolute paths, not list indices) and, like
+  // F5 / Ctrl+T, has no webview-native meaning of its own.
+  { id: "list.batchRename", scope: "global", label: "批量重命名", desc: "对选中的多项套用查找替换 / 序号 / 前后缀 / 大小写规则后统一改名", defaults: ["Ctrl+M"] },
 
   // ── 视频播放 ──
   { id: "video.playPause", scope: "video", label: "播放 / 暂停", defaults: ["Space", "K"] },
