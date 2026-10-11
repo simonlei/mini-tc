@@ -127,6 +127,10 @@
 - [x] **修复：复制跟随目录联接（junction）无限嵌套** — ⚠️ **本条的原始描述三条全错，已按实测修正**。原写「junction 的 `is_symlink()` 返回 false / 三处递归都没深度保护 / 栈溢出 abort 进程」，在本机建真实 junction 跑探针后逐条推翻：
 
   - 🚨 **后续修复（2026-10-11，`6d6d769`）：上一版只修了一半 —— 用户实测「复制后出现的是空目录，不是联接」。** 根因：**守卫只加在「收集任务」阶段，执行阶段仍用 `src.is_dir()`，而该方法跟随链接、对 junction 返回 true，于是走进 `create_dir_all` 分支留下空目录**。空目录比报错更糟 —— 看起来像复制成功而内容全无。**教训：加守卫必须覆盖同一决策链上的每一环，只改一处等于把「明显的失败」变成「静默的谎言」。**
+
+  - ↩ **最终决定（2026-10-11）：放弃复制链接的功能，回滚为「跳过并如实提示」。** 用户判断该场景非常少，不值得继续投入。保留的只有防崩溃的部分：识别链接、**不下钻**、跳过并在结果里列出跳过了哪些。删除了 `create_reparse_point` / `recreate_link` / `build_mount_point_buffer` 及其测试（净减约 400 行）。**不重建链接的理由**：需要手工拼 reparse 缓冲区，写错只得到 `ERROR_ACCESS_DENIED`；且我已在这个功能上连续栽了三次（产出空目录 → 误判为沙箱拦截 → 真实 code=5），每次都要用户实测才发现。如实跳过优于给出一个可能错误的结果。
+  - ⚠️ **本条最贵的教训（与代码无关）**：同一个 `code = 5` 我错了两次。第一次在沙箱里看到它，我归因为「沙箱拦了 reparse point」并交付；用户在 `dev.bat`（不受沙箱限制）复现后，证明**是代码 bug**（`CreateFileW` 多要了 `GENERIC_READ`）。**「我验证不了」不等于「它是对的」** —— 无法端到端验证的代码应当拆成可测的纯函数再交付，或干脆不交付。更糟的是我最初的测试**期望值是照着自己错误的实现写的**，于是「测试全过」而功能是错的；测试必须锚定权威数据源（这里是 `fsutil reparsepoint query` 的真实输出），不能锚定实现。
+  - **保留下来的正确部分**：`classify_item()` / `ItemKind`（用 `symlink_metadata` 不跟随地判类型，收集与执行两阶段共用）—— 这才是防「无限递归 → 幽灵目录 → 报告成功」这一串数据损坏的关键。删掉的是「重建链接」，不是「识别链接」。
     - 修法：① 新增 `ItemKind { File, Dir, Link }` + `classify_item(path)`（走 `symlink_metadata` 不跟随），**收集与执行两阶段共用同一判定**；② 新增 `recreate_link(src, dest)`：读出源链接目标后在目标位置重建同类型链接（junction 走 `FSCTL_SET_REPARSE_POINT`，无需管理员；失败回退 `CreateSymbolicLinkW`）；③ 把缓冲区构造抽成**纯函数** `build_mount_point_buffer`，因为沙箱不允许端到端验证字节布局，而布局错了只表现为无从诊断的 `ERROR_ACCESS_DENIED`。
     - 🚨 **缓冲区布局第一版凭理解写，全错**。用 `fsutil reparsepoint query` 导出 Windows 自己创建的 junction 后发现三处不符：substitute name 带 NT 前缀 `\??\`（不是单个反斜杠）；**Windows 根本不写 print name**（`PrintNameLength = 0`，我写了完整路径）；`SubstituteNameLength` **不含**结尾 NUL 但 `PrintNameOffset` 指向 NUL 之后（差 2 字节）。现已与实测逐项一致（`SubstLen=72`/`PrintOff=74`/`PrintLen=0`，并验证过随路径长度变化）。
     - **测试当场抓出两个真实缺陷**（`reparse_buffer_tests`）：`PrintNameLength` 写了多余内容；超长目标因 u16 回绕**未被拒绝**（会产出一个被 Windows 拒绝且无从诊断的缓冲区）。现已改为在系统调用前显式检查长度。
