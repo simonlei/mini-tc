@@ -265,8 +265,9 @@ import GeneralSettingsDialog from "./components/GeneralSettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import SearchDialog from "./components/SearchDialog.vue";
 import BatchRenameDialog from "./components/BatchRenameDialog.vue";
-import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir } from "./api.js";
+import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir, undoTrashPeek, undoTrashDelete } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
+import { splitName, validateName } from "./renameRules.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import { loadBookmarks, findBookmark, addBookmark, removeBookmark } from "./bookmarks.js";
 import {
@@ -1323,6 +1324,138 @@ async function doPaste(operation, sources, destDirOverride) {
   }
 }
 
+// ── Ctrl+Z: undo the most recent delete ──
+//
+// Scope, deliberately narrow (this is NOT a general undo stack):
+//   · Only the last batch that went into the RECYCLE BIN. Permanent delete
+//     (Shift+Delete) and the elevated delete bypass the bin entirely, so they
+//     are not recoverable — the user was explicit about that, and offering an
+//     undo for them would imply they can be brought back.
+//   · One batch = one keystroke. Deleting 12 files with one Delete is one
+//     undo step, not twelve.
+//
+// The conflict path (原位置已被占用) is the reason this is two-phase: the
+// backend keeps the batch until `undoTrashDelete` consumes it, so we can peek,
+// ask, and still have something to restore.
+
+// A name that is free AND passes the same Windows rules the rename dialog
+// enforces. Reuses `splitName` / `validateName` rather than inventing a third
+// set of naming rules: an auto-suggested name that the rename dialog would
+// reject is worse than none.
+async function pickRestorableName(originalPath) {
+  const { stem, ext } = splitName(originalPath.split(/[\\/]/).pop() || "");
+  const dir = parentDirOf(originalPath);
+  for (let n = 1; n <= 999; n++) {
+    // Keep the extension last: `report.txt` → `report (1).txt`, not
+    // `report.txt (1)`, so the file stays openable by double-click defaults.
+    const candidate = `${stem} (${n})${ext}`;
+    if (validateName(candidate)) continue;
+    const full = await joinPath(dir, candidate);
+    if (!(await pathExists(full))) return full;
+  }
+  return null;
+}
+
+async function onUndoDelete() {
+  let peek;
+  try {
+    peek = await undoTrashPeek();
+  } catch (e) {
+    showToast(`撤销失败：${String(e)}`, "error");
+    return;
+  }
+  if (!peek || !peek.available || !peek.items || peek.items.length === 0) {
+    showToast("没有可撤销的删除", "info");
+    return;
+  }
+
+  // Resolve conflicts BEFORE consuming the batch — the peek is non-destructive
+  // precisely so this decision can happen with the items still restorable.
+  const conflicts = peek.items.filter((i) => i.conflict);
+  const renames = {};
+  if (conflicts.length > 0) {
+    const choice = await showConfirm({
+      title: `${conflicts.length} 个项目的原位置已被占用`,
+      body: "可以改名恢复（自动加序号），或跳过它们（仍留在回收站）。原位置的同名文件不会被覆盖。",
+      items: conflicts.map((i) => i.path),
+      options: [
+        { label: "跳过", value: "skip" },
+        { label: "改名恢复", value: "rename", primary: true },
+      ],
+    });
+    if (choice === "cancel") {
+      showToast("已取消撤销", "info");
+      return;
+    }
+    if (choice === "rename") {
+      for (const item of conflicts) {
+        const full = await pickRestorableName(item.path);
+        if (!full) {
+          showToast(`「${item.name}」找不到可用的新名称，已留在回收站`, "error");
+          continue;
+        }
+        renames[item.path] = full.split(/[\\/]/).pop();
+      }
+    }
+  }
+
+  let res;
+  try {
+    res = await undoTrashDelete(renames);
+  } catch (e) {
+    showToast(`撤销失败：${String(e)}`, "error");
+    return;
+  }
+
+  // Refresh whichever panel is showing a directory that just gained files.
+  // The restore target is wherever the items came from, which need not be the
+  // active panel — the user may have switched or navigated since the delete.
+  // Normalised to arrays: a malformed reply must not throw here, since this
+  // runs after the restore already happened.
+  const restored = Array.isArray(res?.restored) ? res.restored : [];
+  const skipped = Array.isArray(res?.skipped) ? res.skipped : [];
+  const errors = Array.isArray(res?.errors) ? res.errors : [];
+  const touched = new Set(restored.map((p) => normDir(parentDirOf(p))));
+  if (touched.size > 0) {
+    for (const panel of [leftPanel.value, rightPanel.value]) {
+      if (panel && touched.has(normDir(panel.currentPath))) {
+        await panel.refresh?.();
+      }
+    }
+    // Select the first restored item in the active panel when it lives there —
+    // matches the "delete selects the next row" feel in reverse.
+    const active = getActivePanelRef();
+    if (active && touched.has(normDir(active.currentPath))) {
+      const first = restored.find(
+        (p) => normDir(parentDirOf(p)) === normDir(active.currentPath)
+      );
+      if (first) {
+        const name = first.split(/[\\/]/).pop();
+        nextTick(() => active.selectName?.(name));
+      }
+    }
+  }
+  // Free space on the drive changed back (items left the bin).
+  leftPanel.value?.refreshDrives?.();
+  rightPanel.value?.refreshDrives?.();
+
+  const n = restored.length;
+  const parts = [];
+  if (n > 0) parts.push(`已恢复 ${n} 个项目`);
+  if (skipped.length) {
+    parts.push(`${skipped.length} 个因原位置被占用仍留在回收站`);
+  }
+  if (errors.length) {
+    showToast(
+      (parts.length ? parts.join("，") + "；" : "") +
+      `恢复失败：${errors.join("；")}`,
+      "error"
+    );
+    return;
+  }
+  showToast(parts.length ? parts.join("，") : "没有可撤销的删除", n > 0 ? "success" : "info");
+}
+
 // ── Native drag-and-drop (OS-owned via tauri-plugin-drag) ──
 //
 // All webview drag-and-drop is handled by the OS (dragDropEnabled: true). When
@@ -1872,6 +2005,13 @@ onMounted(() => {
     // rule inputs. Ctrl+M itself is re-checked below so it isn't swallowed.
     if (batchRenameVisible.value) return;
 
+    // The conflict prompt raised by an undo is modal too. Without this,
+    // pressing Ctrl+Z again while it is open would raise a SECOND prompt and
+    // overwrite `confirmResolve` — the first Promise then never resolves and
+    // that undo silently evaporates (the general "dialogs don't gate the
+    // global keys" hole; see the review notes).
+    if (confirmDialog.value.visible) return;
+
     // Esc: close the current preview (image / text / pdf / video / unsupported)
     // and return the source file list to the file that was just previewed. When
     // no preview is open, this is a no-op — Esc no longer cancels selection on
@@ -1950,6 +2090,22 @@ onMounted(() => {
       if (isCopy) setClipboard("copy");
       else if (isCut) setClipboard("cut");
       else pasteFromClipboard();
+      return;
+    }
+
+    // Ctrl+Z: restore the most recent batch that went to the recycle bin.
+    // NOT a general undo stack — permanent / elevated deletes never reach the
+    // bin and are deliberately unrecoverable, so there's nothing to undo for
+    // them and the user is told so rather than left guessing.
+    // Skipped while typing: Ctrl+Z inside a text input is the browser's own
+    // text undo (address bar, filename filter, inline rename), and hijacking
+    // it there would be both surprising and destructive-looking.
+    if (matches("edit.undoDelete", e)) {
+      const t = e.target;
+      if (isTypingTarget(t)) return;
+      e.preventDefault();
+      markHandled(e);
+      onUndoDelete();
       return;
     }
 

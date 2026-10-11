@@ -102,7 +102,7 @@ import TabBar from "./TabBar.vue";
 import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
-import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
+import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, beginTrashDelete, commitTrashDelete, undoTrashDelete, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { cancelSearch, startSearch } from "../api.js";
 import {
@@ -1359,13 +1359,27 @@ async function onDelete(targets, opts = {}) {
 
   const remove = permanent ? deletePermanently : deleteToTrash;
 
+  // Snapshot the tab this delete was aimed at. The loop below awaits per
+  // item (and may take seconds for a large selection), during which the user
+  // can navigate or switch tabs — reading `activeTab` inside the loop then
+  // points at a different directory, and the row filtering / tab bookkeeping
+  // would land on the wrong list.
+  const tab = activeTab.value;
+  const tabId = tab.id;
+  const dir = tab.path;
+
   const successNames = [];
   const successPaths = [];    // absolute paths, for exact row removal
   const failed = [];        // delete failed → auto-retry with admin
   const adminLaunched = []; // admin delete was accepted (UAC approved)
 
+  // Bracket the recycle-bin delete so ONE undo step covers the whole batch.
+  // Permanent deletes bypass the bin entirely and are deliberately NOT
+  // undoable, so they neither snapshot nor commit.
+  const binSnapshot = permanent ? null : await beginTrashDelete();
+
   for (const entry of list) {
-    const fullPath = await entryPath(entry, activeTab.value.path);
+    const fullPath = await entryPath(entry, dir);
     try {
       await remove(fullPath);
       successNames.push(entry.name);
@@ -1381,6 +1395,18 @@ async function onDelete(targets, opts = {}) {
     }
   }
 
+  if (!permanent && successPaths.length) {
+    // Awaited (not fired and forgotten) so a Ctrl+Z pressed immediately after
+    // the delete finds the batch already recorded. A failure here only costs
+    // the undo step — the delete itself succeeded and must not be reported as
+    // failed — hence the catch.
+    try {
+      await commitTrashDelete(binSnapshot, successPaths);
+    } catch {
+      /* undo step unavailable; the delete itself is unaffected */
+    }
+  }
+
   // Remove entries that were successfully deleted. Match on the ABSOLUTE path,
   // not the name: a search-results tab can legitimately contain two rows with
   // the same name coming from different folders, and deleting one of them must
@@ -1388,13 +1414,12 @@ async function onDelete(targets, opts = {}) {
   if (successPaths.length) {
     const removed = new Set(successPaths);
     entries.value = entries.value.filter((e) => !removed.has(e.path));
-    const tab = activeTab.value;
     // Drop both keyings — the row may have been cached under its name (real
     // directory) or its path (search-results tab). Written through
     // `updateDirSizes` so the bucket's path stamp survives; a deleted folder's
     // size would otherwise linger and be resurrected on a later re-list.
     if (tab) {
-      updateDirSizes(tab.id, tab.path, (m) => {
+      updateDirSizes(tabId, dir, (m) => {
         const next = { ...m };
         successNames.forEach((n) => delete next[n]);
         successPaths.forEach((p) => delete next[p]);

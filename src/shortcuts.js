@@ -48,6 +48,11 @@ export const COMMANDS = [
   { id: "edit.copyToOther", scope: "global", label: "复制到对面栏", desc: "把选中项复制到另一侧面板的当前目录（与 Total Commander 一致：F5）", defaults: ["F5"] },
   { id: "edit.moveToOther", scope: "global", label: "移动到对面栏", desc: "把选中项移动到另一侧面板的当前目录（与 Total Commander 一致：Shift+F5）", defaults: ["Shift+F5"] },
   { id: "edit.selectAll", scope: "global", label: "全选", desc: "选中当前面板所有项目", defaults: ["Ctrl+A"] },
+  // 撤销最近一次删除（仅限送进回收站的那一步）。删除 N 个文件算**一步**，
+  // Ctrl+Z 一次把它们一起放回原位。彻底删除（Shift+Delete）与提权删除
+  // （走 Remove-Item）根本没进回收站，天然不可撤销 —— 这是用户明确的口径，
+  // 不要给它们也挂撤销，那会误导成可恢复。
+  { id: "edit.undoDelete", scope: "global", label: "撤销删除", desc: "把最近一次送入回收站的项目恢复到原位置（彻底删除不可撤销）", defaults: ["Ctrl+Z"] },
   // Total Commander 用光标 Tab 切左右栏（裸 Tab 已是浏览器焦点遍历键，只在
   // 文件列表获得焦点时才被认领为「切面板」，见 App.vue）。Ctrl+Tab 在 TC 里是
   // 「本栏下一个标签页」，故不再给 panel.switch，只留给 tab.next。

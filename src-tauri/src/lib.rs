@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1109,6 +1110,408 @@ fn delete_to_trash(path: String) -> Result<(), DeleteError> {
         });
     }
     Ok(())
+}
+
+// ── Undo delete (restore the most recent batch sent to the recycle bin) ──
+//
+// `trash::delete` is one-way: it hands back nothing that identifies what it
+// put in the bin, while `restore_all` needs `TrashItem`s (an `id` plus the
+// original location). So the only way to line the two up is to snapshot the
+// bin before and after the delete and take the difference — see
+// `push_trash_undo_batch` for the three ambiguities that difference has to
+// survive.
+//
+// The stack is ONE batch deep, matching what the user asked for ("undo the
+// most recent delete"). Permanent deletes never land here: they don't go
+// through the bin at all, so they are not recoverable by construction.
+
+/// One batch of items that went to the recycle bin together (a single
+/// multi-select Delete). Kept as the exact `TrashItem`s the bin reported so
+/// `restore_all` can put each one back where it came from.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+struct TrashUndoBatch {
+    items: Vec<trash::TrashItem>,
+}
+
+/// Snapshot of the recycle bin taken just before a delete: the set of item
+/// ids currently present. Anything present after the delete but absent here
+/// was added by that delete.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn trash_snapshot_ids() -> Vec<std::ffi::OsString> {
+    match trash::os_limited::list() {
+        Ok(items) => items.into_iter().map(|i| i.id).collect(),
+        // A failed snapshot is NOT an error: the delete itself must still
+        // happen. We record an empty snapshot so the post-delete diff can't
+        // silently attribute somebody else's items to this batch — the
+        // `original_path` intersection below is the real safety net.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Pick the bin entries this batch created, out of a before/after pair.
+///
+/// Pure and IO-free (the caller supplies both listings) so the three
+/// ambiguities can be tested directly — they're the whole reason this
+/// function exists, and they only show up in combination:
+///
+/// 1. **Another process touched the bin** between the snapshots. Those items
+///    are in the diff too, so the diff alone is not "what we deleted" — hence
+///    the intersection on `original_path`.
+/// 2. **The same path deleted twice** (undo, then delete again) leaves two
+///    entries with an identical `original_path`. `list()` returns them in no
+///    particular order, so we keep the most recently deleted one per path —
+///    the batch we just performed.
+/// 3. **A `list()` failure** yields an empty `before`, which would make every
+///    pre-existing entry look new. The intersection is what saves us there;
+///    the `seen` check alone would not.
+fn select_new_trash_items(
+    before: &[std::ffi::OsString],
+    after: Vec<trash::TrashItem>,
+    deleted: &[String],
+) -> Vec<trash::TrashItem> {
+    let mut seen: HashSet<std::ffi::OsString> = before.iter().cloned().collect();
+    let mut newest: HashMap<Vec<String>, trash::TrashItem> = HashMap::new();
+    for item in after {
+        if !seen.insert(item.id.clone()) {
+            continue; // present before the delete → not ours
+        }
+        let key = path_key(&item.original_path());
+        if !deleted.iter().any(|d| path_key(Path::new(d)) == key) {
+            continue; // added by someone else during the delete
+        }
+        match newest.get(&key) {
+            Some(prev) if prev.time_deleted >= item.time_deleted => {}
+            _ => {
+                newest.insert(key, item);
+            }
+        }
+    }
+    newest.into_values().collect()
+}
+
+/// Record the just-deleted paths as the undoable batch.
+///
+/// `before` is the pre-delete id snapshot and `deleted` the absolute paths
+/// that actually went into the bin. Note `list()` is not free — it enumerates
+/// and reads metadata for the whole bin — which is why the snapshot is taken
+/// once per *batch* rather than once per file.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn push_trash_undo_batch(before: Vec<std::ffi::OsString>, deleted: &[String]) {
+    if deleted.is_empty() {
+        clear_trash_undo_batch();
+        return;
+    }
+    let Ok(after) = trash::os_limited::list() else {
+        clear_trash_undo_batch();
+        return;
+    };
+
+    let items = select_new_trash_items(&before, after, deleted);
+    let batch = TrashUndoBatch { items };
+    if batch.items.is_empty() {
+        clear_trash_undo_batch();
+        return;
+    }
+    let mut guard = TRASH_UNDO.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(batch);
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn clear_trash_undo_batch() {
+    let mut guard = TRASH_UNDO.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// The single undoable delete, if any. Depth is deliberately one — the user
+/// asked for "undo the most recent delete", and a deeper stack would have to
+/// decide what to do when a permanent delete or a rename lands on top, which
+/// is scope nobody asked for.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+static TRASH_UNDO: std::sync::Mutex<Option<TrashUndoBatch>> = std::sync::Mutex::new(None);
+
+/// Begin recording a recycle-bin batch: snapshot the bin, then return the
+/// token to hand back to `commit_trash_delete`. Split in two so the frontend
+/// can bracket its whole delete loop (N files = one undo step, not N).
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[tauri::command]
+fn begin_trash_delete() -> Vec<std::ffi::OsString> {
+    trash_snapshot_ids()
+}
+
+/// Close a batch begun by `begin_trash_delete`, recording `deleted` as the
+/// undoable step. Ignored on platforms without a restorable bin.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[tauri::command]
+fn commit_trash_delete(before: Vec<std::ffi::OsString>, deleted: Vec<String>) {
+    push_trash_undo_batch(before, &deleted);
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+#[tauri::command]
+fn begin_trash_delete() -> Vec<std::ffi::OsString> {
+    Vec::new()
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+#[tauri::command]
+fn commit_trash_delete(_before: Vec<std::ffi::OsString>, _deleted: Vec<String>) {}
+
+/// One entry of the pending undo, as reported by `undo_trash_peek`.
+#[derive(Serialize)]
+pub struct UndoTrashItem {
+    /// Absolute path the item would be restored to.
+    pub path: String,
+    pub name: String,
+    /// True when something already occupies `path` — restoring needs either a
+    /// new name or an explicit skip.
+    pub conflict: bool,
+}
+
+/// What `undo_trash_peek` found, without consuming anything.
+#[derive(Serialize)]
+pub struct UndoTrashPeek {
+    pub available: bool,
+    pub items: Vec<UndoTrashItem>,
+}
+
+/// Result of `undo_trash_delete`.
+#[derive(Serialize)]
+pub struct UndoTrashResult {
+    /// Absolute paths put back where they came from.
+    pub restored: Vec<String>,
+    /// Items left in the bin: either the original path was occupied and no
+    /// rename was supplied, or the OS reported a collision anyway. They are
+    /// NOT overwritten (see the command's docs — an undo key that silently
+    /// destroys data is worse than one that reports a conflict).
+    pub skipped: Vec<String>,
+    /// Real failures, with the message.
+    pub errors: Vec<String>,
+}
+
+/// Report the pending undo without consuming it.
+///
+/// Separate from `undo_trash_delete` because the conflict decision needs the
+/// user's input: by the time they answer, the batch must still be there.
+/// A peek is a field read plus one `exists()` per item — no bin enumeration.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[tauri::command]
+fn undo_trash_peek() -> UndoTrashPeek {
+    let guard = TRASH_UNDO.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(batch) = guard.as_ref() else {
+        return UndoTrashPeek {
+            available: false,
+            items: Vec::new(),
+        };
+    };
+    let items = batch
+        .items
+        .iter()
+        .map(|i| {
+            let path = i.original_path();
+            UndoTrashItem {
+                conflict: path.exists(),
+                name: i.name.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
+            }
+        })
+        .collect();
+    UndoTrashPeek {
+        available: true,
+        items,
+    }
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+#[tauri::command]
+fn undo_trash_peek() -> UndoTrashPeek {
+    UndoTrashPeek {
+        available: false,
+        items: Vec::new(),
+    }
+}
+
+/// Put the most recent recycle-bin batch back where it came from.
+///
+/// `renames` maps an item's original absolute path to the name it should be
+/// restored under; it exists for the conflict case, where the user chose
+/// "restore under a new name" over "leave it in the bin". Renaming works by
+/// rewriting `TrashItem::name` before the restore — `original_path()` is
+/// derived from it, and both platform backends move the item to
+/// `original_parent` under `name`.
+///
+/// The stack is consumed by this call — whether or not every item made it —
+/// because the batch is gone from the bin either way, and leaving it on the
+/// stack would let a second Ctrl+Z report items that are no longer there.
+///
+/// Collisions (`RestoreCollision`) are reported in `skipped`, never resolved
+/// by overwriting: the original path is occupied, and clobbering whatever the
+/// user put there with an undo reflex would destroy unrelated data.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[tauri::command]
+fn undo_trash_delete(renames: HashMap<String, String>) -> UndoTrashResult {
+    let batch = {
+        let mut guard = TRASH_UNDO.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    let empty = UndoTrashResult {
+        restored: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    };
+    let Some(batch) = batch else {
+        return empty;
+    };
+    if batch.items.is_empty() {
+        return empty;
+    }
+
+    let mut result = UndoTrashResult {
+        restored: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    };
+    for item in batch.items {
+        let original = item.original_path();
+        let original_key = original.to_string_lossy().to_string();
+        // The rename table is keyed by the path we reported in the peek, so a
+        // key that doesn't match anything here is simply ignored rather than
+        // applied to the wrong item.
+        let mut item = item;
+        if let Some(new_name) = renames.get(&original_key) {
+            item.name = std::ffi::OsString::from(new_name);
+        }
+        let target = item.original_path();
+        if target.exists() {
+            // Nothing to restore onto: report the ORIGINAL path so the user
+            // recognises which item this is, not the speculative new name.
+            result.skipped.push(original_key);
+            continue;
+        }
+        let target_key = target.to_string_lossy().to_string();
+        match trash::os_limited::restore_all([item]) {
+            Ok(()) => result.restored.push(target_key),
+            // The OS can still report a collision after our own `exists()`
+            // check (another process, or a case-insensitive match our check
+            // missed). Report it like any other occupied path.
+            Err(trash::Error::RestoreCollision { .. }) => result.skipped.push(original_key),
+            Err(e) => result.errors.push(format!("{}: {}", target_key, e)),
+        }
+    }
+    result
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+#[tauri::command]
+fn undo_trash_delete(_renames: HashMap<String, String>) -> UndoTrashResult {
+    UndoTrashResult {
+        restored: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    }
 }
 
 /// Recursively clear the read-only attribute inside `path` (Windows refuses to
@@ -3590,6 +3993,10 @@ pub fn run() {
             delete_to_trash,
             delete_permanently,
             delete_with_admin,
+            begin_trash_delete,
+            commit_trash_delete,
+            undo_trash_peek,
+            undo_trash_delete,
             is_executable,
             run_as_admin,
             rename_file,
@@ -3654,6 +4061,141 @@ mod tests {
         assert!(name_matches(&pats, "main.rs", false));
         assert!(name_matches(&pats, "Cargo.toml", false));
         assert!(!name_matches(&pats, "main.js", false));
+    }
+
+    // ── Undo-delete: picking our own entries out of the recycle bin ──
+
+    /// Build a `TrashItem` as the platform backends would report it.
+    fn bin_item(id: &str, original: &str, time_deleted: i64) -> trash::TrashItem {
+        let p = PathBuf::from(original);
+        let parent = p.parent().unwrap_or(Path::new("")).to_path_buf();
+        trash::TrashItem {
+            id: std::ffi::OsString::from(id),
+            name: p.file_name().unwrap_or_default().to_os_string(),
+            original_parent: parent,
+            time_deleted,
+        }
+    }
+
+    #[test]
+    fn undo_batch_ignores_entries_that_predate_the_delete() {
+        // `old.txt` was already in the bin before this delete — it must not be
+        // offered for undo, or Ctrl+Z would restore someone else's file.
+        let picked = select_new_trash_items(
+            &[std::ffi::OsString::from("id-old")],
+            vec![
+                bin_item("id-old", "C:\\a\\old.txt", 100),
+                bin_item("id-new", "C:\\a\\new.txt", 200),
+            ],
+            &["C:\\a\\new.txt".to_string()],
+        );
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].original_path(), PathBuf::from("C:\\a\\new.txt"));
+    }
+
+    #[test]
+    fn undo_batch_ignores_items_added_by_another_process() {
+        // The bin gained `theirs.txt` between the snapshots, but WE didn't
+        // delete it. The id diff can't tell (it's genuinely new), so the
+        // original-path intersection is what saves us here.
+        let picked = select_new_trash_items(
+            &[],
+            vec![
+                bin_item("id-mine", "C:\\a\\mine.txt", 200),
+                bin_item("id-theirs", "C:\\a\\theirs.txt", 201),
+            ],
+            &["C:\\a\\mine.txt".to_string()],
+        );
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].original_path(), PathBuf::from("C:\\a\\mine.txt"));
+    }
+
+    #[test]
+    fn undo_batch_keeps_newest_entry_when_a_path_was_deleted_twice() {
+        // Undo, then delete the same path again: the bin now holds two entries
+        // with an identical original_path. `list()` returns them in NO
+        // particular order, so a "first one seen wins" implementation passes
+        // whenever the stale entry happens to come first. Both orders are
+        // asserted here for exactly that reason — this test failed to catch
+        // such a regression until the orderings were made symmetric.
+        let newest_first = select_new_trash_items(
+            &[],
+            vec![
+                bin_item("id-new", "C:\\a\\x.txt", 500),
+                bin_item("id-old", "C:\\a\\x.txt", 100),
+            ],
+            &["C:\\a\\x.txt".to_string()],
+        );
+        assert_eq!(
+            newest_first.len(),
+            1,
+            "the stale entry must not be offered too"
+        );
+        assert_eq!(newest_first[0].id, std::ffi::OsString::from("id-new"));
+
+        let stale_first = select_new_trash_items(
+            &[],
+            vec![
+                bin_item("id-old", "C:\\a\\x.txt", 100),
+                bin_item("id-new", "C:\\a\\x.txt", 500),
+            ],
+            &["C:\\a\\x.txt".to_string()],
+        );
+        assert_eq!(stale_first.len(), 1);
+        assert_eq!(stale_first[0].id, std::ffi::OsString::from("id-new"));
+    }
+
+    #[test]
+    fn undo_batch_covers_every_path_of_a_multi_select() {
+        // One Delete of N files is ONE undo step: all N must come back.
+        let picked = select_new_trash_items(
+            &[std::ffi::OsString::from("id-old")],
+            vec![
+                bin_item("id-old", "C:\\a\\old.txt", 100),
+                bin_item("id-1", "C:\\a\\1.txt", 200),
+                bin_item("id-2", "C:\\a\\2.txt", 201),
+                bin_item("id-3", "C:\\a\\sub\\3.txt", 202),
+            ],
+            &[
+                "C:\\a\\1.txt".to_string(),
+                "C:\\a\\2.txt".to_string(),
+                "C:\\a\\sub\\3.txt".to_string(),
+            ],
+        );
+        assert_eq!(picked.len(), 3);
+    }
+
+    #[test]
+    fn undo_batch_matches_paths_case_insensitively_on_windows() {
+        // The listing reports the name as the shell stores it, which need not
+        // match the casing the frontend sent down. On a case-insensitive
+        // filesystem these are the same file, so the entry must be picked up.
+        let deleted = if cfg!(windows) {
+            "C:\\a\\MiXeD.TxT"
+        } else {
+            "C:\\a\\mixed.txt"
+        };
+        let picked = select_new_trash_items(
+            &[],
+            vec![bin_item("id-1", "C:\\a\\mixed.txt", 200)],
+            &[deleted.to_string()],
+        );
+        assert_eq!(picked.len(), 1);
+    }
+
+    #[test]
+    fn undo_batch_is_empty_when_the_snapshot_failed() {
+        // `list()` failing on the "before" snapshot yields an EMPTY before,
+        // which makes every pre-existing bin entry look new. Only the
+        // original-path intersection keeps that from restoring unrelated
+        // files — with nothing matching, the batch must be empty so the
+        // frontend reports "nothing to undo" instead of guessing.
+        let picked = select_new_trash_items(
+            &[],
+            vec![bin_item("id-1", "C:\\a\\unrelated.txt", 100)],
+            &["C:\\a\\mine.txt".to_string()],
+        );
+        assert!(picked.is_empty());
     }
 
     /// Write `bytes` to a temp file named `name` and return its path.

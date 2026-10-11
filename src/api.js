@@ -43,6 +43,41 @@ export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
 
+// ── Undo delete ──
+//
+// `trash::delete()` is one-way — it hands back nothing identifying what it
+// put in the bin, while restoring needs the `TrashItem`s. So the backend
+// brackets the whole delete loop: `beginTrashDelete` snapshots the bin,
+// `commitTrashDelete` diffs it and records ONE undoable batch (N files
+// deleted = one Ctrl+Z, not N).
+//
+// Bracketing is per BATCH, not per file: a snapshot costs a full
+// enumeration of the recycle bin, so it must not run once per file.
+export async function beginTrashDelete() {
+  return invoke("begin_trash_delete");
+}
+
+export async function commitTrashDelete(before, deleted) {
+  return invoke("commit_trash_delete", { before, deleted });
+}
+
+/// Inspect the pending undo WITHOUT consuming it — `{ available, items }`,
+/// where each item is `{ path, name, conflict }` and `conflict` means the
+/// original path is occupied again. The conflict decision needs user input,
+/// and the batch must still be there when they answer.
+export async function undoTrashPeek() {
+  return invoke("undo_trash_peek");
+}
+
+/// Restore the most recent recycle-bin batch. `renames` maps an item's
+/// original absolute path to the name to restore it under (used for the
+/// "原位置已被占用 → 改名恢复" choice). Resolves to
+/// `{ restored: string[], skipped: string[], errors: string[] }` — `skipped`
+/// means the item stayed in the bin; it is never overwritten.
+export async function undoTrashDelete(renames = {}) {
+  return invoke("undo_trash_delete", { renames });
+}
+
 /// Delete a file or directory outright — no recycle bin, unrecoverable.
 /// Directories are removed recursively. Rejects with a `DeleteError`
 /// ({ kind, message }); `kind` is "permission_denied" when the caller should
