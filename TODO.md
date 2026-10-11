@@ -104,7 +104,6 @@
   - **加固措施**：① 三个 handler 统一走 `unwrap(event, name)` 辅助函数解包 `.payload`，异常形状 `console.warn`；② 新增 `src-tauri/src/search_log.rs`——GUI 程序在 Windows 上无控制台，`eprintln!` 等于丢弃，故把入口参数 / 每个进入的目录 / 每个命中 / **每种事件的 `emit` 返回值**（此前全被 `let _ =` 吞掉，emit 失败与「没结果」无法区分）/ `read_dir` 失败 / 汇总行写入 `%USERPROFILE%\.minitc\logs\search.log`，每次搜索覆盖；③ `install_panic_hook()` 用 `Once` 装全局 hook（链式调用原 hook）把 panic 信息写进同一文件；④ 搜索线程包 `catch_unwind(AssertUnwindSafe(..))`，panic 也发一条 `search-done`，线程结束用 `Arc::ptr_eq` 认领式清空 `SEARCH_CANCEL`；⑤ 前端「停止」后 1.5 s 兜底定时器，若仍无 `search-done` 就本地收尾并提示看日志——保证任何情况下都不会卡死；⑥ 对话框底部「诊断日志」可点开显示日志路径。
   - **搜索框的模态行为（用户反馈：Esc 关闭后焦点没回文件列表）**：`@close="searchVisible = false"` 只翻了个 ref，键盘就停在 `<body>` 上，什么键都无效。改为 `openSearch` 记下 `searchReturnPanel` + `document.activeElement`，`closeSearch` 在 `nextTick` 里**精确还原**那个元素（文件列表 / 地址栏 / 文件名过滤框），元素已从 DOM 移除或焦点无处可还时才回退 `panel.focusList()`；`onSearchReveal` / `onSearchOpenDir` 跳转后也补上 `focusList()`。同时发现**同源的按键穿透**：全局 keydown 绑在 `document` 上，搜索框里敲的键会冒泡上去，除了 `search.open` 有一道 `if (searchVisible.value) return` 之外，**其余快捷键全部照常触发**——在文件名框按 `Backspace` 会让背后面板返回上级目录、`Delete` 会删文件、方向键会移动背后光标。已在全局 handler 开头加 `if (searchVisible.value) return;`。⚠️ 只对搜索这么做：`SettingsDialog` / `GeneralSettingsDialog` 没有自己的 Esc 处理，加通用模态拦截会破坏它们的关闭行为。
 
-
 ---
 
 # 代码审查：已有功能的问题与可改进点
@@ -112,6 +111,7 @@
 > 本节来自一轮全库通读（后端 3.5k 行 + 前端 1.6 万行，分四路并行审查 + 逐条行号复核）。  
 > **不是新功能需求**，全部是现有功能里已经存在的缺陷、竞态、资源泄漏、重复实现与测试缺口。  
 > 每条都写明了复核过的行号与代码证据。优先级：**P0** = 会丢数据 / 崩进程 / 执行任意程序；**P1** = 真 bug 或明显性能、泄漏；**P2** = 可维护性与重复。
+
 
 ## P0 — 数据丢失 / 崩溃 / 安全
 
@@ -124,17 +124,18 @@
     - **测试**：新增 `mod overwrite_tests` 共 9 例（`cargo test --lib overwrite_tests` 9 passed / 0 failed）。覆盖 `plan_overwrite` 决策表（目标不存在 4 组 / 目录冲突 4 组 / 叶子冲突+类型不符 4 组）、`plan_task_action` 的「合并+不覆盖 → Skip 且 taint」「合并+覆盖 → Replace 且不 taint」「源消失 → Err」「干净树 → 不 taint」「自覆盖 → Skip 且 taint」，以及 `remove_recursive_would_delete_leftovers`（把「`remove_dir_all` 会删残留」这个**危险前提本身**钉成测试，防止有人改回「源还在就删」的朴素写法）。
     - **测试有效性已验证**：把 `plan_overwrite` 的目录分支回退成旧的耦合写法（`if merge_dirs && overwrite_leaves`）重跑，`plan_directory_conflict_follows_merge_dirs_only` **确实失败**，恢复后全绿。另一次返工：第一版测试在测试体内**复刻了一遍生产逻辑**（手工调 `collect_copy_tasks` + 手工判 taint），看着端到端、其实测的是测试自己的副本，已重写为直接调 `plan_task_action`。**判据：测试调的必须是生产代码实际走的路径；全绿的测试和没测试一样，必须验证它能抓住回退**。
     - 前端零改动（`CopyResult{errors, skipped}` 字段名与语义未变，只多几条更准确的错误文案）。`cargo check` / `cargo fmt --check` 均 exit 0。**待用户双击 `dev.bat` 实测**（4 个场景：合并移动选「否」→ 目标文件内容不变 + 源目录保留；选「是」→ 内容替换 + 源目录移除；同卷移动正常；目标在源内部仍被拒绝）。
-- [x] **修复：目录联接（junction）导致复制任务遍历失控** — ⚠️ **本条的原始描述有错，已按实测修正**。原写「三处递归都没有深度保护、junction 的 `is_symlink()` 返回 false、栈溢出 abort 进程」，实测后逐条推翻：
-  - ❌「`is_symlink()` 对 junction 返回 false」—— **实测为 `true`**（`symlink_metadata` 上 `is_symlink=true` / `is_dir=false`）。所以搜索（`829`）、`dir_size`（`423`）、`clear_readonly_recursive`（`1125`）**本来就守得对**，无需改动。
-  - ❌「三处递归都没有深度保护」—— 只有 `collect_copy_tasks` 有问题；另两处走的是 `DirEntry::file_type()` / `symlink_metadata()`，不跟随链接。
-  - ❌「栈溢出 abort 进程」—— **不会崩**。Windows 的 `MAX_PATH`（约 260 字符）在**深度 31** 处兜底，遍历自然终止。实测路径：`C:\jtest2\loop\loop\loop\...`。
-  - ✅ **真实危害是数据损坏**：复制 `loop` 会产出约 30 层幽灵目录并**报告成功**；若这是移动，源侧内容从未完整写过去就被判定搬完。
-  - **真正的陷阱是 `Path::is_dir()` 会跟随链接**：对 junction 返回 `true`，`read_dir` 于是列出目标内容；指向自身祖先的 junction 就无限自我嵌套。
-  - ✅ **已修复（2026-10-11）**：`collect_copy_tasks` 改用 `fs::symlink_metadata(src).file_type().is_symlink()` 判定（**不跟随**，与搜索/`dir_size` 一致），遇到 reparse point 记为单个可复制项而**不下钻**；另加 `MAX_COPY_DEPTH = 64` 深度上限（对齐搜索已有的 `MAX_SEARCH_DEPTH`），触顶时**如实报错并把该源标 tainted**（移动就不会删掉未复制的尾巴——静默截断会被当成成功）。
-    - 语义说明：**「link → 自身祖先」才是危险形状**；junction 指向**兄弟目录**只是把那份树复制两份，那是用户本意，故复制而非跳过。
-    - 测试：新增 `mod recursion_tests` 3 例。⚠️ 过程中发现**本机无法创建 reparse point**——`symlink_dir` 与 `CreateSymbolicLinkW(DIRECTORY|ALLOW_UNPRIVILEGED_CREATE)` 都返回 `Ok` 却什么都没创建（`exists()=false`），沙箱拦截所致。**第一版测试因此失败**（断言 `link.is_dir()` 为真，实际为假）。已改为「先验证链接真的存在、否则大声 skip」，并把这个环境陷阱写进模块文档 —— **断言前不检查前提，测的就是空气**。实测确认输出 `skipping: this machine does not allow creating links`。
-    - `cargo test --lib` 全库 **30 passed / 0 failed**，`cargo check` / `cargo fmt --check` 均 exit 0。
-  - ⚠️ **方法论教训（比这个 bug 本身更值钱）**：这条的原始结论来自「读代码推理」，全错；我**实际建 junction 跑探针**才拿到真相，而且第一次探针的结论（`is_symlink=true`）又和第二次不同（因为第一次用的路径不存在）。**凡涉及 Windows 文件系统 API 语义的判断，必须在本机实测**——`is_dir()` 是否跟随、`is_symlink()` 对 junction 返回什么、`MAX_PATH` 在哪一层兜底，这些都无法靠推理确定。
+- [x] **修复：复制跟随目录联接（junction）无限嵌套** — ⚠️ **本条的原始描述三条全错，已按实测修正**。原写「junction 的 `is_symlink()` 返回 false / 三处递归都没深度保护 / 栈溢出 abort 进程」，在本机建真实 junction 跑探针后逐条推翻：
+  - ❌「`is_symlink()` 对 junction 返回 false」—— **实测为 `true`**（`symlink_metadata` 上 `is_symlink=true`、`is_dir=false`）。所以搜索（`829`）、`dir_size`（`423`）、`clear_readonly_recursive`（`1125`）**本来就守得对**，无需改动。
+  - ❌「三处递归都没有深度保护」—— 只有 `collect_copy_tasks` 有问题；另两处走 `DirEntry::file_type()` / `symlink_metadata()`，不跟随链接。
+  - ❌「栈溢出 abort 进程」—— **不会崩**。Windows 的 `MAX_PATH`（约 260 字符）在**深度 31** 处兜底，遍历自然终止（实测路径 `loop\loop\loop\…`）。
+  - ✅ **真实危害是数据损坏**：复制会产出约 30 层幽灵目录并**报告成功**；若是移动，源侧未完整写过去的尾巴会被判定「搬完了」而删除。
+  - ✅ **真正的陷阱是 `Path::is_dir()` 会跟随链接**：对 junction 返回 `true`，`read_dir` 于是列出目标内容；指向自身祖先的 junction 就无限自我嵌套。
+  - **修法**：`collect_copy_tasks` 改用 `fs::symlink_metadata(src).file_type().is_symlink()` 判定（**不跟随**，与搜索/`dir_size` 一致），遇 reparse point 记为单个可复制项而**不下钻**；新增 `MAX_COPY_DEPTH = 64` 深度上限（对齐搜索已有的 `MAX_SEARCH_DEPTH`），触顶时**如实报错并把该源标 tainted**（静默截断在移动时会导致源侧未复制的尾巴被删）。函数返回值改为是否截断，`copy_all` 据此上报并 taint。
+  - **语义说明**：只有「link → 自身祖先」才是危险形状；junction 指向**兄弟目录**只是把那份树复制两份，符合用户本意，故**复制而非跳过**。
+  - **测试**：新增 `mod recursion_tests` 3 例。⚠️ 过程中发现**从 Bash 通道无法创建 reparse point**——`symlink_dir` 与 `CreateSymbolicLinkW(DIRECTORY|ALLOW_UNPRIVILEGED_CREATE)` 都返回 `Ok` 却什么都没创建（`exists()=false`）。**第一版测试因此失败**（断言 `link.is_dir()` 为真、实际为假）。已改为「先验证链接真的存在、否则大声 skip」，实测输出 `skipping: this machine does not allow creating links`。⚠️ 同一台机器**不同执行通道能力不同**：独立 shell 通道建 junction 成功，从 Bash 通道调 API 被拦 —— 取证时必须记录用的哪个通道。
+  - `cargo test --lib` 全库 **30 passed / 0 failed**，`cargo check` / `cargo fmt --check` 均 exit 0。提交 `d216509`。
+  - ⚠️ **方法论教训（比这个 bug 本身更值钱）**：本条的原始结论来自「读代码推理」，**全错**。**凡涉及 Windows 文件系统 API 语义的判断，必须在本机建真实样例实测**——`is_dir()` 是否跟随、`is_symlink()` 对 junction 返回什么、`MAX_PATH` 在哪一层兜底，都无法靠推理确定。同理，**断言前先确认前提成立**：在不成立的前提上写断言，测的就是空气。
+  - 📌 **验证方式订正**：先前给的「资源管理器 → 属性 → 联接」是**错的** —— Win10/Win11 的资源管理器**都不提供创建 junction 的图形入口**，junction 的官方创建方式是命令行 `mklink /J`（且 junction **不需要管理员权限**，这正是它相对 symlink 的优势）。识别已存在的 junction：文件夹图标左下角有**蓝色小箭头**，或 `dir /AL` 显示 `JUNCTION`。已在 `D://tctest-junction//` 备好测试环境（`link-to-target` → `target`，以及自环的 `src\self` → `src`）。
 - [ ] **修复：覆盖不是原子的 —— 目标在「计划阶段」就被删，随后直接 `File::create` 原地写入** — `lib.rs:1868` / `1904` / `1772`。`plan_overwrite` 返回 `Replace` 时立刻 `remove_recursive(&dest_item)`，而此时 `collect_copy_tasks`（`1878`）刚跑完、**一个字节都还没复制**；随后 `copy_file_with_progress` 用 `File::create(dest)` 直接截断目标写入。任何一个后续步骤失败（磁盘满、目标被占用、源只读）用户就同时失去源和目标，且中途失败留下半截文件。同仓库 `window_state.rs:122-133` 已经正确实现了 tmp+rename，模式是现成的，只是复制路径没复用。顺带 `plan_overwrite` 在 `1855` 和 `1892` 被调两次，每次内部 3 次 stat → 每项多 3 次无用 syscall。修法：复制到 `dest.tmp-xxx`，成功后 `rename` 原子替换，删掉两处 `remove_recursive`。
 - [ ] **修复：`extract_archive` / `add_to_archive` 直接执行前端传来的 `tool_exe`，等价于任意程序执行** — `lib.rs:2949` / `3152`。`get_archive_tools()` 返回的 exe 是后端自己探测的，但 `extract_archive(archive, target_dir, tool_exe, syntax, ...)` 不信任这个来源——webview 里任何一处 XSS 或被劫持的前端资源都能把 `tool_exe` 换成 `cmd.exe` 拿到完整用户权限。`syntax` 还能任意切换参数分支。对比同文件 `run_as_admin` 至少用 `executable_kind`（`1439`）做了白名单，这里连「是不是解压工具」都不校验。修法：后端维护 `tool_id → (exe, 参数模板)` 权威表，命令只接受 `tool_id`，删掉 `tool_exe`/`syntax` 两个前端可控参数。
 - [ ] **修复：预览加载无请求序号，旧结果覆盖新文件 + blob URL 泄漏** — `FilePreview.vue`（`loadPreview` / `loadHeicPreview` / `loadDocxPreview` 全程无 token，grep `loadToken|loadSeq` 零命中）。用 ↓ 快速翻 HEIC 时，A 的 `fetch + decodeHeic(~400ms) + pixelsToBlob(~150ms)` 必然晚于 B：A 覆盖 B 的 `previewType/previewContent/fileSize`，界面上标题写着 B、内容是 A；`heicObjectUrl` 被覆写成 A 的 URL，**B 的 blob 从此无引用、永不 revoke**，每次快速翻页泄漏一份 JPEG。`loadDocxPreview` 同理（25MB docx 转换数秒）。附带 `releaseHeicUrl()` 只在 `loadHeicPreview` 和 `onBeforeUnmount` 调用，预览过 HEIC 后切到 PNG/TXT/PDF 走 `loadPreview` 其它分支时**从不 revoke**。修法：`let loadToken = 0`，入口取 `my = ++loadToken`，每个 `await` 后 `if (my !== loadToken) return;`；`releaseHeicUrl()` 移到 `loadPreview()` 开头（幂等）。
