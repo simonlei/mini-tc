@@ -222,7 +222,7 @@ npm test                       # 只跑单元测试
 
 改动 `.vue` / `src/*.js` 后跑一次，比等运行时白屏再回头找快得多。
 
-`npm test` 目前覆盖三块前端纯逻辑：
+`npm test` 目前覆盖四块前端纯逻辑：
 
 - `scripts/rename-rules-check.mjs` —— 批量重命名的规则与两阶段执行（含失败回滚）
 - `scripts/selection-remap-check.mjs` —— 文件列表选中态在排序 / 过滤后的重映射。
@@ -243,6 +243,22 @@ npm test                       # 只跑单元测试
   同样地，**转圈不能复用落地判据**：切到有缓存的 tab 走 silent 分支、根本不新建转圈，
   按「当前是否还是这个目录」去清就会**永久停在「Loading…」**。所以归属单独记
   （`createSpinner()`：谁点亮谁熄灭），与 await 后的状态无关。
+- `scripts/preview-gate.test.mjs` —— 预览加载的并发落地判定。
+
+  与上一条同源：HEIC 一次 decode + re-encode 要几百毫秒，按住 ↓ 快速翻相册时
+  先发的文件必然后到并覆盖当前文件（标题写着 B、内容是 A），同时把上一份已解码的
+  blob 泄漏掉。判据是 `src/previewGate.js` 的 `previewLands()`。
+
+  两条通用要点：
+
+  - **守卫要落在每一个 `await` 之后，不只是入口**。HEIC 路径有 4 处 await
+    （fetch / decode / `nextTick` / encode），任何一处都可能落在用户导航之后。
+  - **作废一个「已经产出了资源」的结果时，必须真的把资源丢掉**。`pixelsToBlob`
+    之后那道守卫若只跳过后续的界面写入，那多 MB 的 JPEG 就此无引用、永不 revoke ——
+    **跳过写入不等于释放资源**，而这正是原来的泄漏点。
+
+  资源释放的位置同样有讲究：`releaseHeicUrl()` 必须在**加载入口**调用，不能只在
+  HEIC 分支里 —— 否则「预览过 HEIC → 切到 PNG/TXT」这条路从不释放，blob 活到窗口关闭。
 
 ## 后端单元测试
 

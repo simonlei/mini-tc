@@ -107,6 +107,7 @@
 import { ref, watch, computed, onBeforeUnmount, nextTick } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
+import { previewLands } from "../previewGate.js";
 import { decodeHeic, decodeHeicFrame, pixelsToBlob } from "../heicDecoder.js";
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
@@ -184,6 +185,21 @@ onBeforeUnmount(() => {
   releaseHeicUrl();
   stopAnimation();
 });
+
+// Concurrency guard for the async preview loaders. Every entry point snapshots
+// the path it was asked about and re-checks `lands()` after each await: a HEIC
+// decode + re-encode takes hundreds of ms, so arrow-key scrubbing through a
+// folder guarantees the earlier file's result lands LAST and would otherwise
+// overwrite the file the user is actually looking at (title says B, body is A).
+// See src/previewGate.js for why the test is "is this still the wanted file"
+// rather than a request counter.
+function beginLoad() {
+  const path = props.filePath;
+  return {
+    path,
+    lands: () => previewLands(path, props.filePath),
+  };
+}
 
 // ── 动画 HEIC 播放 ──
 // A multi-frame HEIC (burst, sequence, Live Photo style) plays on a canvas.
@@ -409,7 +425,7 @@ function sanitizeHtml(html) {
   return doc.body.innerHTML;
 }
 
-async function loadDocxPreview() {
+async function loadDocxPreview(load) {
   docMessage.value = "";
   // Guard against previewing huge documents (keeps the webview responsive).
   if (props.fileBytes && props.fileBytes > MAX_DOCX_BYTES) {
@@ -426,6 +442,9 @@ async function loadDocxPreview() {
     const arrayBuffer = await resp.arrayBuffer();
     const mammoth = await loadMammoth();
     const result = await mammoth.convertToHtml({ arrayBuffer });
+    // A 25 MB docx takes seconds to convert; without this the document the
+    // user paged away from lands last and replaces the one they are reading.
+    if (!load.lands()) return;
     const html = sanitizeHtml(result.value || "");
     previewContent.value = html;
     previewType.value = "docx";
@@ -434,9 +453,11 @@ async function loadDocxPreview() {
     const text = html.replace(/<[^>]+>/g, " ").replace(/\s/g, "");
     charCount.value = text.length;
   } catch (e) {
-    error.value = `无法预览此 Word 文档：${String(e)}\n（若为 .doc 旧格式，请另存为 .docx 后再预览）`;
+    if (load.lands()) {
+      error.value = `无法预览此 Word 文档：${String(e)}\n（若为 .doc 旧格式，请另存为 .docx 后再预览）`;
+    }
   } finally {
-    loading.value = false;
+    if (load.lands()) loading.value = false;
   }
 }
 
@@ -498,8 +519,7 @@ function heicReport() {
 // entire cost. The engine matters, so this path uses libheif-js's real WASM
 // build directly instead of heic2any's asm.js one (2.5x, see heicDecoder.js).
 // The remaining cost is downscaling, which libheif-js does not expose.
-async function loadHeicPreview() {
-  releaseHeicUrl();
+async function loadHeicPreview(load) {
   stopAnimation();
   heicPhaseStart = performance.now();
   heicMarks.length = 0;
@@ -520,6 +540,9 @@ async function loadHeicPreview() {
   // re-encode the returned pixels. These are now separate calls with separate
   // timings -- heic2any hid both behind one await across two threads.
   const result = await decodeHeic(arrayBuffer);
+  // Past this point the decode cost is already sunk — bail out before touching
+  // any state, so the slow file cannot overwrite the one now on screen.
+  if (!load.lands()) return;
 
   // The pixel budget is enforced in the worker, before it commits the RGBA
   // allocation. Reaching here means the primary either fitted, or the file
@@ -549,8 +572,16 @@ async function loadHeicPreview() {
     heicNote.value = `HEIC 动画，共 ${result.frameCount} 帧`;
     loading.value = false;
     // The canvas only exists after previewType flips to "image", so the first
-    // paint has to wait for Vue to render it.
+    // paint has to wait for Vue to render it. The selection may have moved on
+    // during that tick, and the loop this starts would otherwise keep decoding
+    // frames of a file nobody is looking at.
     await nextTick();
+    if (!load.lands()) {
+      // Our frame bookkeeping was already written above; drop it so the file
+      // now on screen doesn't inherit this one's frame count and durations.
+      stopAnimation();
+      return;
+    }
     paintFrame(pixels, width, height);
     heicMark("ready", `frame 1/${result.frameCount} on canvas`);
     heicReport();
@@ -560,6 +591,11 @@ async function loadHeicPreview() {
 
   const { blob, putMs, encodeMs } = await pixelsToBlob(pixels, width, height);
   heicMark("encoded", `putImageData ${putMs.toFixed(0)}ms + jpeg ${encodeMs.toFixed(0)}ms -> ${(blob.size / 1024).toFixed(0)} KB`);
+  // The encode is the last await, and it is the one that produced an objectURL
+  // — so a superseded load MUST drop the blob rather than just skip the writes
+  // below. Leaking it here is exactly the bug: every fast page-through a folder
+  // of HEICs would strand one more multi-MB JPEG for the life of the window.
+  if (!load.lands()) return;
 
   heicObjectUrl = URL.createObjectURL(blob);
   previewContent.value = heicObjectUrl;
@@ -576,6 +612,12 @@ async function loadHeicPreview() {
 }
 
 async function loadPreview() {
+  // Snapshot what we were asked about, and release the previous file's objectURL
+  // HERE rather than inside loadHeicPreview: releasing it only on the HEIC path
+  // meant that paging from a HEIC to a PNG/TXT/PDF left the decoded blob alive
+  // for the rest of the session. `lands()` below is checked after every await.
+  const load = beginLoad();
+  releaseHeicUrl();
   loading.value = true;
   error.value = "";
   previewType.value = "";
@@ -603,8 +645,11 @@ async function loadPreview() {
   // can't decode it), so it gets its own wasm transcode path.
   if (HEIC_EXTENSIONS.includes(ext)) {
     try {
-      await loadHeicPreview();
+      await loadHeicPreview(load);
     } catch (e) {
+      // A decode failure from a file the user already paged away from must not
+      // paint an error over the file they are actually looking at.
+      if (!load.lands()) return;
       error.value = `无法解码此 HEIC 文件：${String(e?.message || e)}`;
       loading.value = false;
       // Flush the partial timeline — "where did it die" is exactly the
@@ -632,7 +677,7 @@ async function loadPreview() {
   // backend change). .doc is the legacy binary format mammoth can't read, so
   // we show a friendly prompt to re-save as .docx instead of failing silently.
   if (ext === "docx") {
-    await loadDocxPreview();
+    await loadDocxPreview(load);
     return;
   }
   if (ext === "doc") {
@@ -648,6 +693,7 @@ async function loadPreview() {
   // for extensions the user opted into via the "按文本预览" action.
   try {
     const result = await readFilePreview(props.filePath, props.asText);
+    if (!load.lands()) return;
     previewType.value = result.preview_type;
     previewContent.value = result.content;
     fileSize.value = formatSize(result.size);
@@ -670,9 +716,11 @@ async function loadPreview() {
       lineCount.value = previewContent.value.split("\n").length;
     }
   } catch (e) {
-    error.value = String(e);
+    // Same reasoning as above: a read failure belonging to a file the user has
+    // already paged away from says nothing about the one now on screen.
+    if (load.lands()) error.value = String(e);
   } finally {
-    loading.value = false;
+    if (load.lands()) loading.value = false;
   }
 }
 
@@ -691,7 +739,15 @@ watch(
     // decodeHeicFrame() against a container the worker has already replaced,
     // and the canvas keeps painting frames nobody is looking at.
     stopAnimation();
-    if (props.filePath) loadPreview();
+    // Also release the previous file's decoded blob when the preview closes
+    // entirely (filePath goes empty): nothing will call loadPreview in that
+    // case, so this is the only place the HEIC objectURL gets freed.
+    if (props.filePath) {
+      loadPreview();
+    } else {
+      releaseHeicUrl();
+      loading.value = false;
+    }
   },
   { immediate: true }
 );
