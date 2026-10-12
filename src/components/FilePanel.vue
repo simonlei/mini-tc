@@ -104,6 +104,7 @@ import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, beginTrashDelete, commitTrashDelete, undoTrashDelete, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
+import { loadLands, createSpinner } from "../loadGate.js";
 import { cancelSearch, startSearch } from "../api.js";
 import {
   isHiddenShown,
@@ -269,6 +270,10 @@ let preloaded = false;
 // watchers firing on the same tab switch (the path watcher + the active-tab
 // watcher) collapse into a single backend request.
 const inFlightLoads = new Set();
+// Tracks which in-flight request owns the "Loading…" spinner, so the one that
+// raised it is the one that lowers it. See src/loadGate.js for why this can't
+// be re-derived from state after the await.
+const spinner = createSpinner();
 
 // Discovered external extraction tools (filled on mount).
 const archiveTools = ref([]);
@@ -1002,17 +1007,32 @@ function trackFirstLoad(promise) {
 // `opts.silent` (used for tab-switch refreshes) skips the "Loading…" flash and
 // selection/error reset: the previous listing stays on screen until the fresh
 // one arrives, so a switch feels instant yet always shows current contents.
+//
+// Resolves to whether THIS call landed its result on the active panel. `false`
+// means the tab moved on (or stopped being active) while the request was in
+// flight, or that it only warmed the cache as a background preload — so the
+// caller must not assume `entries` now reflects what it asked for.
 async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
   const silent = !!opts.silent;
   const isActive = tabId === activeTabId.value;
   const key = `${tabId}:${path}`;
   // Collapse duplicate in-flight loads (e.g. a tab switch that triggers both the
   // path watcher and the active-tab watcher) into a single backend request.
-  if (inFlightLoads.has(key)) return;
+  // Note this only folds requests for the SAME path — A→B→C rapid navigation
+  // still runs three different paths concurrently, which is what the landing
+  // check below is for.
+  if (inFlightLoads.has(key)) return true;
   inFlightLoads.add(key);
 
   if (isActive && !silent) {
     loading.value = true;
+    // Remember that THIS request owns the spinner. Clearing it has to be keyed
+    // to the request that raised it, not re-derived from state after the await:
+    // a request for a directory the user has since left must not hide the
+    // "Loading…" of whatever is loading now, and a tab switch that starts no
+    // new spinner (cached listing) leaves this one as the only thing able to
+    // lower it.
+    spinner.claim(key);
     error.value = "";
     selectedEntry.value = null;
     selectedEntries.value = [];
@@ -1031,19 +1051,31 @@ async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
     // special-casing every caller) keeps the whole rest of the panel working
     // unchanged: sorting, selection, preview, delete, F5 all just see entries.
     if (isSearchPath(path)) {
+      // No await on this path, so the tab cannot have moved since the call —
+      // the only thing that can have changed is which tab is active.
+      if (tabId !== activeTabId.value) return false;
       const tab = tabs.value.find((t) => t.id === tabId);
       const s = tab && tab.search;
-      if (isActive) {
-        entries.value = s ? s.hits : [];
-        hasParent.value = false; // no ".." row in a result set
-        if (!s) error.value = "搜索结果已失效";
-      }
+      entries.value = s ? s.hits : [];
+      hasParent.value = false; // no ".." row in a result set
+      if (!s) error.value = "搜索结果已失效";
       tabCache.value[tabId] = { path, entries: s ? s.hits : [], hasParent: false };
-      return;
+      return true;
     }
     const res = await listDirectory(path);
+    // Re-check AFTER the await: `isActive` was captured before it, and both
+    // things it assumed can have changed in the meantime — the tab may have
+    // navigated elsewhere (three different paths race during rapid navigation,
+    // and the slow one used to land last and overwrite the visible listing while
+    // the breadcrumb showed a different directory), and the user may have
+    // switched tabs. See src/loadGate.js for why the test is "does this tab
+    // still point at this path" rather than a request sequence number.
+    const land = loadLands({ path, tab: tabs.value.find((t) => t.id === tabId), tabId, activeTabId: activeTabId.value });
+    if (!land.cache) return false;
+    // The cache is the tab's own data — a background preload fills it too, but
+    // only while the tab still points at the path we just read.
     tabCache.value[tabId] = { path, entries: res.entries, hasParent: res.has_parent };
-    if (isActive) {
+    if (land.ui) {
       entries.value = res.entries;
       hasParent.value = res.has_parent;
       // Warm the rest of the tabs in the background now that the active one is
@@ -1052,22 +1084,34 @@ async function loadDirectory(path, tabId = activeTabId.value, opts = {}) {
         preloaded = true;
         preloadOtherTabs();
       }
+      return true;
     }
+    // A background preload: it warmed the cache but must not touch the UI.
+    return false;
   } catch (e) {
+    const land = loadLands({ path, tab: tabs.value.find((t) => t.id === tabId), tabId, activeTabId: activeTabId.value });
+    // A load for a directory the tab has since navigated away from must not
+    // report its failure: the user is looking at a different directory now, and
+    // a stale "path not found" (or a wiped list) would be blamed on it. This is
+    // why the check can't reuse the `isActive` captured before the await — that
+    // one goes stale exactly when the panel has moved on.
+    if (!land.cache) return false;
     // Don't cache a failed load — allow a retry on the next switch/refresh.
     if (tabCache.value[tabId]) delete tabCache.value[tabId];
-    if (isActive && !silent) {
+    if (land.ui && !silent) {
       error.value = String(e);
       entries.value = [];
       hasParent.value = false;
-    } else if (isActive && silent) {
+      return true;
+    } else if (land.ui && silent) {
       // Background refresh failed: keep the existing listing on screen rather
       // than wiping it; just log so the failure isn't invisible.
       console.warn("Background refresh failed:", e);
     }
+    return false;
   } finally {
     inFlightLoads.delete(key);
-    if (isActive && !silent) loading.value = false;
+    if (spinner.release(key)) loading.value = false;
   }
 }
 
@@ -1164,7 +1208,13 @@ async function refresh(opts = {}) {
     // Force a real reload by dropping the cached entry first.
     const id = activeTab.value.id;
     if (tabCache.value[id]) delete tabCache.value[id];
-    await loadDirectory(activeTab.value.path, id);
+    const landed = await loadDirectory(activeTab.value.path, id);
+    // If this load was superseded (a newer navigation started while it awaited)
+    // it never touched `entries` — the request that replaced it owns the list
+    // now, and it applies its own selection handling. Restoring here would
+    // stamp this refresh's snapshot onto whatever list is currently displayed,
+    // possibly on a different tab entirely.
+    if (!landed) return;
     // loadDirectory has now replaced `entries`; the file list reset its
     // selection. Re-apply the saved names (those still present; external
     // deletions are dropped automatically).

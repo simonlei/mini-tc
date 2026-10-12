@@ -7,7 +7,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint:imports": "node scripts/lint-imports.js",
-    "test": "node scripts/rename-rules-check.mjs && node scripts/selection-remap-check.mjs",
+    "test": "node scripts/rename-rules-check.mjs && node scripts/selection-remap-check.mjs && node scripts/load-gate.test.mjs",
     "check": "npm run lint:imports && npm test",
     "tauri": "tauri"
   },
