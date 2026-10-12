@@ -269,8 +269,27 @@ cargo test --lib overwrite_tests        # 只跑某一组
 ```
 
 覆盖 `glob_match`、`executable_kind` / `has_pe_header` / `script_has_command`、窗口几何 `resolve`，
-以及**文件覆盖策略**（`overwrite_tests`：目录合并 vs 叶子替换的决策表、跳过时源是否被标记为可删）
-与**递归守卫**（`recursion_tests`：不跟随 reparse point、深度上限必须上报）。
+**文件覆盖策略**（`overwrite_tests`：目录合并 vs 叶子替换的决策表、跳过时源是否被标记为可删）、
+**原子替换**（`atomic_replace_tests`：覆盖目标的时机、失败后源是否还在）与
+**递归守卫**（`recursion_tests`：不跟随 reparse point、深度上限必须上报）。
+
+### 覆盖写文件的三条硬规矩
+
+复制/移动的覆盖路径曾经在三处**先删目标再写**，而那一步发生在「一个字节都还没拷」之前 ——
+磁盘满、目标被占用、源只读，任何一个后续失败都会让用户**同时失去源和目标**。现在：
+
+- **普通文件目标绝不预先删除**，由 `copy_file_with_progress` 用「同目录 tmp + `rename`」
+  原子替换。tmp 必须建在目标的**同级目录**：放 `%TEMP%` 会跨卷，最后一步退化成
+  非原子的 copy+delete。`fs::rename` 覆盖已存在文件在 Windows 上是原子的
+  （`MoveFileExW` + `MOVEFILE_REPLACE_EXISTING`，本机实测）。
+- **只有目标是「非空目录」时才需要预删** —— `rename` 换不了非空目录
+  （`ERROR_DIR_NOT_EMPTY`，实测），`create_dir_all` 也覆盖不了文件。空目录不用。
+- **移动时若必须清空目标，先把「源」park 成临时名**，目标空出来后再改名回去；任何一步
+  失败都把源改名回原位。提交失败时如实报出文件仍在哪个临时名下，**绝不删除**。
+
+⚠️ **Windows 上 `fs::rename` 会无条件覆盖已存在目标**（连目录 rename 到已存在文件也成功），
+所以「靠 rename 报错来避让占用名」这种写法是错的 —— 它会静默吃掉上次崩溃的残留文件。
+`park_source` 因此**先用 `symlink_metadata` 查存在性**，不依赖报错。
 
 ⚠️ 三点纪律：
 

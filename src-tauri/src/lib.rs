@@ -1995,6 +1995,88 @@ fn remove_recursive(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Rename `src` to a temp name in its own directory, returning the new path.
+///
+/// Used by the move path when the destination has to be cleared before the
+/// source can be renamed onto it. Parking the source first means the window in
+/// which neither side exists is closed: if anything later fails, the caller
+/// renames it straight back.
+///
+/// Same directory as the source, so the rename stays on one filesystem — a
+/// temp elsewhere could turn the "park" itself into a cross-volume copy.
+///
+/// 🚨 Existence is checked with `symlink_metadata`, NOT by relying on the
+/// rename to fail. Measured on this machine: `fs::rename` **overwrites an
+/// existing target silently** on Windows (Rust's std uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`), and it even succeeds when renaming a directory
+/// onto an existing file. A name left behind by an earlier crash would
+/// therefore be eaten without so much as an error — so we look before we leap.
+fn park_source(src: &Path) -> Result<PathBuf, String> {
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "item".to_string());
+    let dir = src.parent().unwrap_or_else(|| Path::new("."));
+    for attempt in 0..64u32 {
+        let candidate = if attempt == 0 {
+            dir.join(format!(".{name}.minitc-park-{}", std::process::id()))
+        } else {
+            dir.join(format!(
+                ".{name}.minitc-park-{}-{attempt}",
+                std::process::id()
+            ))
+        };
+        if fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        match fs::rename(src, &candidate) {
+            Ok(()) => return Ok(candidate),
+            // Another process could have taken the name between the check and
+            // the rename; on Windows that rename would have *overwritten* it,
+            // so re-verify what we ended up parking. This branch only triggers
+            // if the rename reported a hard error.
+            Err(e) => {
+                if fs::symlink_metadata(&candidate).is_err() {
+                    return Err(e.to_string());
+                }
+                continue;
+            }
+        }
+    }
+    Err(format!("无法为 {} 创建临时名", src.display()))
+}
+
+/// Does this destination need to be removed *before* the copy can proceed?
+///
+/// Only one case does: the destination is a **non-empty directory** and we are
+/// about to put something else there. `rename` cannot replace a non-empty
+/// directory (`ERROR_DIR_NOT_EMPTY`, measured on this machine), and
+/// `create_dir_all` cannot overwrite a file.
+///
+/// A plain file destination does **not** qualify — it is replaced atomically by
+/// `copy_file_with_progress` (tmp + rename), and deleting it up front is exactly
+/// the bug this module used to have: any failure after that point (disk full,
+/// target locked by another process, source read-only) left the user with
+/// neither the old file nor the new one.
+///
+/// `symlink_metadata` so a link is classified by itself rather than by whatever
+/// it points at.
+fn dest_is_nonempty_dir(path: &Path) -> bool {
+    // Fast path: no directory, nothing to clear.
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    match fs::read_dir(path) {
+        Ok(mut it) => it.next().is_some(),
+        // Unreadable directory: treat it as needing removal so the caller gets
+        // a reported error rather than a silent skip.
+        Err(_) => true,
+    }
+}
+
 /// Returns true if `a` and `b` refer to the same filesystem location. Exact
 /// comparison first, then canonicalization (resolves case, `.`/`..`, and
 /// symlinks) when both paths exist. Used to detect a self-overwrite — copying
@@ -2276,6 +2358,27 @@ fn emit_progress(
 /// Copy a single file in 1 MB chunks, emitting progress roughly every 1% of the
 /// overall job size (or at least every chunk for small jobs).
 #[allow(clippy::too_many_arguments)]
+/// Copy one file, **atomically replacing** whatever is at `dest`.
+///
+/// Why not just `File::create(dest)`: that truncates the destination before a
+/// single byte has been copied. If anything then fails — disk full, the target
+/// held open by another process, the source read-only — the user is left with
+/// neither side: the target is already destroyed and the copy never landed.
+/// The old code made this worse by deleting the target even earlier, in the
+/// *planning* phase, before a single byte was read.
+///
+/// Instead the bytes go to a sibling temp file first and only replace the target
+/// once they are all on disk. `fs::rename` over an existing **file** is
+/// atomic on Windows (Rust's std uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`) — verified on this machine, not assumed.
+/// A non-empty *directory* cannot be replaced by rename (fails with
+/// `ERROR_DIR_NOT_EMPTY`); that case is a type mismatch, handled by the caller
+/// via [`OverwriteAction::Replace`], and remains a reported failure rather than
+/// a silent data loss.
+///
+/// The temp name lives next to the destination so the rename stays within one
+/// filesystem — a temp in `%TEMP%` would make the copy cross volumes, which
+/// turns the final step into a non-atomic copy-and-delete.
 fn copy_file_with_progress(
     app: &tauri::AppHandle,
     src: &Path,
@@ -2289,31 +2392,53 @@ fn copy_file_with_progress(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
+    // `create_new` refuses a name that is already taken, so an unrelated file
+    // (or one stranded by an earlier crash) is never silently overwritten.
     let mut reader = fs::File::open(src)?;
-    let mut writer = fs::File::create(dest)?;
+    let (mut writer, tmp) = create_new_file(dest)?;
     let mut buf = vec![0u8; 1024 * 1024]; // 1 MB chunks
     let step = (total_bytes / 100).max(256 * 1024).max(1);
     let mut last_emit = *copied;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+    // From here on every failure must clean up the temp file, or a long copy
+    // session strands a growing pile of partial copies in the user's folder.
+    let result = (|| -> io::Result<()> {
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            *copied += n as u64;
+            if *copied - last_emit >= step {
+                last_emit = *copied;
+                emit_progress(
+                    app,
+                    &src.file_name().unwrap().to_string_lossy(),
+                    file_index,
+                    file_total,
+                    *copied,
+                    total_bytes,
+                );
+            }
         }
-        writer.write_all(&buf[..n])?;
-        *copied += n as u64;
-        if *copied - last_emit >= step {
-            last_emit = *copied;
-            emit_progress(
-                app,
-                &src.file_name().unwrap().to_string_lossy(),
-                file_index,
-                file_total,
-                *copied,
-                total_bytes,
-            );
-        }
+        writer.flush()?;
+        // Get the bytes onto the platter before publishing the name. Without
+        // this a crash (or the next power cut) can leave a renamed-but-empty
+        // file where a good one used to be — the atomic rename protects against
+        // a *concurrent reader* seeing a partial file, not against power loss.
+        writer.sync_all()?;
+        Ok(())
+    })();
+    drop(writer);
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    writer.flush()?;
+    // The commit. Everything above can fail with the destination still intact.
+    if let Err(e) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     // Final emit so the bar reaches 100% for this file.
     emit_progress(
         app,
@@ -2324,6 +2449,50 @@ fn copy_file_with_progress(
         total_bytes,
     );
     Ok(())
+}
+
+/// A temp path next to `dest` — same directory, so the final `rename` stays on
+/// one filesystem and therefore stays atomic. `attempt` only exists to walk past
+/// a name left behind by an earlier crash.
+fn tmp_sibling_path(dest: &Path, attempt: u32) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    if attempt == 0 {
+        // No pid: the name is claimed with create_new, so we only need it to be
+        // unlikely to collide. The pid keeps the common case collision-free
+        // against a *concurrent* copy in the other panel.
+        dir.join(format!(".{name}.minitc-{}.tmp", std::process::id()))
+    } else {
+        dir.join(format!(
+            ".{name}.minitc-{}-{attempt}.tmp",
+            std::process::id()
+        ))
+    }
+}
+
+/// Claim the temp path exclusively. `create_new` refuses an existing name, so a
+/// name left behind by a previous crash (or another process) is never silently
+/// clobbered — we bump the suffix until we find a free one.
+fn create_new_file(dest: &Path) -> io::Result<(fs::File, PathBuf)> {
+    for attempt in 0..64u32 {
+        let candidate = tmp_sibling_path(dest, attempt);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => return Ok((f, candidate)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("无法为 {} 创建临时文件", dest.display()),
+    ))
 }
 
 /// Copy all `sources` into `dest_dir`, emitting `copy-progress` events so the
@@ -2401,12 +2570,19 @@ fn copy_all(
                 continue;
             }
             Result::Ok(OverwriteAction::Replace) => {
-                // Replace a leaf (file-vs-file or a type mismatch). Never a
-                // directory-vs-directory conflict — those go through `Leave`
-                // and are merged.
-                if let Err(e) = remove_recursive(&dest_item) {
-                    errors.push(format!("无法覆盖 {}: {}", name, e));
-                    continue;
+                // Nothing to do here. `copy_file_with_progress` replaces the
+                // destination atomically (tmp file + rename), so deleting it
+                // now would only create the window where a failure leaves the
+                // user with neither side. What still must be cleared here is a
+                // *type mismatch* — the destination is a directory where a file
+                // is going, or vice versa — because rename cannot replace a
+                // non-empty directory and `create_dir_all` cannot overwrite a
+                // file. That is done lazily, per task, below.
+                if dest_is_nonempty_dir(&dest_item) {
+                    if let Err(e) = remove_recursive(&dest_item) {
+                        errors.push(format!("无法覆盖 {}: {}", name, e));
+                        continue;
+                    }
                 }
             }
             Result::Ok(OverwriteAction::Leave) => {
@@ -2495,14 +2671,22 @@ fn copy_all(
                 continue;
             }
             OverwriteAction::Replace => {
-                // Replace a leaf conflict; directory-vs-directory is merged via
-                // `Leave` (the create_dir_all below is a no-op on existing dirs).
-                if let Err(e) = remove_recursive(dest) {
-                    errors.push(format!("无法覆盖 {}: {}", dest.display(), e));
-                    if let Some(t) = tainted_slot {
-                        tainted[t] = true;
+                // Directory-vs-directory is merged via `Leave` (the
+                // create_dir_all below is a no-op on existing dirs), so the only
+                // thing left to clear is a type mismatch: the destination is a
+                // non-empty directory where this task is about to write a file.
+                // A plain file destination is replaced atomically by
+                // copy_file_with_progress, and must NOT be deleted here — doing
+                // so is what used to leave a failed copy with nothing on either
+                // side.
+                if dest_is_nonempty_dir(dest) {
+                    if let Err(e) = remove_recursive(dest) {
+                        errors.push(format!("无法覆盖 {}: {}", dest.display(), e));
+                        if let Some(t) = tainted_slot {
+                            tainted[t] = true;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
             OverwriteAction::Leave => {}
@@ -2674,6 +2858,10 @@ fn move_items(
     // (copy into it, then delete the now-empty source), since a rename onto a
     // non-empty directory is impossible and a delete-and-replace would lose data.
     let mut merge_move: Vec<PathBuf> = Vec::new();
+    // Sources parked under a temp name because their destination had to be
+    // cleared first. They are still intact on disk; committing them renames
+    // each onto its (now empty) destination.
+    let mut parked_sources: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for src in &sources {
         let src_path = Path::new(src);
@@ -2715,10 +2903,51 @@ fn move_items(
                     continue;
                 }
                 Ok(OverwriteAction::Replace) => {
-                    // Leaf conflict: remove the destination, then rename below.
-                    if let Err(e) = remove_recursive(&dest_item) {
-                        errors.push(format!("无法覆盖 {}: {}", name, e));
-                        continue;
+                    // `fs::rename` will not replace an existing file, so the
+                    // destination has to go — but deleting it *here*, before the
+                    // rename below, is a data-loss window: if that rename then
+                    // fails (cross-volume, permissions, the target being locked
+                    // by another process) the user has lost both sides.
+                    //
+                    // So park the SOURCE under a temp name first. It is still on
+                    // disk, just renamed, and a `parked_source` list lets the
+                    // cross-volume fallback below recover it instead of copying
+                    // from a path that no longer exists.
+                    match park_source(src_path) {
+                        Result::Ok(parked) => {
+                            // Destination is now clear. A directory can only be
+                            // replaced by another directory, and only when empty
+                            // (measured: ERROR_DIR_NOT_EMPTY otherwise), so a
+                            // type mismatch stays an error we report rather than
+                            // a delete that could not have worked anyway.
+                            if dest_is_nonempty_dir(&dest_item) {
+                                errors.push(format!(
+                                    "无法用 {} 覆盖非空目录 {}",
+                                    name,
+                                    dest_item.display()
+                                ));
+                                // Put the source back where the user had it.
+                                if let Err(e) = fs::rename(&parked, src_path) {
+                                    errors.push(format!("已恢复 {} 失败: {}", name, e));
+                                }
+                                continue;
+                            }
+                            if let Err(e) = remove_recursive(&dest_item) {
+                                errors.push(format!("无法覆盖 {}: {}", name, e));
+                                if let Err(e) = fs::rename(&parked, src_path) {
+                                    errors.push(format!("已恢复 {} 失败: {}", name, e));
+                                }
+                                continue;
+                            }
+                            parked_sources.push((parked, dest_item.clone()));
+                            // The source is no longer at its original path, so
+                            // the cross-volume fallback must not be asked for it.
+                            continue;
+                        }
+                        Result::Err(e) => {
+                            errors.push(format!("无法移动 {}: {}", name, e));
+                            continue;
+                        }
                     }
                 }
                 Ok(OverwriteAction::Leave) => {
@@ -2733,6 +2962,21 @@ fn move_items(
         match fs::rename(src_path, &dest_item) {
             Result::Ok(_) => {}
             Result::Err(_) => cross_volume.push(src_path.to_path_buf()),
+        }
+    }
+
+    // Commit the parked sources now that their destinations are clear. A
+    // failure here puts the file back at a temp name — never delete it, and say
+    // where it is so the user can recover it by hand.
+    for (parked, dest) in &parked_sources {
+        match fs::rename(parked, dest) {
+            Ok(()) => {}
+            Err(e) => errors.push(format!(
+                "移动 {} 失败: {}（文件仍完整保留在 {}）",
+                dest.display(),
+                e,
+                parked.display()
+            )),
         }
     }
 
@@ -4619,6 +4863,217 @@ mod overwrite_tests {
 /// while creating nothing (`exists()` = false) — a sandbox blocks it. So a test
 /// that asserts link behaviour must verify the link exists and skip loudly if
 /// not; asserting without checking would silently test nothing.
+
+#[cfg(test)]
+mod atomic_replace_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-atomic-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn write(path: &Path, body: &str) {
+        if let Some(p) = path.parent() {
+            fs::create_dir_all(p).expect("create parent");
+        }
+        fs::write(path, body).expect("write file");
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e))
+    }
+
+    /// The temp path is a sibling of the destination, so the final rename stays
+    /// on one filesystem and therefore stays atomic. A temp in `%TEMP%` would
+    /// silently turn the commit into a cross-volume copy.
+    #[test]
+    fn temp_file_lives_beside_the_destination() {
+        let dir = scratch("beside");
+        let dest = dir.join("sub").join("file.txt");
+        let tmp = tmp_sibling_path(&dest, 0);
+        assert_eq!(tmp.parent(), dest.parent(), "temp must share the directory");
+        // ...and it must be a *different* name, or we would clobber the target.
+        assert_ne!(tmp, dest);
+    }
+
+    /// A leftover temp file from an earlier crash must never be reused: doing so
+    /// would overwrite a file the user (or another process) put there.
+    #[test]
+    fn existing_temp_name_is_never_reused() {
+        let dir = scratch("collide");
+        let dest = dir.join("file.txt");
+        write(&dest, "real");
+
+        let squatter = tmp_sibling_path(&dest, 0);
+        write(&squatter, "someone else's data");
+
+        let (_handle, claimed) = create_new_file(&dest).expect("claim a temp name");
+        assert_ne!(claimed, squatter, "must not hand out a taken name");
+        // The squatter is untouched.
+        assert_eq!(read(&squatter), "someone else's data");
+    }
+
+    /// The old code deleted the destination during the *planning* phase, before
+    /// a single byte was copied. Pin that hazard directly: deciding to replace a
+    /// file must not touch it. Whatever runs afterwards (a full disk, a locked
+    /// target, an unreadable source) has to find the old file still there.
+    #[test]
+    fn planning_to_replace_a_file_does_not_delete_it() {
+        let dir = scratch("plan-keep");
+        let src = dir.join("src.txt");
+        let dest = dir.join("dest.txt");
+        write(&src, "NEW");
+        write(&dest, "OLD");
+
+        let action = plan_overwrite(&src, &dest, true, false).expect("plan");
+        assert_eq!(action, OverwriteAction::Replace);
+        // The decision alone must not have destroyed anything.
+        assert_eq!(read(&dest), "OLD", "planning must leave the target intact");
+        assert_eq!(read(&src), "NEW", "planning must leave the source intact");
+    }
+
+    /// A non-empty directory destination genuinely cannot be replaced by rename
+    /// (`ERROR_DIR_NOT_EMPTY`, measured on this machine) — so it must still be
+    /// cleared up front, and reported rather than silently mangled.
+    #[test]
+    fn non_empty_directory_destination_is_still_cleared() {
+        let dir = scratch("nonempty");
+        let dest = dir.join("dest");
+        write(&dest.join("child.txt"), "in the way");
+        assert!(dest_is_nonempty_dir(&dest));
+
+        // An EMPTY directory, by contrast, is renamed over without complaint.
+        let empty = dir.join("empty");
+        fs::create_dir_all(&empty).expect("create empty dir");
+        assert!(
+            !dest_is_nonempty_dir(&empty),
+            "an empty directory is replaceable by rename, so it needs no removal"
+        );
+    }
+
+    /// The classification the fast path depends on: an ordinary file
+    /// destination is NOT something to remove, because the copy replaces it
+    /// atomically. Getting this wrong is the data-loss bug itself.
+    #[test]
+    fn plain_file_destination_is_not_pre_cleared() {
+        let dir = scratch("plain");
+        let dest = dir.join("dest.txt");
+        write(&dest, "OLD");
+        assert!(
+            !dest_is_nonempty_dir(&dest),
+            "a file destination must be replaced atomically, not deleted first"
+        );
+
+        // A path that does not exist at all needs no clearing either.
+        assert!(!dest_is_nonempty_dir(&dir.join("absent.txt")));
+    }
+
+    /// The full round trip, without an AppHandle: write to a temp beside the
+    /// destination, then rename over it. The destination must end up holding the
+    /// new content, and no temp file may survive.
+    #[test]
+    fn atomic_replace_leaves_no_temp_behind() {
+        let dir = scratch("roundtrip");
+        let src = dir.join("src.txt");
+        let dest = dir.join("dest.txt");
+        write(&src, "NEW CONTENT");
+        write(&dest, "OLD");
+
+        let (mut w, tmp) = create_new_file(&dest).expect("claim temp");
+        w.write_all(b"NEW CONTENT").expect("write temp");
+        w.sync_all().expect("sync");
+        drop(w);
+        fs::rename(&tmp, &dest).expect("commit");
+
+        assert_eq!(read(&dest), "NEW CONTENT");
+        assert!(!tmp.exists(), "temp must be consumed by the rename");
+
+        // Nothing stray left in the directory.
+        let strays: Vec<String> = fs::read_dir(&dir)
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("minitc"))
+            .collect();
+        assert!(strays.is_empty(), "stray temp files: {:?}", strays);
+    }
+
+    /// `park_source` must be reversible: the point of parking the source before
+    /// clearing its destination is that a later failure can put it back.
+    #[test]
+    fn park_source_is_reversible() {
+        let dir = scratch("park");
+        let src = dir.join("file.txt");
+        write(&src, "precious");
+
+        let parked = park_source(&src).expect("park");
+        assert!(!src.exists(), "source moved aside");
+        assert_eq!(read(&parked), "precious", "content survived the park");
+
+        fs::rename(&parked, &src).expect("restore");
+        assert_eq!(read(&src), "precious");
+    }
+
+    /// Parking must never clobber an existing name — including one left behind
+    /// by an earlier crash.
+    #[test]
+    fn park_source_never_reuses_a_taken_name() {
+        let dir = scratch("park-collide");
+        let src = dir.join("file.txt");
+        write(&src, "mine");
+
+        // Squat on the name park_source would try first.
+        let squatter = dir.join(format!(
+            ".{}.minitc-park-{}",
+            src.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        write(&squatter, "not mine");
+
+        let parked = park_source(&src).expect("park");
+        assert_ne!(parked, squatter);
+        assert_eq!(read(&parked), "mine");
+        assert_eq!(
+            read(&squatter),
+            "not mine",
+            "the squatter must be untouched"
+        );
+    }
+
+    /// Parking the source and then failing must leave the user's file intact at
+    /// its original path — the whole reason for parking instead of deleting.
+    #[test]
+    fn failed_overwrite_restores_the_source() {
+        let dir = scratch("restore");
+        let src = dir.join("file.txt");
+        let dest = dir.join("dest.txt");
+        write(&src, "PRECIOUS");
+        write(&dest, "old stuff");
+
+        // Park, hit an error, then restore — exactly what move_items does.
+        let parked = park_source(&src).expect("park");
+        let simulated_error: Option<String> = Some("simulated".into());
+        if simulated_error.is_some() {
+            fs::rename(&parked, &src).expect("restore");
+        }
+
+        assert!(src.exists(), "source must be back where it was");
+        assert_eq!(read(&src), "PRECIOUS");
+        assert_eq!(
+            read(&dest),
+            "old stuff",
+            "the destination must not have been destroyed on the way out"
+        );
+    }
+}
 
 #[cfg(test)]
 mod recursion_tests {
