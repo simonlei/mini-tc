@@ -1545,15 +1545,102 @@ fn clear_readonly_recursive(path: &Path) {
     }
 }
 
+/// Which `std::fs` call actually removes an item.
+///
+/// Split out from the IO so the decision can be unit-tested: the branch that
+/// was wrong needs a reparse point to be observable end-to-end, and this
+/// machine's sandbox refuses to create one (see `recursion_tests`). The table
+/// itself is testable anywhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemoveCall {
+    /// `remove_file` — a plain file, a file symlink, or any link on POSIX
+    /// (`unlink(2)` ignores what the link points at).
+    RemoveFile,
+    /// `remove_dir` — a *directory* link (junction or Windows dir symlink).
+    /// Windows refuses `DeleteFileW` on one and vice versa, so picking the
+    /// wrong call fails outright.
+    RemoveDirLink,
+    /// `remove_dir_all` — a real directory, walked and deleted.
+    RemoveTree,
+}
+
+/// Decide how to delete an item, from what it *is* rather than what it points
+/// at. Pure, so the decision table is testable without a reparse point.
+///
+/// `is_dir` is only meaningful when `is_link` is false: `symlink_metadata`
+/// reports `S_IFLNK` for every link, so a link's "is it a directory" flag has
+/// to come from `link_points_at_dir` (which asks the reparse point) — asking
+/// the file type instead yields `false` for *every* link, silently routing all
+/// of them to `RemoveFile`. That was the bug: a directory junction went to
+/// `DeleteFileW`, Windows refused, and the failure surfaced as "other" with no
+/// elevated retry offered.
+fn remove_call_for(is_link: bool, link_points_at_dir: bool, is_dir: bool) -> RemoveCall {
+    if is_link {
+        if link_points_at_dir {
+            RemoveCall::RemoveDirLink
+        } else {
+            RemoveCall::RemoveFile
+        }
+    } else if is_dir {
+        RemoveCall::RemoveTree
+    } else {
+        RemoveCall::RemoveFile
+    }
+}
+
+/// Does this reparse point *behave as* a directory?
+///
+/// Windows keeps the directory flag on the link itself, so this survives a
+/// dangling target. POSIX has no equivalent distinction and needs none:
+/// `remove_file` (`unlink`) detaches a symlink regardless of its target.
+#[cfg(windows)]
+fn link_points_at_dir(ft: fs::FileType) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    ft.is_symlink_dir()
+}
+
+#[cfg(not(windows))]
+fn link_points_at_dir(_ft: fs::FileType) -> bool {
+    false
+}
+
+/// Delete a file, directory or link — removing *the item*, never traversing
+/// into a reparse point.
+///
+/// Single entry point on purpose: `delete_permanently` and the move path used
+/// to carry opposite link policies in the same file (`path.is_dir()` follows
+/// links, `symlink_metadata()` does not), so "delete this" meant two different
+/// things depending on which caller you asked.
+fn remove_link_or_tree(path: &Path) -> io::Result<()> {
+    let (is_link, link_is_dir, is_dir) = match fs::symlink_metadata(path) {
+        Ok(m) => {
+            let ft = m.file_type();
+            let is_link = ft.is_symlink();
+            (is_link, is_link && link_points_at_dir(ft), ft.is_dir())
+        }
+        // No metadata: the entry vanished, or the filesystem refuses to report
+        // it. Fall back to the following API, which at least answers "dir?".
+        Err(_) => (false, false, path.is_dir()),
+    };
+    match remove_call_for(is_link, link_is_dir, is_dir) {
+        RemoveCall::RemoveDirLink => fs::remove_dir(path),
+        RemoveCall::RemoveTree => fs::remove_dir_all(path),
+        RemoveCall::RemoveFile => fs::remove_file(path),
+    }
+}
+
 /// Delete a file or directory WITHOUT going through the recycle bin — the
 /// counterpart of `delete_to_trash`, bound to Shift+Delete in the UI.
-/// Directories are removed recursively (`remove_dir_all`). Returns the same
-/// structured `DeleteError` as `delete_to_trash`, so the frontend can offer the
-/// elevated (`delete_with_admin`) retry path on permission failures.
+/// Directories are removed recursively. Returns the same structured
+/// `DeleteError` as `delete_to_trash`, so the frontend can offer the elevated
+/// (`delete_with_admin`) retry path on permission failures.
 #[tauri::command]
 fn delete_permanently(path: String) -> Result<(), DeleteError> {
     let p = Path::new(&path);
-    if !p.exists() {
+    // `symlink_metadata`, NOT `Path::exists()`: the latter *follows* the link,
+    // so a broken link (target already gone — common for stale junctions) came
+    // back "路径不存在" and could never be cleaned up from the UI.
+    if fs::symlink_metadata(p).is_err() {
         return Err(DeleteError {
             kind: "not_found".to_string(),
             message: format!("路径不存在: {}", path),
@@ -1561,34 +1648,10 @@ fn delete_permanently(path: String) -> Result<(), DeleteError> {
     }
 
     // Read-only files would abort the delete (and a whole directory tree on
-    // Windows), so drop the attribute first.
+    // Windows), so drop the attribute first. Links are skipped inside.
     clear_readonly_recursive(p);
 
-    // Decide file vs directory from the link itself: a symlink pointing at a
-    // directory must be unlinked as a link, not traversed.
-    let meta = match fs::symlink_metadata(p) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(DeleteError {
-                kind: "other".to_string(),
-                message: format!("无法读取属性: {}", e),
-            })
-        }
-    };
-
-    let result = if meta.file_type().is_symlink() {
-        if meta.file_type().is_dir() {
-            fs::remove_dir(p)
-        } else {
-            fs::remove_file(p)
-        }
-    } else if meta.is_dir() {
-        fs::remove_dir_all(p)
-    } else {
-        fs::remove_file(p)
-    };
-
-    if let Err(e) = result {
+    if let Err(e) = remove_link_or_tree(p) {
         // Access-denied / file-in-use are the common cases worth retrying with
         // elevation; anything else is reported as-is.
         let kind = if e.kind() == io::ErrorKind::PermissionDenied {
@@ -1990,12 +2053,14 @@ pub struct CopyResult {
 }
 
 /// Recursively remove a file or directory.
+///
+/// Thin alias over [`remove_link_or_tree`], kept because every call site here
+/// means "delete this item". It used to branch on `path.is_dir()`, which
+/// *follows* links — so a junction read as a directory and went to
+/// `remove_dir_all`, whose Windows implementation walks into the target.
+/// Deleting the link would have wiped a tree the user never selected.
 fn remove_recursive(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
+    remove_link_or_tree(path)
 }
 
 /// Rename `src` to a temp name in its own directory, returning the new path.
@@ -4984,6 +5049,228 @@ mod overwrite_tests {
             !merged.exists(),
             "documents that remove_recursive is destructive for leftovers — \
              this is the behaviour the taint check exists to route around"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Tests for [`remove_call_for`] and [`remove_link_or_tree`] — the "delete an
+/// item, not what it points at" decision.
+///
+/// The bug this pins: `delete_permanently` branched on
+/// `symlink_metadata(...).file_type().is_dir()`, which is **always false** for a
+/// link (`symlink_metadata` reports `S_IFLNK`). So every directory junction took
+/// the `remove_file` branch, Windows refused (`DeleteFileW` on a directory
+/// link), and the failure was classified as plain `other` — the user was never
+/// even offered the elevated retry.
+///
+/// The table is tested directly because the link case cannot be: see the
+/// reparse-point note above `recursion_tests` — this machine cannot create
+/// links, so an end-to-end assertion here would silently test nothing.
+#[cfg(test)]
+mod remove_call_tests {
+    use super::*;
+
+    /// The full decision table: (is_link, link_points_at_dir, is_dir) → call.
+    #[test]
+    fn table_picks_the_right_removal_call() {
+        use RemoveCall::*;
+        // A plain file and a plain tree are unambiguous.
+        assert_eq!(remove_call_for(false, false, false), RemoveFile);
+        assert_eq!(remove_call_for(false, false, true), RemoveTree);
+        // A file link → unlink the link.
+        assert_eq!(remove_call_for(true, false, false), RemoveFile);
+        // A directory link → RemoveDirectory, because DeleteFileW refuses one.
+        // This is the case the old `file_type().is_dir()` got wrong.
+        assert_eq!(remove_call_for(true, true, false), RemoveDirLink);
+        // A link must never be walked, whatever the trailing flag says: this is
+        // the "delete the item, not the tree behind it" invariant.
+        assert_eq!(remove_call_for(true, true, true), RemoveDirLink);
+        assert_eq!(remove_call_for(true, false, true), RemoveFile);
+    }
+
+    /// Counter-arm for the table above. `remove_call_for(true, …, is_dir=true)`
+    /// must NOT answer `RemoveTree`: if the trailing flag could promote a link
+    /// to a recursive delete, a junction to a large tree would be erased
+    /// wholesale. Pinning it separately means the `is_dir` arm can't be "fixed"
+    /// by reordering the branches.
+    #[test]
+    fn a_link_is_never_promoted_to_a_recursive_delete() {
+        for link_is_dir in [false, true] {
+            for is_dir in [false, true] {
+                let got = remove_call_for(true, link_is_dir, is_dir);
+                assert_ne!(
+                    got,
+                    RemoveCall::RemoveTree,
+                    "link (link_points_at_dir={link_is_dir}, is_dir={is_dir}) \
+                     must not be deleted as a tree"
+                );
+            }
+        }
+    }
+
+    /// A real directory tree is still removed recursively — the fix must not
+    /// regress ordinary folders into "delete fails if not empty".
+    #[test]
+    fn a_real_tree_is_still_removed_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-rmtree-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let tree = dir.join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("a.txt"), "a").unwrap();
+        fs::write(tree.join("sub").join("b.txt"), "b").unwrap();
+
+        remove_link_or_tree(&tree).expect("remove tree");
+        assert!(
+            !tree.exists(),
+            "a plain non-empty directory must go away entirely"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A single file still deletes, and its siblings are untouched.
+    #[test]
+    fn a_single_file_is_removed_without_touching_siblings() {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-rmfile-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        let keeper = dir.join("keeper.txt");
+        fs::write(&victim, "v").unwrap();
+        fs::write(&keeper, "k").unwrap();
+
+        remove_link_or_tree(&victim).expect("remove file");
+        assert!(!victim.exists(), "the file must be gone");
+        assert!(keeper.exists(), "a sibling must be untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The missing-entry path reports `other`-free: `remove_link_or_tree` must
+    /// surface the IO error rather than claim success. Guards the silent
+    /// "deleted!" case.
+    #[test]
+    fn a_missing_entry_reports_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-rmmissing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let missing = dir.join("nope.txt");
+        assert!(
+            remove_link_or_tree(&missing).is_err(),
+            "deleting a nonexistent path must not report success"
+        );
+    }
+
+    /// Static assertions — the layer the behavioural tests above cannot reach.
+    ///
+    /// Measured, not assumed: reverting `remove_recursive` to the old
+    /// `path.is_dir()` (link-following) branch left all 61 tests green. The
+    /// table tests don't notice because they call `remove_call_for` directly,
+    /// and the one end-to-end link test skips on this machine — so a regression
+    /// at the *call site* is invisible to them. Hence: assert on the source
+    /// text.
+    ///
+    /// This is the "change the implementation but not the call site" case: pure
+    /// behavioural assertions stay green while the thing that actually runs in
+    /// production is wrong.
+    #[test]
+    fn no_deletion_path_branches_on_the_following_is_dir() {
+        let src = include_str!("lib.rs");
+        // Strip line comments so prose about the trap isn't mistaken for a
+        // call site (the same trick `lint-imports.js` uses on the front end).
+        let code: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) if !l[..i].contains('"') => format!("{}\n", &l[..i]),
+                _ => format!("{l}\n"),
+            })
+            .collect();
+
+        // `Path::is_dir()` / `Metadata::is_dir()` after a `symlink_metadata`
+        // call resolves the *target*, not the link. Only `remove_link_or_tree`
+        // is allowed to make deletion decisions, and it must not.
+        // Match the *call* (`ft.is_dir()` on something named file_type), not
+        // the bare text: this assertion's own message quotes the trap, and a
+        // substring check would fail on itself. The needle is assembled from
+        // fragments so this file never contains the pattern it forbids.
+        let needle = ["file_type", "().is_", "dir()"].concat();
+        assert!(
+            !code.contains(&needle),
+            "asking a symlink_metadata file_type whether it is a directory is \
+             always false for a link — that mistake routed every directory \
+             junction to remove_file (lib.rs delete_permanently). Use \
+             remove_call_for / link_points_at_dir."
+        );
+        // The removal entry point must stay a single funnel.
+        assert!(
+            code.contains("fn remove_link_or_tree"),
+            "the shared deletion entry point must exist"
+        );
+    }
+
+    /// `remove_recursive` must stay a thin delegation. Its own doc records why
+    /// it used to be a second, link-following implementation.
+    #[test]
+    fn remove_recursive_delegates_instead_of_reimplementing() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("fn remove_recursive(")
+            .expect("remove_recursive must exist");
+        // The body runs to the first closing brace at column 0.
+        let body = &src[start..];
+        let end = body.find("\n}").expect("unterminated fn body") + 2;
+        let body = &body[..end];
+        assert!(
+            body.contains("remove_link_or_tree(path)"),
+            "remove_recursive must delegate to remove_link_or_tree, got:\n{body}"
+        );
+        assert!(
+            !body.contains("is_dir"),
+            "remove_recursive must not decide anything itself (it reintroduced \
+             link-following semantics when it branched on path.is_dir()), got:\n{body}"
+        );
+    }
+
+    /// End-to-end through a real link, when the machine allows creating one.
+    ///
+    /// Skips loudly (rather than asserting vacuously) on machines that block
+    /// reparse points — the failure mode this guards against is a junction
+    /// going to `DeleteFileW` and failing.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_link_is_unlinked_without_touching_its_target() {
+        use std::os::windows::fs::symlink_dir;
+
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-rmlink-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), "keep").unwrap();
+        let link = dir.join("link");
+        if symlink_dir(&target, &link).is_err() || !link.exists() {
+            eprintln!("skipping: this machine does not allow creating links");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        remove_link_or_tree(&link).expect("remove the link itself");
+        assert!(!link.exists(), "the link must be gone");
+        assert!(
+            target.join("keep.txt").exists(),
+            "deleting a link must never delete its target's contents"
         );
         let _ = fs::remove_dir_all(&dir);
     }
