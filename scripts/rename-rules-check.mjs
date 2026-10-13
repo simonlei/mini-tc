@@ -15,7 +15,7 @@ import {
   planPhases,
   defaultRules,
 } from "../src/renameRules.js";
-import { runRenamePlan } from "../src/renameRunner.js";
+import { runRenamePlan, applyRenamePlan } from "../src/renameRunner.js";
 
 const base = defaultRules();
 const R = (over) => ({ ...base, ...over });
@@ -426,6 +426,74 @@ function makeFs() {
   );
   ok(res.ok, "all-unchanged plan is ok");
   eq(res.done.length, 0, "all-unchanged plan renamed nothing");
+}
+
+// ── applyRenamePlan: the pairs handed back must describe what landed on disk ──
+//
+// The dialog passes `() => plan.value`, a getter over reactive rules, and the
+// run is awaited. If the plan were re-read after the await, the panel would be
+// told the names the rules produce NOW while the disk holds the old ones. The
+// <fieldset disabled> makes that unreachable by keyboard, but the guarantee has
+// to live in the code that owns the await, so it does.
+{
+  const fsys = makeFs();
+  fsys.files.set("C:/d/a.txt", "a.txt");
+  fsys.files.set("C:/d/b.txt", "b.txt");
+
+  const rows = [
+    { path: "C:/d/a.txt", name: "a.txt", newName: "OLD-a.txt", status: "ok" },
+    { path: "C:/d/b.txt", name: "b.txt", newName: "OLD-b.txt", status: "ok" },
+  ];
+  // What the rules would say if they changed mid-run: same paths, different
+  // names. Reading this after the await is exactly the bug.
+  const drifted = [
+    { path: "C:/d/a.txt", name: "a.txt", newName: "NEW-a.txt", status: "ok" },
+    { path: "C:/d/b.txt", name: "b.txt", newName: "NEW-b.txt", status: "ok" },
+  ];
+  let reads = 0;
+  const getRows = () => (reads++ === 0 ? rows : drifted);
+
+  const { res, pairs } = await applyRenamePlan(getRows, {
+    existing: new Set(["a.txt", "b.txt"]),
+    move: async (from, to) => fsys.rename(from, to),
+  });
+
+  ok(res.ok, "applyRenamePlan succeeded");
+  eq(reads, 1, "plan getter read exactly once");
+  // The disk state is the ground truth — compare the pairs against it rather
+  // than against the row objects. A pair is [oldPath, newName], and oldPath is
+  // by definition gone after the rename, so the path on disk is the old
+  // directory plus the new name.
+  const dirOf = (p) => p.slice(0, p.lastIndexOf("/") + 1);
+  const onDisk = [...fsys.files.keys()].sort();
+  const fromPairs = pairs.map(([p, n]) => dirOf(p) + n).sort();
+  eq(fromPairs, onDisk, "reported pairs resolve to the paths that now exist on disk");
+  const namesOnDisk = [...fsys.files.values()].sort();
+  const newNames = pairs.map(([, n]) => n).sort();
+  eq(newNames, namesOnDisk, "reported new names are the names on disk");
+  ok(!newNames.includes("NEW-a.txt"), "post-await rule drift did not leak into pairs");
+}
+
+{
+  // Pairs are empty on failure — the panel must not patch rows for a batch
+  // that was rolled back.
+  const rows = [{ path: "C:/d/a.txt", name: "a.txt", newName: "x.txt", status: "ok" }];
+  const { res, pairs } = await applyRenamePlan(() => rows, {
+    move: () => Promise.reject(new Error("boom")),
+  });
+  ok(!res.ok, "failing run reported as not ok");
+  eq(pairs, [], "no pairs emitted on failure");
+}
+
+{
+  // `move` missing must throw rather than fail mysteriously later.
+  let threw = false;
+  try {
+    await applyRenamePlan(() => [], {});
+  } catch {
+    threw = true;
+  }
+  ok(threw, "applyRenamePlan rejects without a move callback");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

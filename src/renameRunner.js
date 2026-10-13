@@ -116,3 +116,30 @@ export async function runRenamePlan(rows, { existing = null, move }) {
 
   return { ok: true, done, failed: [], rolledBack: false };
 }
+
+/// Execute `getRows()` and report the [oldPath, newName] pairs of the SAME plan
+/// that was executed.
+///
+/// `getRows` is a function, not an array, and it is called EXACTLY ONCE. In the
+/// dialog it is `() => plan.value` — a computed over the reactive `rules` object
+/// — and the run is `await`ed. Reading `plan.value` again afterwards would ask
+/// the computed what the rules say NOW, while the disk holds what the executor
+/// renamed to a moment ago; the panel would then patch its listing with
+/// filenames that do not exist, with nothing reporting an error. Handing the
+/// getter in (rather than the array) keeps the snapshot inside the function that
+/// owns the await, so the invariant can't be broken by the caller forgetting.
+///
+/// `move` may legitimately change the rules (nothing stops a caller from doing
+/// so), which is exactly what makes the single-read load-bearing here.
+///
+/// Returns `{ res, pairs }`; `pairs` is empty unless `res.ok`.
+export async function applyRenamePlan(getRows, { existing = null, move }) {
+  const rows = getRows();
+  const res = await runRenamePlan(rows, { existing, move });
+  return {
+    res,
+    pairs: res.ok
+      ? rows.filter((r) => r.status === "ok").map((r) => [r.path, r.newName])
+      : [],
+  };
+}

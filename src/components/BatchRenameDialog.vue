@@ -15,7 +15,12 @@
 
       <div class="rename-body">
         <!-- ── Rule editor ── -->
-        <div class="rules" ref="rulesEl">
+        <!--
+          A real <fieldset disabled> rather than :disabled on all 14 inputs: the
+          browser then blocks typing AND native keyboard interaction in one place,
+          so a future rule row can't be added without remembering to lock it too.
+        -->
+        <fieldset class="rules" ref="rulesEl" :disabled="running">
           <section class="rule-block">
             <div class="rule-title">查找替换</div>
             <label class="rule-row">
@@ -95,7 +100,7 @@
           <div class="rule-actions">
             <button class="btn-ghost" @click="resetRules">恢复默认</button>
           </div>
-        </div>
+        </fieldset>
 
         <!-- ── Preview ── -->
         <div class="preview">
@@ -147,7 +152,7 @@ import {
   CASE_MODES,
   EXT_MODES,
 } from "../renameRules.js";
-import { runRenamePlan } from "../renameRunner.js";
+import { applyRenamePlan } from "../renameRunner.js";
 import { renameFile } from "../api.js";
 
 // `items`: [{ path, name }] in DISPLAY order — the sequence numbers follow this
@@ -180,10 +185,12 @@ async function apply() {
   if (!canApply.value) return;
   running.value = true;
   result.value = null;
-  // `renameFile(oldPath, newName)` matches the executor's `move(from, to)`
-  // signature exactly — the sequencing (temp names, ordering, rollback) lives
-  // in renameRunner, which is pure and unit-tested.
-  const res = await runRenamePlan(plan.value, {
+  // The <fieldset :disabled="running"> above keeps the rules from changing
+  // mid-run. That is a UI courtesy, not the guarantee — the guarantee is that
+  // `applyRenamePlan` reads the plan exactly once and derives the pairs it hands
+  // back from that same snapshot, so what the panel is told can never drift
+  // from what landed on disk.
+  const { res, pairs } = await applyRenamePlan(() => plan.value, {
     existing: props.existing,
     move: renameFile,
   });
@@ -191,15 +198,7 @@ async function apply() {
   if (res.ok) {
     // Hand back the concrete [oldPath, newName] pairs so the panel can update
     // its listing the right way for its kind of tab (re-list vs patch rows).
-    emit("applied", {
-      count: res.done.length,
-      // `plan.value` is read here, not captured before the await: the rules
-      // cannot change mid-run (the inputs are inert while `running`), and
-      // reading it after keeps one source of truth for what was planned.
-      pairs: plan.value
-        .filter((r) => r.status === "ok")
-        .map((r) => [r.path, r.newName]),
-    });
+    emit("applied", { count: res.done.length, pairs });
     emit("close");
     return;
   }
@@ -316,6 +315,12 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* <fieldset> user-agent reset — it is only the disabled-scope mechanism here,
+     the visual chrome stays with .rule-block. */
+  border: none;
+  margin: 0;
+  padding: 0 6px 0 0;
+  min-inline-size: 0;
 }
 
 .rule-block {
