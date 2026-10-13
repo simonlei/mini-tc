@@ -373,6 +373,28 @@ async function loadState() {
 }
 
 // Watch for state changes and persist
+//
+// Debounced, unlike the naive `saveState()` call these watchers used to make.
+// The tabs watcher is `deep` over `nav.entries`, so a single Alt+Left burst
+// fires it once per history step and each fire used to launch its own
+// `save_config`. Those run on Tauri's thread pool, so several of them reached
+// the same file concurrently. The backend now publishes atomically and takes a
+// per-name lock, so a torn file is no longer possible — but the debounce is
+// still the right thing on its own: writing the same JSON five times in 200ms
+// is five fsyncs to buy a result that only the last one determines.
+//
+// 200ms rather than viewState's 150ms: this payload carries directory history
+// (up to 100 paths per tab), so it is bigger, and a lost final state here means
+// visibly wrong history on the next launch rather than a stale column width.
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveState();
+  }, 200);
+}
+
 watch(
   () => tabs.value.map((t) => ({
     id: t.id,
@@ -384,10 +406,10 @@ watch(
     // and forth must be persisted, not just path switches).
     nav: t.nav ? { entries: [...(t.nav.entries || [])], index: t.nav.index } : null,
   })),
-  () => { activeTabId.value && saveState(); },
+  () => { activeTabId.value && scheduleSave(); },
   { deep: true }
 );
-watch(activeTabId, (newId) => { newId && saveState(); });
+watch(activeTabId, (newId) => { newId && scheduleSave(); });
 
 // ── Lifecycle ──
 

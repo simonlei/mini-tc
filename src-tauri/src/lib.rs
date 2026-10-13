@@ -5,8 +5,11 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use tauri::Emitter;
 
+mod atomic_file;
 mod search_log;
 mod window_state;
+
+use atomic_file::create_new_file;
 
 #[cfg(windows)]
 #[link(name = "shell32")]
@@ -2451,50 +2454,6 @@ fn copy_file_with_progress(
     Ok(())
 }
 
-/// A temp path next to `dest` — same directory, so the final `rename` stays on
-/// one filesystem and therefore stays atomic. `attempt` only exists to walk past
-/// a name left behind by an earlier crash.
-fn tmp_sibling_path(dest: &Path, attempt: u32) -> PathBuf {
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    if attempt == 0 {
-        // No pid: the name is claimed with create_new, so we only need it to be
-        // unlikely to collide. The pid keeps the common case collision-free
-        // against a *concurrent* copy in the other panel.
-        dir.join(format!(".{name}.minitc-{}.tmp", std::process::id()))
-    } else {
-        dir.join(format!(
-            ".{name}.minitc-{}-{attempt}.tmp",
-            std::process::id()
-        ))
-    }
-}
-
-/// Claim the temp path exclusively. `create_new` refuses an existing name, so a
-/// name left behind by a previous crash (or another process) is never silently
-/// clobbered — we bump the suffix until we find a free one.
-fn create_new_file(dest: &Path) -> io::Result<(fs::File, PathBuf)> {
-    for attempt in 0..64u32 {
-        let candidate = tmp_sibling_path(dest, attempt);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(f) => return Ok((f, candidate)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("无法为 {} 创建临时文件", dest.display()),
-    ))
-}
-
 /// Copy all `sources` into `dest_dir`, emitting `copy-progress` events so the
 /// frontend can render a progress bar.
 ///
@@ -3168,6 +3127,30 @@ fn load_config(name: String) -> Option<String> {
 
 /// Persist a named config blob to ~/.minitc/<name>.json so it is shared across
 /// every run of the binary (dev vs bundled) regardless of cwd.
+///
+/// **Atomic, and serialized per config name.** This is the single landing
+/// channel for every persisted store — view state, bookmarks, shortcuts, tabs,
+/// theme, panel split, video / app / text-preview settings — so a partial write
+/// here is not one broken preference but *all of them*: `load_config` fails to
+/// parse, each store's `catch` falls back to defaults, and the user's
+/// bookmarks, open tabs and key bindings disappear with no message.
+///
+/// The two properties are independent and both required:
+///
+/// - *Atomic* (`write_atomic`): no reader and no crash ever sees a partial
+///   file. This is what a bare `fs::write` cannot give, since it truncates
+///   before it writes.
+/// - *Serialized per name*: `FilePanel`'s deep watcher has no debounce, so
+///   hammering Backspace fires several `save_config` calls for the same name.
+///   Tauri runs commands on a thread pool, so two of them can reach
+///   `fs::write` on the same path concurrently and interleave. Different names
+///   still run in parallel — the payload is ~4 KB and the cost is the
+///   round-trip, so gating unrelated writes behind each other would only add
+///   latency (the same reasoning as the parallel `loadConfig` above).
+///
+/// The lock is per name and released before returning; it is never held across
+/// an `await`-like boundary that could block the UI thread, because a Tauri
+/// command already runs off it.
 #[tauri::command]
 fn save_config(name: String, config: String) -> Result<(), String> {
     if !is_valid_config_name(&name) {
@@ -3175,10 +3158,176 @@ fn save_config(name: String, config: String) -> Result<(), String> {
     }
     let home = home_dir().ok_or_else(|| "无法定位用户主目录".to_string())?;
     let dir = home.join(".minitc");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.json", name));
-    fs::write(path, config).map_err(|e| e.to_string())?;
-    Ok(())
+    persist_config(&path, &config)
+}
+
+/// The part of `save_config` worth testing: publish to `path` atomically.
+/// Split out so a test can point it at a scratch directory and race real
+/// threads against each other — file integrity cannot be observed from the
+/// outside otherwise.
+///
+/// **No lock here, deliberately.** Two properties were getting conflated:
+///
+/// - *Integrity* — no reader and no crash ever sees a partial file. That is
+///   what `write_atomic` buys, and it holds with any number of concurrent
+///   writers because each one claims a private temp name and commits by rename.
+///   Verified by `config_persist_tests::concurrent_saves_never_produce_a_
+///   spliced_file`, which fails if this ever goes back to a bare `fs::write`.
+/// - *Order* — the last requested write lands last. That is a property of the
+///   caller, not the file: Tauri runs commands on a thread pool, so two
+///   requests can reach this function in either order, and a Mutex here would
+///   not fix that (lock acquisition order is not FIFO either). It is solved on
+///   the frontend by a per-name promise queue, which *is* genuinely ordered.
+///
+/// A Mutex held across a blocking write would also re-introduce the hazard
+/// already recorded for `window_state::flush` — one slow disk stalls every
+/// other writer.
+fn persist_config(path: &Path, body: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    atomic_file::write_atomic(path, body.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod config_persist_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "minitc-config-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// A config file must never contain anything but one complete document.
+    /// `save_config` used to be a bare `fs::write`, which **truncates before it
+    /// writes** — so any interruption (or a crash) left a half-written file
+    /// that `load_config` cannot parse, and every store's `catch` then silently
+    /// reverted to defaults. The user's bookmarks, tabs and key bindings all
+    /// disappear with no message.
+    ///
+    /// Racing real threads is the only honest way to test this. Each thread
+    /// writes a different-length body so a splice cannot be mistaken for a
+    /// whole document, and the reader checks the invariant *continuously*
+    /// rather than at the end — the final content is correct either way, which
+    /// is exactly why the original bug survived.
+    #[test]
+    fn concurrent_saves_never_expose_a_partial_file() {
+        let dir = scratch("race");
+        let path = dir.join("tabs-left.json");
+
+        let bodies: Vec<String> = (0..8)
+            .map(|i| {
+                format!(
+                    "{{\"tabs\":[{}]}}",
+                    vec![format!("\"p{}\"", i); 200 + i * 37].join(",")
+                )
+            })
+            .collect();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            let bodies = bodies.clone();
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(raw) = fs::read_to_string(&path) {
+                        seen += 1;
+                        assert!(
+                            bodies.contains(&raw),
+                            "config file exposed a partial document ({} bytes)",
+                            raw.len()
+                        );
+                    }
+                }
+                seen
+            })
+        };
+
+        let mut writers = Vec::new();
+        for round in 0..40 {
+            let body = bodies[round % bodies.len()].clone();
+            let path = path.clone();
+            writers.push(std::thread::spawn(move || {
+                persist_config(&path, &body).expect("persist");
+            }));
+        }
+        for w in writers {
+            w.join().expect("writer thread");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let seen = reader.join().expect("reader thread");
+
+        // Precondition: without a reader that actually ran, every assertion
+        // above is vacuous.
+        assert!(
+            seen > 0,
+            "reader observed nothing — the test proved nothing"
+        );
+    }
+
+    /// A failed save must leave the previous good document readable. This is
+    /// the difference between "the write didn't happen" and "the user's
+    /// configuration is gone" — and it is the half of the contract that the
+    /// old delete-then-write sequence in `window_state` violated.
+    #[test]
+    fn a_failing_save_keeps_the_previous_document_loadable() {
+        let dir = scratch("keep-old");
+        let path = dir.join("bookmarks.json");
+        persist_config(&path, r#"{"bookmarks":["a"]}"#).expect("seed");
+
+        // A directory in the way makes the commit fail.
+        let blocked = dir.join("blocked.json");
+        fs::create_dir_all(blocked.join("child")).expect("blocking dir");
+
+        let err = persist_config(&blocked, r#"{"never":"landed"}"#)
+            .expect_err("rename onto a non-empty dir must fail");
+        assert!(!err.is_empty(), "a failure must be reported, not swallowed");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            r#"{"bookmarks":["a"]}"#,
+            "the unrelated good document must be untouched"
+        );
+    }
+
+    /// The load side is the other half of the contract: whatever `persist_config`
+    /// published must come back byte-for-byte, because `load_config` returning
+    /// `None` is what silently resets a store.
+    #[test]
+    fn persisted_documents_round_trip_unchanged() {
+        let dir = scratch("roundtrip");
+        let cases = [
+            r#"{}"#,
+            r#"{"theme":"dark"}"#,
+            r#"{"tabs":[{"path":"C:////Users","nav":{"entries":["a","b"],"index":1}}]}"#,
+            r#"{"bookmarks":[]}"#,
+            // Multi-byte content: a byte-length assumption in the publish path
+            // would corrupt these.
+            r#"{"name":"书签与路径"}"#,
+        ];
+        for (i, body) in cases.iter().enumerate() {
+            let path = dir.join(format!("case{}.json", i));
+            persist_config(&path, body).expect("persist");
+            assert_eq!(
+                fs::read_to_string(&path).expect("read back"),
+                *body,
+                "case {} did not round-trip",
+                i
+            );
+        }
+    }
 }
 
 /// Result returned by `get_clipboard_files`: the list of file paths currently
@@ -4867,6 +5016,7 @@ mod overwrite_tests {
 #[cfg(test)]
 mod atomic_replace_tests {
     use super::*;
+    use crate::atomic_file::tmp_sibling_path;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

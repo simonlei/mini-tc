@@ -119,17 +119,15 @@ fn save_state(st: &WindowState) {
         return;
     };
 
-    // 先写临时文件再改名：崩溃 / 断电时不会留下半截 JSON，下次启动仍能用
-    // 上一份好状态。Windows 上 rename 不能覆盖已存在的目标，必须先删。
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = fs::write(&tmp, body) {
-        crate::debug_log(&format!("window-state: write tmp failed: {}", e));
-        return;
-    }
-    let _ = fs::remove_file(&path);
-    if let Err(e) = fs::rename(&tmp, &path) {
-        crate::debug_log(&format!("window-state: rename failed: {}", e));
-        let _ = fs::remove_file(&tmp);
+    // Publish atomically, via the same helper the config channel uses. The
+    // hand-rolled version this replaced wrote to a *fixed* temp name and
+    // deleted the destination before renaming — reasoning that "Windows
+    // rename can't overwrite an existing target". That is wrong on this
+    // machine (`fs::rename` uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
+    // and overwrites a file fine), and the delete was pure downside: it opened
+    // a window in which a crash left the user with no geometry file at all.
+    if let Err(e) = crate::atomic_file::write_atomic(&path, body.as_bytes()) {
+        crate::debug_log(&format!("window-state: save failed: {}", e));
     }
 }
 

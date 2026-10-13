@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { createConfigWriter } from "./configWriter.js";
 
 export async function listDirectory(path) {
   return invoke("list_directory", { path });
@@ -183,9 +184,15 @@ export async function loadConfig(name) {
 }
 
 /// Persist a named config blob to ~/.minitc/<name>.json.
-export async function saveConfig(name, config) {
-  return invoke("save_config", { name, config });
-}
+///
+/// Writes to the same name are issued strictly in call order, so the newest
+/// state is always the one that survives. The backend publishes atomically
+/// (temp file + rename), which is what stops a reader or a crash from ever
+/// seeing a half-written file — see `configWriter.js` for why these two halves
+/// are fixed in different places.
+export const saveConfig = createConfigWriter((name, config) =>
+  invoke("save_config", { name, config })
+);
 
 /// Write the given paths onto the OS clipboard as a file list.
 /// `cut = true` marks them for a move (File Explorer moves rather than copies).
