@@ -131,6 +131,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { loadConfig, saveConfig } from "../api.js";
 import { listDirectory, getParentDir, joinPath, openFile } from "../api.js";
 import { matches, markHandled } from "../shortcuts.js";
+import { autoplayGate } from "../autoplayGate.js";
 
 const props = defineProps({
   filePath: { type: String, required: true },
@@ -200,10 +201,14 @@ const showCtrls = ref(true);
 const hoveringCtrls = ref(false);
 let ctrlsTimer = null;
 
-// Set when the current clip ended and we're auto-advancing to the next one, so
-// that loadVideo() actually starts playback (instead of stopping on a paused
-// frame). Cleared once the next clip's metadata has loaded (or on error).
-const pendingAutoplay = ref(false);
+// Autoplay-after-ended is authorised by the PARENT (App.playNextVideo), not by
+// our own `ended` handler: whether there IS a next clip is the parent's call —
+// it bails out for five different reasons (preview closed / not a video / no
+// current name / last clip / no dir). Arming it here meant every one of those
+// bail-outs left the flag stuck, and the next clip the USER picked started
+// playing on its own. We only consume: `claim()` runs at the top of every
+// loadVideo(), so an authorisation can never outlive a single load.
+const autoplayNext = ref(false);
 
 // Detect "audio plays but no video frame is ever painted" — the classic
 // HEVC/H.265-in-WebView2 symptom: the browser can't decode the video track but
@@ -316,10 +321,11 @@ function onLoadedMetadata() {
     triggerVideoFallback("无法获取视频画面（视频轨可能未解码，常见于 H.265/HEVC），请用系统播放器打开。");
     return;
   }
-  // Autoplay the next clip if we're advancing from a finished one. The new
-  // source has just loaded, so playback is safe to start now.
-  if (pendingAutoplay.value) {
-    pendingAutoplay.value = false;
+  // Autoplay the next clip if the parent authorised it (i.e. we are advancing
+  // from a finished one). The new source has just loaded, so playback is safe
+  // to start now.
+  if (autoplayNext.value) {
+    autoplayNext.value = false;
     v.play().catch(() => {});
   }
 }
@@ -342,14 +348,13 @@ function onEnded() {
   playing.value = false;
   // Defensive: onEnded only fires for a real <video>, but guard anyway.
   if (!VIDEO_OK.includes(ext.value)) return;
-  // Flag the upcoming reload so loadVideo() actually starts playback once the
-  // new source is ready (instead of stopping on a paused frame).
-  pendingAutoplay.value = true;
+  // We do NOT arm autoplay here — the parent decides whether a next clip
+  // exists (see autoplayGate). We only report which clip just finished.
   emit("open-next", { name: props.fileName });
 }
 function onError() {
   // Native-capable container but actual codec/stream failed to decode.
-  pendingAutoplay.value = false;
+  autoplayNext.value = false;
   externalFallback.value = true;
   if (canPlayNative.value) loadError.value = "当前编码格式 WebView 无法直接解码，请用系统播放器打开。";
 }
@@ -367,7 +372,7 @@ function cancelFrameWatch() {
 // Switch to the system-player fallback because the video track can't be shown.
 function triggerVideoFallback(msg) {
   cancelFrameWatch();
-  pendingAutoplay.value = false;
+  autoplayNext.value = false;
   externalFallback.value = true;
   loadError.value = msg;
 }
@@ -654,6 +659,10 @@ function onStageLeave() {
 // handled by the parent via the file list, not here.
 async function loadVideo() {
   cancelFrameWatch();
+  // Consume the autoplay authorisation FIRST — before the isExternalOnly
+  // early-return below. This is the common entry of every load, so an
+  // authorisation can never survive into a later, user-initiated selection.
+  autoplayNext.value = autoplayGate.claim(props.filePath);
   videoSrc.value = "";
   externalFallback.value = false;
   loadError.value = "";

@@ -279,6 +279,7 @@ import {
   snapshot as viewStateSnapshot,
 } from "./viewState.js";
 import * as alwaysOnTop from "./alwaysOnTop.js";
+import { autoplayGate } from "./autoplayGate.js";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
@@ -1008,6 +1009,16 @@ async function playNextVideo(payload) {
   const dir = panel?.currentPath;
   if (!dir) return;
   const p = await entryPath(next, dir);
+  // The await above is a window in which the user can close the preview (or
+  // switch away). Landing now would unmount VideoPreview without ever running
+  // loadVideo(), stranding the authorisation for the next manual open — so
+  // re-check before arming.
+  if (!previewVisible.value || previewKind.value !== "video") return;
+  // Authorise playback for THIS clip only. Every bail-out above leaves the
+  // gate unarmed — previously the child armed itself on `ended` and every one
+  // of those bail-outs stranded the flag, so the next clip the user picked
+  // started playing by itself. Arming here means "we are the ones advancing".
+  autoplayGate.arm(p);
   previewFilePath.value = p;
   previewFileName.value = next.name;
   previewFileBytes.value = next.size || 0;
@@ -1713,6 +1724,10 @@ function closePreview() {
   previewFileBytes.value = 0;
   previewAsText.value = false;
   previewUnsupportedIsDir.value = false;
+  // Closing unmounts VideoPreview without ever running loadVideo(), so any
+  // authorisation armed by an in-flight playNextVideo() would never be
+  // consumed — drop it here, at the event that would have leaked it.
+  autoplayGate.arm(null);
 
   // After leaving preview, make the SOURCE file list (the panel where the
   // previewed file lives — always the visible one, since the preview occupies

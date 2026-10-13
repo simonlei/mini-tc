@@ -223,7 +223,7 @@ npm test                       # 只跑单元测试
 
 改动 `.vue` / `src/*.js` 后跑一次，比等运行时白屏再回头找快得多。
 
-`npm test` 目前覆盖四块前端纯逻辑：
+`npm test` 目前覆盖五块前端纯逻辑：
 
 - `scripts/rename-rules-check.mjs` —— 批量重命名的规则与两阶段执行（含失败回滚）
 - `scripts/selection-remap-check.mjs` —— 文件列表选中态在排序 / 过滤后的重映射。
@@ -260,6 +260,25 @@ npm test                       # 只跑单元测试
 
   资源释放的位置同样有讲究：`releaseHeicUrl()` 必须在**加载入口**调用，不能只在
   HEIC 分支里 —— 否则「预览过 HEIC → 切到 PNG/TXT」这条路从不释放，blob 活到窗口关闭。
+- `scripts/autoplay-gate.test.mjs` —— 视频播完自动续播的授权闸门。
+
+  曾有一个「用户手动选的视频会自己开始播」的 bug：`VideoPreview` 在 `ended` 时自己把
+  `pendingAutoplay` 置真，但**要不要换下一条是父组件说了算**（`playNextVideo` 有五个
+  提前 return）。父组件一旦拒绝，这个标志就永远悬着，此后用户点选**任何另一个**视频
+  都会自动播放。
+
+  判据是 `src/autoplayGate.js` 的 `arm()` / `claim()`。三点通用结论：
+
+  - 🚨 **原打算的「按路径校验」修法拦不住**：手动选的路径当然和刚播完那条不同，校验只会
+    把「立刻播」变成「换一个照样播」。**病根是置位方向反了** —— 谁决定，谁置位。
+    现在只有父组件 `arm()`，子组件在 `loadVideo()` 开头消费一次。
+  - **消费点必须在所有分支的共同入口**，且在 `isExternalOnly` 提前 return **之前**。
+    放进分支里，「下一条是 mkv」就会跳过消费、把标志留给下一次手动选择。
+  - **消费即作废**：`claim()` 无论命中与否都清空。授权是一次性的，不能跨过一次加载存活。
+
+  顺带一处值得记的窗口：`await entryPath(...)` 期间用户可能已关掉预览，await 后的
+  快照一律不可信；而「关闭预览」会 unmount 播放器、`loadVideo()` 根本不会跑 ——
+  撤销必须做在**事件发生处**（`closePreview` 里 `arm(null)`），不能等「状态不匹配时」。
 
 ## 后端单元测试
 
