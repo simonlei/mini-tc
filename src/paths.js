@@ -49,10 +49,18 @@ export function normDir(p) {
 ///
 /// A name is unique *within one directory*, but not within a search-results
 /// tab: the same `report.zip` can be listed from ten different folders at
-/// once. Keying rows by name there makes Vue reuse the wrong DOM node, and
-/// that is not merely cosmetic — the row's inline rename input mounts onto a
-/// different file, so committing the rename writes a name the user never
-/// typed to a file they never selected.
+/// once. Vue's keyed diff builds a `key -> index` map and, on duplicates, the
+/// later entry overwrites the earlier one — so it reuses nodes shifted by one
+/// position. Given [A,B,C,D] becoming [D,A,B,C], row 1 sits where D is but
+/// still holds A's per-row state (cached dir size, decoded thumbnail, the
+/// inline rename state). Measured, not assumed: see
+/// `scripts/row-key-identity-check.mjs`.
+///
+/// Note what this does *not* cause: the inline rename input does not end up on
+/// the wrong file. Its position comes from `renamingIndex`, an index, and given
+/// a correctly remapped index both key strategies behave identically. The
+/// genuinely mis-targeted rename is a separate defect (an index that is not
+/// remapped when the list changes) — tracked on its own.
 ///
 /// Both entry sources (`FileEntry` from `list_directory`, `SearchHit` from the
 /// search command) always carry an absolute `path`, and `entries` is always
