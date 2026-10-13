@@ -44,3 +44,22 @@ export function parentDirOf(p) {
 export function normDir(p) {
   return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
 }
+
+/// Stable identity for a listed entry — the value to key a row by.
+///
+/// A name is unique *within one directory*, but not within a search-results
+/// tab: the same `report.zip` can be listed from ten different folders at
+/// once. Keying rows by name there makes Vue reuse the wrong DOM node, and
+/// that is not merely cosmetic — the row's inline rename input mounts onto a
+/// different file, so committing the rename writes a name the user never
+/// typed to a file they never selected.
+///
+/// Both entry sources (`FileEntry` from `list_directory`, `SearchHit` from the
+/// search command) always carry an absolute `path`, and `entries` is always
+/// replaced wholesale from a single source — never a merge of two listings —
+/// so the path is unique across the rendered list. The `|| name` fallback only
+/// covers a hypothetical entry with no path at all, where colliding is still
+/// better than rendering nothing.
+export function entryKey(entry) {
+  return (entry && entry.path) || (entry && entry.name) || "";
+}

@@ -228,13 +228,18 @@ npm test                       # 只跑单元测试
 
 改动 `.vue` / `src/*.js` 后跑一次，比等运行时白屏再回头找快得多。
 
-`npm test` 目前覆盖六块前端纯逻辑：
+`npm test` 目前覆盖七块前端纯逻辑：
 
 - `scripts/rename-rules-check.mjs` —— 批量重命名的规则与两阶段执行（含失败回滚）
 - `scripts/selection-remap-check.mjs` —— 文件列表选中态在排序 / 过滤后的重映射。
   **选中态是下标存储的，任何重排或过滤都会让它失效**：曾只处理了「显示隐藏文件」一种，
   于是按另一列排序或用 `/` 过滤后，选中态仍停在原下标上，**此时按 Delete 删掉的是另一个文件**。
   这类逻辑必须单测 —— `vite build` 与类型检查都发现不了「下标指向了谁」。
+- `scripts/entry-key-check.mjs` —— 文件列表行的 `:key` 身份（`src/paths.js` 的 `entryKey()`）。
+  **文件名只在单个目录内唯一**：搜索结果面板里同一个 `report.zip` 可以同时来自十个目录，
+  key 撞车后 Vue 复用错误的 DOM 节点 —— 行内容错位只是表象，**行内的内联改名输入框会挂到
+  别的文件上**，回车就把一个用户没输入过的名字写到用户没选中的文件上。测试同时做变异验证：
+  把 `entryKey` 改回 `entry.name`、或在模板里绕过它手写 `entry.name`，都必须失败。
 - `scripts/load-gate.test.mjs` —— 目录列表的并发落地判定与「Loading…」归属。
 
   面板加载目录时会并发多个请求（快速导航 = 三个不同 path 同时在飞），**先发后到的旧结果
@@ -426,7 +431,7 @@ mini-tc/
 │   ├── App.vue               # 主双面板布局 + 菜单栏
 │   ├── main.js               # 应用入口
 │   ├── api.js                # Tauri invoke 封装
-│   ├── paths.js              # 绝对路径解析唯一入口：entryPath / 虚拟目录哨兵 minitc://search/{id}
+│   ├── paths.js              # 绝对路径解析唯一入口：entryPath / 行 key 身份 entryKey / 虚拟目录哨兵 minitc://search/{id}
 │   ├── style.css             # 全局样式（4 套主题变量）
 │   ├── shortcuts.js          # 快捷键注册表：命令 / 作用域 / 匹配 / 冲突检测
 │   ├── bookmarks.js          # 目录书签全局 store（~/.minitc/bookmarks.json + 下拉展开者令牌）

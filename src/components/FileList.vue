@@ -98,7 +98,7 @@
       <!-- Actual file entries (search-filtered) -->
       <div
         v-for="(entry, index) in displayedEntries"
-        :key="entry.name"
+        :key="entryKey(entry)"
         class="file-row"
         :class="{
           selected: selectedIndices.has(index),
@@ -161,7 +161,7 @@
 <script setup>
 import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import { startNativeDrag } from "../api.js";
-import { entryPath, isSearchPath } from "../paths.js";
+import { entryPath, isSearchPath, entryKey } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
 
 const props = defineProps({
