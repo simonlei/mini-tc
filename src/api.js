@@ -219,36 +219,38 @@ export async function getArchiveTools() {
   return invoke("get_archive_tools");
 }
 
-/// Extract `archive` into `targetDir` using the external tool described by
-/// `toolExe` + `syntax` (from `getArchiveTools`). `mode` is "here" (extract
-/// into targetDir) or "to_folder" (extract into a new sub-folder named after
-/// the archive). Resolves to `{ success, message }`.
+/// Extract `archive` into `targetDir` using the external tool identified by
+/// `toolId` (an `id` previously returned by `getArchiveTools`). `mode` is
+/// "here" (extract into targetDir) or "to_folder" (extract into a new
+/// sub-folder named after the archive). Resolves to `{ success, message }`.
+///
+/// Note the tool is named by id only: the backend resolves the executable from
+/// its own discovery table and refuses anything else, so a compromised webview
+/// cannot make it run an arbitrary program.
 /// `wait` only affects GUI tools: when true the call blocks until the tool's
 /// window closes (bounded), so a batch of archives can be extracted strictly
 /// one after another instead of stacking every dialog at once. CLI tools
 /// always run to completion.
-export async function extractArchive(archive, targetDir, toolExe, syntax, mode, wait = false) {
+export async function extractArchive(archive, targetDir, toolId, mode, wait = false) {
   return invoke("extract_archive", {
     archive,
     targetDir,
-    toolExe,
-    syntax,
+    toolId,
     mode,
     wait,
   });
 }
 
 /// Add the given `sources` (files / directories) into a single archive named
-/// `archiveName` inside `baseDir`, using the external tool `toolExe` + `syntax`
-/// (from `getArchiveTools`). Only CLI tools (syntax "7z-cli" / "7z" / "winrar")
+/// `archiveName` inside `baseDir`, using the external tool `toolId` (from
+/// `getArchiveTools`). Only CLI tools (syntax "7z-cli" / "7z" / "winrar")
 /// are valid here.
-export async function addToArchive(sources, baseDir, archiveName, toolExe, syntax) {
+export async function addToArchive(sources, baseDir, archiveName, toolId) {
   return invoke("add_to_archive", {
     sources,
     baseDir,
     archiveName,
-    toolExe,
-    syntax,
+    toolId,
   });
 }
 

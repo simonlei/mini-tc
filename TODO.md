@@ -5,7 +5,6 @@
 
 ## P0 — 数据丢失 / 崩溃 / 安全
 
-- [ ] **修复：`extract_archive` / `add_to_archive` 直接执行前端传来的 `tool_exe`，等价于任意程序执行** — `lib.rs:2949` / `3152`。`get_archive_tools()` 返回的 exe 是后端自己探测的，但 `extract_archive(archive, target_dir, tool_exe, syntax, ...)` 不信任这个来源——webview 里任何一处 XSS 或被劫持的前端资源都能把 `tool_exe` 换成 `cmd.exe` 拿到完整用户权限。`syntax` 还能任意切换参数分支。对比同文件 `run_as_admin` 至少用 `executable_kind`（`1439`）做了白名单，这里连「是不是解压工具」都不校验。修法：后端维护 `tool_id → (exe, 参数模板)` 权威表，命令只接受 `tool_id`，删掉 `tool_exe`/`syntax` 两个前端可控参数。
 - [ ] **修复：mammoth 预览的 `v-html` 净化器是黑名单且漏 `data:` URL，配合 `csp: null` 可在 Tauri 源上执行脚本** — `FilePreview.vue:386-409` + `tauri.conf.json:27`。`sanitizeHtml` 只黑名单 `javascript:` 前缀和 `on*` 属性，`<a href="data:text/html,<script>...">` 被完整保留；用户点击即在 webview 内导航到攻击者构造的**同源** HTML，而 Tauri 的 `window.__TAURI_INTERNALS__` 在该源下可用 → 等价于任意命令执行（读文件、删文件）。`"csp": null` 意味着没有第二道防线。也不处理 `srcdoc` / `formaction` / `xlink:href`。修法：换 DOMPurify 显式白名单 `ALLOWED_TAGS`/`ALLOWED_ATTR`，并给 `tauri.conf.json` 配 `csp: "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'"`。✅ 已核实 `BatchRenameDialog.vue` / `PathBar.vue` 全部走 `{{ }}` 插值与 `:title` 绑定，**无 XSS**。
 
 ## P1 — 真 bug / 竞态 / 泄漏 / 明显性能

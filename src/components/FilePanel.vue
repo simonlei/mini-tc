@@ -1951,7 +1951,7 @@ async function doAddToArchive() {
     : path.split(/[\\/]/).filter(Boolean).pop() || "archive";
 
   try {
-    const res = await addToArchive(sources, baseDir, folderName, tool.exe, tool.syntax);
+    const res = await addToArchive(sources, baseDir, folderName, tool.id);
     if (res && res.success) {
       showToast(res.message, "success");
       // GUI tools build the archive asynchronously in their own window (and
@@ -2002,7 +2002,7 @@ async function doExtract(targets, tool, mode) {
       continue;
     }
     try {
-      const res = await extractArchive(fullArchive, destDir, tool.exe, tool.syntax, mode, wait);
+      const res = await extractArchive(fullArchive, destDir, tool.id, mode, wait);
       if (res && res.success) {
         done++;
         lastMessage = res.message || "";

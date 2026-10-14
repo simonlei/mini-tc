@@ -3802,12 +3802,62 @@ fn clear_clipboard() -> Result<(), String> {
 /// ─────────────────────────────────────────────────────────────────────────
 ///
 /// A discovered external extraction tool.
-#[derive(Serialize)]
+///
+/// `exe` / `syntax` are handed to the frontend for *display and menu* purposes
+/// only (which entries to show, GUI vs CLI). They are NOT accepted back from
+/// the frontend: `extract_archive` / `add_to_archive` take a `tool_id` and
+/// resolve it through [`resolve_archive_tool`], which reads the process-wide
+/// registry this struct is stored in. A webview that has been compromised by
+/// an XSS could otherwise name `cmd.exe` and get it run with the user's full
+/// privileges.
+#[derive(Serialize, Clone, Debug)]
 pub struct ArchiveTool {
     pub id: String,     // stable identifier (e.g. "7zip-7z", "path-7za")
     pub name: String,   // display name shown in the menu (e.g. "7-Zip")
     pub exe: String,    // absolute path to the executable
     pub syntax: String, // "7z" | "unzip" | "winrar" — how to invoke it
+}
+
+/// The authoritative set of archive tools this backend is willing to execute.
+///
+/// Written only by `get_archive_tools` (the sole discovery path) and read by
+/// [`resolve_archive_tool`]. Empty means "discovery has not run yet in this
+/// process".
+static ARCHIVE_TOOLS: std::sync::OnceLock<std::sync::Mutex<Vec<ArchiveTool>>> =
+    std::sync::OnceLock::new();
+
+fn archive_tools_registry() -> &'static std::sync::Mutex<Vec<ArchiveTool>> {
+    ARCHIVE_TOOLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Pure lookup used by [`resolve_archive_tool`] — separated so the matching
+/// rule (exact id, never a prefix) is unit-testable without touching the
+/// process-wide registry.
+fn find_tool_by_id<'a>(tools: &'a [ArchiveTool], id: &str) -> Option<&'a ArchiveTool> {
+    tools.iter().find(|t| t.id == id)
+}
+
+/// Turn a `tool_id` the frontend echoes back into the `(exe, syntax)` pair the
+/// backend itself discovered. Any id that is not in the registry is refused,
+/// which is what makes these two commands safe to expose to a webview.
+///
+/// When the registry is still empty we run discovery once rather than fail:
+/// making the lookup depend on the frontend having called
+/// `get_archive_tools` first would bake an ordering requirement into the
+/// security check, and forgetting it would degrade into "compression silently
+/// stopped working" instead of a loud error. A *populated* registry that
+/// doesn't contain the id is NOT re-scanned — otherwise every bogus id would
+/// trigger another full drive walk.
+fn resolve_archive_tool(tool_id: &str) -> Result<ArchiveTool, String> {
+    let mut guard = archive_tools_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.is_empty() {
+        *guard = discover_archive_tools();
+    }
+    find_tool_by_id(&guard, tool_id)
+        .cloned()
+        .ok_or_else(|| format!("未知的压缩工具 id: {}", tool_id))
 }
 
 /// Locate an executable by name using the system PATH.
@@ -3900,8 +3950,11 @@ fn scan_drives_for_exe(basenames: &[&str]) -> Vec<String> {
 /// Discover extraction tools actually present on this machine. Only tools whose
 /// executable exists are returned, so the frontend can tailor the menu (and
 /// show a "not installed" placeholder when none are found).
-#[tauri::command]
-fn get_archive_tools() -> Vec<ArchiveTool> {
+///
+/// This is the ONLY place that decides which executables mini-tc may run; the
+/// result is cached in [`ARCHIVE_TOOLS`] so `extract_archive` /
+/// `add_to_archive` can resolve a `tool_id` without trusting the frontend.
+fn discover_archive_tools() -> Vec<ArchiveTool> {
     let mut tools: Vec<ArchiveTool> = Vec::new();
 
     #[cfg(windows)]
@@ -4034,6 +4087,19 @@ fn get_archive_tools() -> Vec<ArchiveTool> {
     tools
 }
 
+/// Frontend entry point for tool discovery. The discovered list doubles as the
+/// backend's allow-list (see [`ARCHIVE_TOOLS`]), so a `tool_id` handed to
+/// `extract_archive` / `add_to_archive` can only ever name an executable found
+/// here.
+#[tauri::command]
+fn get_archive_tools() -> Vec<ArchiveTool> {
+    let tools = discover_archive_tools();
+    *archive_tools_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = tools.clone();
+    tools
+}
+
 /// Result returned by `extract_archive`.
 #[derive(Serialize)]
 pub struct ExtractResult {
@@ -4052,8 +4118,9 @@ const GUI_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 /// - `mode == "to_folder"`: extract into a new sub-folder named after the
 ///   archive's base name (e.g. `foo.zip` → `foo\`), which 7z/unzip create
 ///   automatically.
-/// `tool_exe` + `syntax` come from `get_archive_tools` so this command stays
-/// agnostic to which tool is installed.
+/// `tool_id` is an id previously handed out by `get_archive_tools`; the
+/// executable to run is resolved from the backend's own registry (see
+/// [`resolve_archive_tool`]) and never taken from the caller.
 /// `wait` only matters for GUI tools: when true we block until the tool's
 /// window exits (bounded by `GUI_WAIT_LIMIT`) before returning, which lets the
 /// frontend extract several archives strictly one after another instead of
@@ -4062,11 +4129,13 @@ const GUI_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 fn extract_archive(
     archive: String,
     target_dir: String,
-    tool_exe: String,
-    syntax: String,
+    tool_id: String,
     mode: String,
     wait: Option<bool>,
 ) -> Result<ExtractResult, String> {
+    let tool = resolve_archive_tool(&tool_id)?;
+    let tool_exe = tool.exe.as_str();
+    let syntax = tool.syntax.as_str();
     let archive_path = Path::new(&archive);
     if !archive_path.exists() {
         return Err(format!("压缩包不存在: {}", archive));
@@ -4115,8 +4184,8 @@ fn extract_archive(
     let target_str = target.to_string_lossy().to_string();
 
     // Build the invocation per tool syntax.
-    let mut cmd = std::process::Command::new(&tool_exe);
-    match syntax.as_str() {
+    let mut cmd = std::process::Command::new(tool_exe);
+    match syntax {
         "unzip" => {
             // unzip -o <archive> -d <target>  (-o = overwrite)
             cmd.arg("-o").arg(&archive).arg("-d").arg(&target);
@@ -4228,7 +4297,9 @@ pub struct AddResult {
 /// manager produces one bundle named after the folder they live in — matching
 /// Explorer's "Compressed (zipped) folder" behaviour.
 ///
-/// `tool_exe` + `syntax` come from `get_archive_tools`. GUI tools
+/// `tool_id` is an id previously handed out by `get_archive_tools`; the
+/// executable to run is resolved from the backend's own registry (see
+/// [`resolve_archive_tool`]) and never taken from the caller. GUI tools
 /// (`7z-gui` / `winrar-gui`) open their interactive "Add to archive" dialog
 /// pre-filled with the selected sources so the user can configure options;
 /// CLI tools (`7z-cli` / `7z` / `winrar`) compress silently.
@@ -4237,9 +4308,11 @@ fn add_to_archive(
     sources: Vec<String>,
     base_dir: String,
     archive_name: String,
-    tool_exe: String,
-    syntax: String,
+    tool_id: String,
 ) -> Result<AddResult, String> {
+    let tool = resolve_archive_tool(&tool_id)?;
+    let tool_exe = tool.exe.as_str();
+    let syntax = tool.syntax.as_str();
     if sources.is_empty() {
         return Err("没有选中任何文件".to_string());
     }
@@ -4257,14 +4330,14 @@ fn add_to_archive(
     let archive_path = base.join(&name);
     let archive_str = archive_path.to_string_lossy().to_string();
 
-    let mut cmd = std::process::Command::new(&tool_exe);
+    let mut cmd = std::process::Command::new(tool_exe);
     // All tools use the `a` (add) command. The archive path is always passed
     // so the GUI pre-fills the destination name; the trailing switch differs
     // per tool: GUI tools must NOT use `-y` (it would skip the dialog) and
     // 7-Zip's GUI additionally needs `-ad` to pop the "Add to archive" dialog
     // instead of running silently.
     let is_gui = syntax == "7z-gui" || syntax == "winrar-gui";
-    match syntax.as_str() {
+    match syntax {
         "winrar" | "winrar-gui" => {
             // WinRAR `a` = add to archive; the destination must end with a
             // separator when it doesn't exist yet so WinRAR treats it as a
@@ -5632,5 +5705,195 @@ mod recursion_tests {
             "a link must be recorded so the user can be told it was skipped"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Archive tools: the backend, not the webview, picks the executable ──
+
+    fn tool(id: &str, exe: &str, syntax: &str) -> ArchiveTool {
+        ArchiveTool {
+            id: id.to_string(),
+            name: "test".to_string(),
+            exe: exe.to_string(),
+            syntax: syntax.to_string(),
+        }
+    }
+
+    #[test]
+    fn tool_lookup_is_an_exact_id_match() {
+        let tools = vec![
+            tool("7zip-7z-gui", r"C:\Program Files\7-Zip\7zG.exe", "7z-gui"),
+            tool("7zip-7z-cli", r"C:\Program Files\7-Zip\7z.exe", "7z-cli"),
+            tool(
+                "winrar-gui",
+                r"C:\Program Files\WinRAR\WinRAR.exe",
+                "winrar-gui",
+            ),
+        ];
+
+        // The id handed back is the only accepted key, and it must resolve to
+        // the executable the backend discovered — not to anything the caller
+        // supplies alongside it.
+        let hit = find_tool_by_id(&tools, "winrar-gui").expect("known id must resolve");
+        assert_eq!(hit.exe, r"C:\Program Files\WinRAR\WinRAR.exe");
+        assert_eq!(hit.syntax, "winrar-gui");
+
+        // Unknown id — the shape an XSS payload would use to smuggle in
+        // `cmd.exe` — is refused.
+        assert!(find_tool_by_id(&tools, r"C:\Windows\System32\cmd.exe").is_none());
+        assert!(find_tool_by_id(&tools, "").is_none());
+        assert!(find_tool_by_id(&[], "7zip-7z-cli").is_none());
+
+        // Matching must be exact, not prefix- or case-insensitive: an id that
+        // merely *starts with* a known one, or differs in case, is not a tool.
+        assert!(find_tool_by_id(&tools, "7zip-7z").is_none());
+        assert!(find_tool_by_id(&tools, "7zip-7z-gui-extra").is_none());
+        assert!(find_tool_by_id(&tools, "WINRAR-GUI").is_none());
+        assert!(find_tool_by_id(&tools, " winrar-gui").is_none());
+    }
+
+    #[test]
+    fn unknown_tool_id_is_refused_end_to_end() {
+        // Goes through the real registry + the real resolver. Seed the registry
+        // explicitly instead of letting it run discovery: a drive walk in a
+        // unit test is slow, machine-dependent, and could make this test pass
+        // for the wrong reason (an empty machine refuses every id).
+        {
+            let mut guard = archive_tools_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = vec![tool(
+                "7zip-7z-cli",
+                r"C:\Program Files\7-Zip\7z.exe",
+                "7z-cli",
+            )];
+        }
+
+        // The one id that was discovered resolves to its own executable.
+        let ok = resolve_archive_tool("7zip-7z-cli").expect("discovered id must resolve");
+        assert_eq!(ok.exe, r"C:\Program Files\7-Zip\7z.exe");
+        assert_eq!(ok.syntax, "7z-cli");
+
+        // Anything else — including something shaped like a path to a real
+        // program — is refused even though the registry is populated.
+        for bogus in [
+            r"C:\Windows\System32\cmd.exe",
+            "no-such-tool-id",
+            "7zip-7z-gui",
+            "",
+        ] {
+            let err = resolve_archive_tool(bogus)
+                .expect_err("an id outside the registry must be refused");
+            assert!(
+                err.contains("未知的压缩工具"),
+                "unexpected error shape for {bogus:?}: {err}"
+            );
+        }
+
+        let mut guard = archive_tools_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.clear();
+    }
+
+    /// Static assertion for the layer a behavioural test cannot reach: the two
+    /// commands' *parameter lists*. Both used to accept `tool_exe` + `syntax`
+    /// straight from the frontend, which is arbitrary-program execution once
+    /// the webview is compromised — a table test on `find_tool_by_id` would stay
+    /// green even if someone re-added the parameters and kept resolving via the
+    /// registry for the happy path.
+    ///
+    /// This is the "change the implementation but not the call site" case, in
+    /// the security direction: the guard has to be on the signature, not on the
+    /// body.
+    #[test]
+    fn archive_commands_no_longer_accept_an_executable_from_the_frontend() {
+        let src = include_str!("lib.rs");
+
+        for fname in ["fn extract_archive(", "fn add_to_archive("] {
+            let start = src
+                .find(fname)
+                .unwrap_or_else(|| panic!("{fname} must exist"));
+            // The signature runs to the `) -> Result<...> {` that opens the body.
+            let rest = &src[start..];
+            let end = rest
+                .find(") -> Result<")
+                .unwrap_or_else(|| panic!("{fname} signature must be terminated"));
+            let sig = &rest[..end];
+
+            // Assembled from fragments: a literal here would make this
+            // assertion match its own needle.
+            let exe_param = ["tool_", "exe: String"].concat();
+            assert!(
+                !sig.contains(&exe_param),
+                "{fname} must not take an executable path from the frontend — \
+                 a compromised webview could run any program with full user \
+                 rights. Take tool_id and resolve it via resolve_archive_tool, \
+                 got signature: {sig}"
+            );
+            let syntax_param = ["syntax", ": String"].concat();
+            assert!(
+                !sig.contains(&syntax_param),
+                "{fname} must not take an argument-syntax selector from the \
+                 frontend either — it switches which parameter template runs, \
+                 got signature: {sig}"
+            );
+            // And it must actually resolve through the registry.
+            assert!(
+                sig.contains("tool_id: String"),
+                "{fname} must take a tool_id so the executable comes from the \
+                 backend registry, got signature: {sig}"
+            );
+        }
+
+        // Belt-and-braces: the bodies must source the exe from the resolved
+        // tool, never from a parameter.
+        assert!(
+            src.contains("let tool = resolve_archive_tool(&tool_id)?;"),
+            "both commands must resolve tool_id through resolve_archive_tool"
+        );
+    }
+
+    /// The other half of that contract: the frontend must actually *send* the
+    /// id. Renaming the backend parameters without touching `api.js` would
+    /// leave every archive action failing at runtime with a missing-argument
+    /// error — invisible to `cargo test` and to `cargo check`, and only
+    /// reported by the user when they right-click an archive.
+    ///
+    /// Read as source text rather than imported, because `api.js` pulls in the
+    /// Tauri IPC layer and cannot be loaded outside a webview.
+    #[test]
+    fn frontend_sends_the_tool_id_and_nothing_else() {
+        let api = include_str!("../../src/api.js");
+
+        for cmd in ["extract_archive", "add_to_archive"] {
+            let start = api
+                .find(&format!("invoke(\"{cmd}\""))
+                .unwrap_or_else(|| panic!("api.js must invoke {cmd}"));
+            let rest = &api[start..];
+            let end = rest.find("});").expect("invoke call must be terminated") + 3;
+            let call = &rest[..end];
+
+            assert!(
+                call.contains("toolId"),
+                "{cmd} must be sent a toolId — the backend resolves the \
+                 executable from its own registry, got:\n{call}"
+            );
+            // Fragments again: a literal would make this match its own needle.
+            for banned in [["tool", "Exe"].concat(), ["syn", "tax"].concat()] {
+                assert!(
+                    !call.contains(&banned),
+                    "{cmd} must not send `{banned}` from the frontend, got:\n{call}"
+                );
+            }
+        }
+
+        // The two call sites in FilePanel.vue must pass the id, not the exe.
+        let panel = include_str!("../../src/components/FilePanel.vue");
+        for call in [
+            "addToArchive(sources, baseDir, folderName, tool.id)",
+            "extractArchive(fullArchive, destDir, tool.id, mode, wait)",
+        ] {
+            assert!(panel.contains(call), "FilePanel.vue must call `{call}`");
+        }
     }
 }
