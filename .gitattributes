@@ -1,0 +1,29 @@
+# 行尾策略：让仓库自描述，不再依赖全局 core.autocrlf
+#
+# 背景：本仓库原先没有 .gitattributes，全靠用户全局的 core.autocrlf=true 兜底。
+# 但仓库内又设了 core.autocrlf=false —— 两者冲突时，git 会对同一文件按两套
+# 规则解释 LF/CRLF，于是出现「git diff 输出为空、git status 却显示 M」的
+# 假改动（内容哈希其实完全一致）。scripts/cargo-check.sh 每次都冒出来，
+# 就是这个原因，不是有人改了它。
+#
+# 有了本文件后，转换规则以这里为准，全局设置不再影响本仓库。
+
+# ── 默认：仓库内一律 LF ──
+# 索引与工作区都保持 LF，跨平台一致，shell 脚本 (.sh) 在 Git Bash 下不会被
+# CRLF 弄出「bad interpreter: /usr/bin/env bash^M」。
+* text=auto eol=lf
+
+# ── 例外：Windows 批处理必须是 CRLF ──
+# cmd.exe 按字节而非字符计算行偏移，LF 的 .bat 会在长行处被从中间切断，
+# 报出莫名其妙的「xxx 不是内部或外部命令」。.ps1 同理（PowerShell 5.1）。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# ── 二进制：禁止任何转换 ──
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.miora binary
