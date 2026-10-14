@@ -17,6 +17,10 @@
 const fs = require("fs");
 const path = require("path");
 
+// Shared with the pure-logic test scripts (ESM side imports the .cjs build).
+// Kept here rather than duplicated: a second copy is a second thing to fix.
+const { stripComments } = require("./stripComments.cjs");
+
 const ROOT = path.resolve(__dirname, "..");
 const SRC = path.join(ROOT, "src");
 
@@ -51,11 +55,7 @@ function read(file) {
 }
 
 // Strip comments so a mention inside prose isn't mistaken for a call site.
-function stripComments(src) {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .replace(/(^|[^:])\/\/[^\n]*/g, (m, p1) => p1 + " ".repeat(m.length - p1.length));
-}
+// Imported from ./stripComments.cjs — do NOT re-add a local copy.
 
 // ── Check 1: vue API imports ──
 

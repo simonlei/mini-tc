@@ -109,6 +109,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
 import { previewLands } from "../previewGate.js";
 import { decodeHeic, decodeHeicFrame, pixelsToBlob } from "../heicDecoder.js";
+import { formatBytes as formatSize } from "../format.js";
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
 // Vite web build). The browser build is pure-JS (uses a browser jszip) and
@@ -323,14 +324,6 @@ const typeLabel = computed(() => {
   if (previewType.value === "text") return "TEXT";
   return "PREVIEW";
 });
-
-function formatSize(bytes) {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const val = bytes / Math.pow(1024, i);
-  return val.toFixed(i === 0 ? 0 : 1) + " " + units[i];
-}
 
 function getExtension(name) {
   const parts = name.split(".");

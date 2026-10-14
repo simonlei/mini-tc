@@ -163,6 +163,7 @@ import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from "vue"
 import { startNativeDrag } from "../api.js";
 import { entryPath, isSearchPath, entryKey } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
+import { formatBytes as formatSize } from "../format.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -1015,14 +1016,6 @@ function onKeydown(e) {
       }
     }
   }
-}
-
-function formatSize(bytes) {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const val = bytes / Math.pow(1024, i);
-  return val.toFixed(i === 0 ? 0 : 1) + " " + units[i];
 }
 
 function formatDate(ts) {

@@ -5,7 +5,7 @@
       <span class="vp-icon">🎬</span>
       <span class="vp-title" :title="fileName">{{ fileName }}</span>
       <span class="vp-meta" v-if="!isExternalOnly && !externalFallback">
-        <template v-if="resW && resH">{{ resW }}×{{ resH }} · </template>{{ fmtTime(duration) }}<template v-if="fileBytes"> · {{ fmtSize(fileBytes) }}</template>
+        <template v-if="resW && resH">{{ resW }}×{{ resH }} · </template>{{ fmtTime(duration) }}<template v-if="fileBytes"> · {{ fmtSize(fileBytes, "") }}</template>
       </span>
       <button class="vp-btn icon" @click="toggleFullscreen" title="全屏 (F)">⛶</button>
       <button class="vp-btn icon" @click="$emit('close')" title="关闭 (Esc)">✕</button>
@@ -132,6 +132,7 @@ import { loadConfig, saveConfig } from "../api.js";
 import { listDirectory, getParentDir, joinPath, openFile } from "../api.js";
 import { matches, markHandled } from "../shortcuts.js";
 import { autoplayGate } from "../autoplayGate.js";
+import { formatBytes as fmtSize } from "../format.js";
 
 const props = defineProps({
   filePath: { type: String, required: true },
@@ -252,13 +253,6 @@ function fmtTime(s) {
   const ss = String(sec).padStart(2, "0");
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
-function fmtSize(bytes) {
-  if (!bytes) return "";
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + " " + u[i];
-}
-
 // ── Playback controls ──
 function togglePlay() {
   const v = videoEl.value;

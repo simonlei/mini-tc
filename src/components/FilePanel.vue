@@ -106,6 +106,7 @@ import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSi
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { loadLands, createSpinner } from "../loadGate.js";
 import { cancelSearch, startSearch } from "../api.js";
+import { formatBytes } from "../format.js";
 import {
   isHiddenShown,
   setHiddenShown,
@@ -1361,14 +1362,6 @@ function onSelect(entries, active) {
 const selectedSize = computed(() =>
   selectedEntries.value.reduce((sum, e) => sum + (e.is_dir ? 0 : (e.size || 0)), 0)
 );
-
-function formatBytes(bytes) {
-  if (!bytes || bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-  const v = bytes / Math.pow(1024, i);
-  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
-}
 
 // Mark the given entry names as "cut" (pending move) so FileList can ghost them.
 function setCutNames(names) {

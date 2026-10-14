@@ -142,6 +142,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import { pathExists, expandPath } from "../api.js";
+import { formatBytes } from "../format.js";
 import BookmarkMenu from "./BookmarkMenu.vue";
 
 const props = defineProps({
@@ -318,30 +319,18 @@ function driveLabel(d) {
 }
 
 // Human-readable byte size (mirrors formatting used elsewhere in the app).
-function formatBytes(bytes) {
-  if (!bytes || bytes <= 0) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  let i = 0;
-  let v = bytes;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
-}
-
 // Compact label shown inside the dropdown for each drive: letter + free space.
 function driveOptionLabel(d) {
   const letter = driveLabel(d);
   if (!d.free_bytes) return letter;
-  return `${letter}  ·  ${formatBytes(d.free_bytes)}`;
+  return `${letter}  ·  ${formatBytes(d.free_bytes, "—")}`;
 }
 
 // Tooltip with both free and total capacity for a drive.
 function driveTitle(d) {
   const letter = driveLabel(d);
   if (!d.free_bytes && !d.total_bytes) return letter;
-  return `${letter}：${formatBytes(d.free_bytes)} 可用 · ${formatBytes(d.total_bytes)} 总容量`;
+  return `${letter}：${formatBytes(d.free_bytes, "—")} 可用 · ${formatBytes(d.total_bytes, "—")} 总容量`;
 }
 
 // ── Navigation ──

@@ -161,6 +161,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { startSearch, cancelSearch, openFile } from "../api.js";
+import { formatBytes as formatSize } from "../format.js";
 import ContextMenu from "./ContextMenu.vue";
 
 const props = defineProps({
@@ -489,14 +490,6 @@ function onCtxSelect(item) {
 }
 
 // ── Formatting ──
-
-function formatSize(bytes) {
-  if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-  const v = bytes / Math.pow(1024, i);
-  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
-}
 
 function formatDate(ms) {
   if (!ms) return "";

@@ -267,6 +267,7 @@ import SearchDialog from "./components/SearchDialog.vue";
 import BatchRenameDialog from "./components/BatchRenameDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir, undoTrashPeek, undoTrashDelete } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
+import { formatBytes } from "./format.js";
 import { splitName, validateName } from "./renameRules.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import { loadBookmarks, findBookmark, addBookmark, removeBookmark } from "./bookmarks.js";
@@ -1134,14 +1135,6 @@ const progress = ref({
 // reflects the actual operation — important now that the OS clipboard (not the
 // internal buffer) is the source of truth, e.g. a cut made in Explorer.
 const pasteOperation = ref("copy");
-
-function formatBytes(bytes) {
-  if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-  const v = bytes / Math.pow(1024, i);
-  return (i === 0 ? String(bytes) : v.toFixed(1)) + " " + units[i];
-}
 
 // ── Confirm dialog (e.g. same-name conflict on paste) ──
 const confirmDialog = ref({
