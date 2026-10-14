@@ -9,7 +9,6 @@
 
 ## P1 — 真 bug / 竞态 / 泄漏 / 明显性能
 
-- [ ] **修复：预览状态的两个 watcher 在 `await` 后无条件写 preview，快速方向键会预览到旧文件** — `App.vue:1696-1743` / `1746-1783` / `999-1014`。`const fullPath = await entryPath(...)` 之后直接写 `previewFilePath`。`showFilePreview`（`1498`）还有第二层：await 之后才读 `previewPanel.value = activePanel...`（`1500`），await 期间用户按了 Tab 就会把预览挂到错误的一侧。修法：抽自增 `previewToken`，每个 await 前后校验；`previewPanel` 由调用方传入确定的 panelId。
 - [ ] **修复：`onDelete` 循环内每次 `await` 之后重新读 `activeTab.value.path` 与 `entries.value`** — `FilePanel.vue:1367-1416`。删除几秒内用户完全可以点进别的目录或切标签：循环里 `activeTab.value.path` 指向新目录、1390 的 filter 作用在错误列表上（真正的删除结果不反映到任何面板），1416 把**新目录**的条目数当 `remainingCount` 上报，`onPanelDeleted` 可能因此关掉一个毫不相关的预览。修法：入口处快照 `(tabId, dir, list)`，循环内只用快照；写入前校验 tab 是否已切换。
 - [ ] **修复：`onCtxMenu` 两个 await 之间无序号，慢的旧右键会覆盖新右键的可执行判定** — `FilePanel.vue:1639-1659`。首次右键要扫盘探测压缩工具（可能数秒），用户在 B 行右键后 A 的流程才落地，把 `ctxIsExecutable` 改成 A 的结果，而菜单已按 B 弹出。修法：`let ctxSeq = 0`，每个 await 后校验；`handleCtxSelect` 的 `activeTab.value?.path`（`1666`）在菜单打开时快照。
 - [ ] **修复：`VideoPreview.loadVideo()` 与 `detectSubtitles()` 无并发守卫 → 字幕串台** — `VideoPreview.vue:655-670/672-695`。`onMounted` 的 `await loadPlayerConfig()` 未 resolve 时若 `filePath` 变了，watcher 的 `loadVideo()` 先跑、随后 `onMounted` 又跑一次；两次各自 `await detectSubtitles()`，而 `loadSubtitleByPath` 会在新 `loadVideo()` 已执行 `subtitleTracks.value = []` 之后才 resolve，把**旧文件目录**的字幕推进新文件的轨道列表。修法：同一套 `loadToken`。

@@ -309,6 +309,34 @@ npm test                       # 只跑单元测试
   顺带一处值得记的窗口：`await entryPath(...)` 期间用户可能已关掉预览，await 后的
   快照一律不可信；而「关闭预览」会 unmount 播放器、`loadVideo()` 根本不会跑 ——
   撤销必须做在**事件发生处**（`closePreview` 里 `arm(null)`），不能等「状态不匹配时」。
+- `scripts/preview-request.test.mjs` —— 打开预览的并发守卫（`src/previewRequest.js`）。
+
+  与上面两条同源但层次不同：`previewGate` 管的是**预览组件内部**（HEIC 解码），
+  这条管的是**打开预览的入口**。四个入口（选中项 watcher、activePanel watcher、
+  `playNextVideo`、`showFilePreview`）都要先 `await entryPath(...)` 把条目解析成绝对
+  路径才能写 `preview*` 状态，而那是一次 IPC 往返 —— 期间用户完全可以连按 ↓ 翻页、
+  切面板、进别的目录甚至按 Esc。先发的旧结果落到界面上就是**标题写着 B、内容是 A**。
+
+  第二个 bug 在 `showFilePreview` 更深一层：它在 await **之后**才读
+  `previewPanel.value = activePanel.value === "left" ? ...`，所以 await 期间按一下 Tab
+  就会把预览挂到用户已经离开的那一侧。现在 panel 由调用方作为参数传下去。
+
+  判据仍是「目的地还是不是它」，不是请求序号（理由同 `loadGate.js`：`entryPath` 不做
+  同 key 折叠，但序号模型在折返时同样会让谁都不落地）。快照记四项 —— 源面板、活动面板、
+  目录、条目身份（`entryKey`），四项全等才允许落地。三条通用结论：
+
+  - 🚨 **少比一项就等于漏掉一种真实操作**。「只比条目身份」会漏掉切面板与换目录；只比
+    目录 + 条目会漏掉「同名不同目录」（搜索结果页里同名是常态）。变异测试里逐项删过，
+    每删一项都有断言变红。
+  - 🚨 **空快照必须判为不可落地**。`makePreviewRequest()` 两个空对象本来就全等，
+    让它返回 `true` 等于把「面板此刻没有选中项」（导航后）当成「目的地没变」，调用点
+    会因此打开一个空预览。这条是写测试时真发现的缺陷，不是预防性条款。
+  - ⚠️ **纯逻辑断言抓不住「改实现不改调用点」**：把守卫调用从 App.vue 里删掉，
+    判据测试仍全绿。所以额外钉了静态断言 —— 剥注释后逐个数出**直接 await entryPath
+    的落地点**（4 个）与**转发给 showFilePreview 的调用点**（4 个），前者必须查守卫、
+    后者必须传 `panelId`，并断言守卫出现在写入之前（顺序，不是「存在即可」）。
+    四个变异（判据恒 true / 漏比活动面板 / 删守卫调用 / `panelId` 改回读 `activePanel`）
+    都被抓住。
 - `scripts/config-writer-check.mjs` —— 配置写入的落地顺序（`src/configWriter.js`）。
 
   这条测的是**顺序**而非完整性 —— 完整性由后端 `write_atomic` 保证，前端补不了也无需补。

@@ -267,6 +267,7 @@ import SearchDialog from "./components/SearchDialog.vue";
 import BatchRenameDialog from "./components/BatchRenameDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir, undoTrashPeek, undoTrashDelete } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
+import { makePreviewRequest, previewRequestLands } from "./previewRequest.js";
 import { formatBytes } from "./format.js";
 import { splitName, validateName } from "./renameRules.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
@@ -1002,19 +1003,26 @@ function openVideo(payload) {
 async function playNextVideo(payload) {
   if (!previewVisible.value || previewKind.value !== "video") return;
   const source = previewPanel.value === "left" ? "right" : "left";
-  const panel = source === "left" ? leftPanel.value : rightPanel.value;
+  const panel = panelRefById(source);
   const currentName = payload?.name;
   if (!currentName) return;
   const next = panel?.getNextVideoEntry?.(currentName);
   if (!next) return; // last video in the list → stop, no loop
   const dir = panel?.currentPath;
   if (!dir) return;
+  // Snapshot before the await: `ended` arrives while the clip is still selected,
+  // so the "destination" is the source panel showing that clip. If the user
+  // arrows away, switches panel or navigates before the path resolves, this
+  // advance no longer describes what they are watching and must be dropped —
+  // including its playback authorisation (see below).
+  const request = capturePreviewRequest(source, panel?.selectedEntry);
   const p = await entryPath(next, dir);
   // The await above is a window in which the user can close the preview (or
   // switch away). Landing now would unmount VideoPreview without ever running
   // loadVideo(), stranding the authorisation for the next manual open — so
   // re-check before arming.
   if (!previewVisible.value || previewKind.value !== "video") return;
+  if (!previewStillWanted(request)) return;
   // Authorise playback for THIS clip only. Every bail-out above leaves the
   // gate unarmed — previously the child armed itself on `ended` and every one
   // of those bail-outs stranded the flag, so the next clip the user picked
@@ -1045,6 +1053,49 @@ function onPanelActivate(panelId) {
 
 function getActivePanelRef() {
   return activePanel.value === "left" ? leftPanel.value : rightPanel.value;
+}
+
+function panelRefById(panelId) {
+  return panelId === "left" ? leftPanel.value : rightPanel.value;
+}
+
+// ── Preview request snapshots (see src/previewRequest.js) ──
+//
+// Every path that opens a preview must `await entryPath(...)` before it can
+// write preview* state, and that await is a window in which the user can flip
+// through files, switch panels, navigate elsewhere or close the preview. So each
+// entry point takes a snapshot of "the row this request is for" up front, and
+// re-reads the same destination after the await: the result may only land if the
+// destination is still exactly that row.
+//
+// Note the panel is captured as a parameter rather than read from `activePanel`
+// after the await — that read is the second half of the original bug: pressing
+// Tab while `showFilePreview` was in flight attached the preview to whichever
+// side had become active by then, not the side the file was selected in.
+function capturePreviewRequest(panelId, entry) {
+  return makePreviewRequest({
+    panelId,
+    activePanelId: activePanel.value,
+    dir: panelRefById(panelId)?.currentPath || "",
+    entry,
+  });
+}
+
+// Re-read the destination `request` was aimed at. `panelId` is taken from the
+// request itself so this can never drift onto a different panel than the one
+// whose state we compare against.
+function previewStillWanted(request) {
+  if (!request) return false;
+  const panel = panelRefById(request.panelId);
+  return previewRequestLands(
+    request,
+    makePreviewRequest({
+      panelId: request.panelId,
+      activePanelId: activePanel.value,
+      dir: panel?.currentPath || "",
+      entry: panel?.selectedEntry,
+    })
+  );
 }
 
 // The panel FOCUS is not on — i.e. the destination for "copy/move to the other
@@ -1632,9 +1683,17 @@ function showToast(text, type = "info") {
 // Show a normal (image/text) preview on the opposite panel.
 // `asText = true` forces a plain-text read (used for user-added text-preview
 // extensions that aren't built-in text types).
-async function showFilePreview(entry, path, asText = false) {
+//
+// `panelId` is the panel the entry was selected in and must be passed in rather
+// than read from `activePanel` after the await — see capturePreviewRequest.
+async function showFilePreview(entry, path, asText = false, panelId = activePanel.value) {
+  const request = capturePreviewRequest(panelId, entry);
   const fullPath = await entryPath(entry, path);
-  previewPanel.value = activePanel.value === "left" ? "right" : "left";
+  // The user may have moved on while we were resolving the path (flipped to
+  // another row, switched panels, navigated, or closed the preview). Landing now
+  // would show one file while the list highlights another.
+  if (!previewStillWanted(request)) return;
+  previewPanel.value = panelId === "left" ? "right" : "left";
   previewKind.value = "file";
   previewFilePath.value = fullPath;
   previewFileName.value = entry.name;
@@ -1644,8 +1703,10 @@ async function showFilePreview(entry, path, asText = false) {
 }
 
 // Show a "format not supported" placeholder on the opposite panel.
-function showUnsupportedPreview(entry) {
-  previewPanel.value = activePanel.value === "left" ? "right" : "left";
+// Synchronous, so there is no await to guard — but the panel still comes from
+// the caller for the same reason as in showFilePreview.
+function showUnsupportedPreview(entry, panelId = activePanel.value) {
+  previewPanel.value = panelId === "left" ? "right" : "left";
   previewKind.value = "unsupported";
   previewFileName.value = entry.name;
   previewUnsupportedIsDir.value = !!entry.is_dir;
@@ -1663,11 +1724,12 @@ async function onPreviewAsText() {
     textPreviewExtensions.value = [...textPreviewExtensions.value, ext];
     await saveTextPreviewConfig();
   }
-  const panel = getActivePanelRef();
+  const panelId = activePanel.value;
+  const panel = panelRefById(panelId);
   const entry = panel?.selectedEntry;
   const path = panel?.currentPath;
   if (!entry || !path) return;
-  await showFilePreview(entry, path, true);
+  await showFilePreview(entry, path, true, panelId);
 }
 
 async function togglePreview() {
@@ -1679,8 +1741,10 @@ async function togglePreview() {
   const panel = getActivePanelRef();
   const entry = panel?.selectedEntry;
   if (!entry) return;
+  const panelId = activePanel.value;
+  const request = capturePreviewRequest(panelId, entry);
   if (entry.is_dir) {
-    showUnsupportedPreview(entry);
+    showUnsupportedPreview(entry, panelId);
     return;
   }
 
@@ -1690,16 +1754,17 @@ async function togglePreview() {
   const ext = entry.extension.toLowerCase();
   if (VIDEO_EXTENSIONS.includes(ext)) {
     const fullPath = await entryPath(entry, path);
-    openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
+    if (!previewStillWanted(request)) return;
+    openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: panelId });
     return;
   }
 
   if (!isPreviewableExt(ext)) {
-    showUnsupportedPreview(entry);
+    showUnsupportedPreview(entry, panelId);
     return;
   }
 
-  await showFilePreview(entry, path, isTextPreviewExt(ext));
+  await showFilePreview(entry, path, isTextPreviewExt(ext), panelId);
 }
 
 function closePreview() {
@@ -1842,17 +1907,24 @@ watch(
   async (entry) => {
     if (!previewVisible.value) return;
     if (!entry) return; // keep the current preview when nothing is selected (e.g. after navigating to another directory)
+    // Snapshot BEFORE the first await. Every `await` below is a window in which
+    // the user can keep arrowing through the list; without this guard the slow
+    // earlier request lands last and the preview ends up on a file the user has
+    // already arrowed past (title and content disagree).
+    const panelId = activePanel.value;
+    const request = capturePreviewRequest(panelId, entry);
     if (entry.is_dir) {
-      showUnsupportedPreview(entry);
+      showUnsupportedPreview(entry, panelId);
       return;
     }
 
     const ext = entry.extension.toLowerCase();
     if (VIDEO_EXTENSIONS.includes(ext)) {
-      const panel = getActivePanelRef();
+      const panel = panelRefById(panelId);
       const path = panel?.currentPath;
       if (!path) return;
       const fullPath = await entryPath(entry, path);
+      if (!previewStillWanted(request)) return;
       if (previewVisible.value && previewKind.value === "video") {
         // Already in video preview → just swap the source without remounting.
         previewFilePath.value = fullPath;
@@ -1866,20 +1938,20 @@ watch(
         // just-opened video preview (the old image snaps back). The preview
         // panel is always the opposite of the source panel, so openVideo keeps
         // it on the same side and we only need to swap the kind.
-        openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
+        openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: panelId });
       }
       return;
     }
     if (!isPreviewableExt(ext)) {
-      showUnsupportedPreview(entry);
+      showUnsupportedPreview(entry, panelId);
       return;
     }
 
-    const panel = getActivePanelRef();
+    const panel = panelRefById(panelId);
     const path = panel?.currentPath;
     if (!path) return;
 
-    await showFilePreview(entry, path, isTextPreviewExt(ext));
+    await showFilePreview(entry, path, isTextPreviewExt(ext), panelId);
   }
 );
 
@@ -1887,11 +1959,16 @@ watch(
 watch(activePanel, async () => {
   if (!previewVisible.value) return;
 
-  const panel = getActivePanelRef();
+  // Same guard as the selection watcher: switching panels is itself an async
+  // sequence (resolve the new panel's entry path), and the user can switch back
+  // or start arrowing before it lands.
+  const panelId = activePanel.value;
+  const request = capturePreviewRequest(panelId, getActivePanelRef()?.selectedEntry);
+  const panel = panelRefById(panelId);
   const entry = panel?.selectedEntry;
   if (!entry) return;
   if (entry.is_dir) {
-    showUnsupportedPreview(entry);
+    showUnsupportedPreview(entry, panelId);
     return;
   }
 
@@ -1900,6 +1977,7 @@ watch(activePanel, async () => {
     const path = panel?.currentPath;
     if (!path) return;
     const fullPath = await entryPath(entry, path);
+    if (!previewStillWanted(request)) return;
     if (previewVisible.value && previewKind.value === "video") {
       previewFilePath.value = fullPath;
       previewFileName.value = entry.name;
@@ -1908,19 +1986,19 @@ watch(activePanel, async () => {
       // Switch from image/text/unsupported to video without closePreview()
       // (see the selection-watch branch for why — closePreview's nextTick
       // re-selects the old file and clobbers the new video preview).
-      openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: activePanel.value });
+      openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: panelId });
     }
     return;
   }
   if (!isPreviewableExt(ext)) {
-    showUnsupportedPreview(entry);
+    showUnsupportedPreview(entry, panelId);
     return;
   }
 
   const path = panel?.currentPath;
   if (!path) return;
 
-  await showFilePreview(entry, path, isTextPreviewExt(ext));
+  await showFilePreview(entry, path, isTextPreviewExt(ext), panelId);
 });
 
 // ── Window focus regain ──
