@@ -384,6 +384,17 @@ npm test                       # 只跑单元测试
     的 `ipc:` 漏了会静默打死全部 IPC，`script-src` 少了 `'wasm-unsafe-eval'` 会坏 HEIC），
     `object-src`/`form-action` 保持 `'none'`，`assetProtocol` 未被关掉，且 `csp` 不是 `null`。
 
+  ⚠️ **`jsdom` 锁在 `~28.1.0`，这个锁是承重的**（`package.json`）。jsdom 30 要求
+  node `^22.22.2` 并拉 `whatwg-url` 17（要求 `^22.14.0`），而 `dev.bat` 可能选中 node
+  22.12.0 —— 在那个版本上这套测试**在 import 阶段就整体崩掉**（不是某条断言失败）：
+  undici 的 `decompress.js` 调用 `zlib.createZstdDecompress`（node 22.15+ 才有），
+  那里它是 `undefined`。jsdom 28 拉的是 `whatwg-url` 16，其 engines（`^22.12.0`）
+  正好容纳该版本。
+  ⚠️ **陷阱在于 `undici` 7.x 声明的是 `engines: >=20.18.1`**，纸面上 22.12.0 完全受支持。
+  **engines 是声明不是保证** —— 新增依赖后要用启动器实际会选中的那个 node 实跑一遍，
+  别只看告警文本（或只看它没告警）。实测：jsdom@30 在 22.12.0 上产生 45 条 EBADENGINE
+  且测试崩溃，jsdom@28 为 0 条且 90 条断言全过、对照臂数字不变。
+
   ⚠️ **这条测试的必要组成部分是那个对照臂**：同一批载荷再过一遍**旧黑名单实现**，
   要求它至少漏掉 3 个（实测漏 **17/33**）。没有它，一个「净化器彻底坏了」的 harness
   照样能全绿 —— 而这正是安全测试最常见的假阳性。另有三次变异验证：关掉 `data:` 钩子

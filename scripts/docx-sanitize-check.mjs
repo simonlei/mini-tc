@@ -10,11 +10,24 @@
 //      "the bug looks like it does not exist".
 //
 // Run: node scripts/docx-sanitize-check.mjs
+//
+// ⚠️ jsdom is pinned to `~28.1.0` in package.json, and that pin is load-bearing.
+// jsdom 30 requires node ^22.22.2 and pulls whatwg-url 17 (node ^22.14.0), while
+// dev.bat can select node 22.12.0 -- on which the whole suite dies at import
+// time, not with a test failure: undici's decompress.js calls
+// `zlib.createZstdDecompress` (node 22.15+), which is `undefined` there.
+// jsdom 28 pulls whatwg-url 16, whose engines (`^22.12.0`) admit that version.
+//
+// Note the trap: undici 7.x declares `engines: >=20.18.1`, so 22.12.0 looks
+// supported on paper. **engines is a declaration, not a guarantee** -- verify a
+// dependency actually runs on the node this repo's launcher picks, rather than
+// trusting the warning text (or its absence).
 
 import { JSDOM } from "jsdom";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+// jsdom is pinned to ~28.1.0 deliberately -- see the node-version note below.
 // dompurify's default export is a FACTORY under plain node (no DOM at import
 // time), so sanitize() would be undefined. Seed the globals it reads at
 // construction, then import the module under test.
