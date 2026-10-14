@@ -29,6 +29,12 @@
   - **多帧 HEIC 播放（canvas）**：容器里有多个 top-level 图元时（连拍 / 序列 / Live Photo）走动画播放，`<canvas>` + `putImageData` 逐帧绘制（不用 `<img>`：换 src 会闪且每帧泄漏一个 objectURL）。首帧随初始解码一起返回，UI 立即有画面；其余帧**按需向 Worker 索取**（`decodeHeicFrame(index)`），Worker 缓存已解析的容器避免每次重解析（实测 19 ms/次）。**帧率不靠猜**：读每帧的 `heif_image_get_duration()`，真有时序就按真实速度播，只有文件完全没有时序数据时才回落 100 ms/帧。底部有播放/暂停按钮和 `当前/总帧数` 计数；换文件与组件卸载都会停掉循环
     - 🚨 **循环令牌（`animToken`）必做**：`clearTimeout` 只能杀当前那个定时器，若某帧正在 `await` 解码，换文件时它回来后还会继续调 `decodeHeicFrame()`，对着 Worker 里已被替换的容器反复取帧 —— 表现为方向键快速切文件后 canvas 自己乱跳。每次启停递增令牌，旧循环回来一比对即退出。帧解码失败时**结束循环而非空转**，否则卡在同一帧反复报错
   - **为什么不用 heic2any**（已移除）：它内嵌的是 emscripten **asm.js** 版 libheif，YUV→RGBA 转换跑在 JS 解释器上。实测 12MP 手机照片中位数：**asm.js 1047 ms vs wasm 422 ms（2.5x）**。⚠️ `libheif-js` 的 package.json `main` 指向的正是 asm.js 版（`libheif/libheif.js`），必须显式引 `libheif-wasm/libheif-bundle.mjs` 才拿到 wasm
+  - 🚨 **docx 预览是本项目唯一的内容注入面，已按「不可信输入」处理**（`src/docxSanitize.js` + `tauri.conf.json` 的 `csp`）。mammoth 的输出经 `v-html` 进 webview，而 .docx 就是一包攻击者可选的 XML。在 Tauri 里**同源导航等价于任意命令执行**——`window.__TAURI_INTERNALS__` 在主框架所在源上一直可用，所以「让 webview 导航到攻击者的 HTML」就等于拿到了完整 IPC（读文件、删文件、执行命令）。原先的净化是**黑名单**（只黑 `<script>` / `on*` / `javascript:` 前缀），`<a href="data:text/html,<script>…">` 原样保留，用户一点即中招。现在改为**显式白名单**（`ALLOWED_TAGS`/`ALLOWED_ATTR` 只放行 mammoth 的输出子集，`FORBID_TAGS`/`FORBID_ATTR` 再兜一层），交给 DOMPurify 而非手写遍历 —— 绕过面（mutation XSS、命名空间混淆、解析器差异）正是每年被重新挖出来的那一类
+    - 🚨 **`ALLOWED_URI_REGEXP` 不是最后一道关**：实测 DOMPurify 3.4.17 在正则之后还有一条内建放行（`purify.es.mjs:2164`）—— 只要标签在 `DATA_URI_TAGS` 内，`src`/`href`/`xlink:href` 上的**任意** `data:` 值都直接放行，而该内建集合**包含 `img`**。也就是说 `<img src="data:text/html;base64,…">` 能活过一条明确拒绝 `data:` 的正则。`ADD_DATA_URI_TAGS` 也救不了：它经 `_resolveSetOption(..., { base: DEFAULT_DATA_URI_TAGS })` 是**并集**语义，传 `[]` 不会缩小集合。所以 `data:` 的判定只能自己做（本项目用 `uponSanitizeAttribute` 钩子，且**用完立刻摘掉** —— 钩子挂在共享实例上，泄漏出去会顺手放宽别处的 `sanitize()`）
+    - **`data:` 只对 `img@src` 放行，且必须匹配 `data:image/(png|jpeg|jpg|gif|webp|bmp|x-icon);base64,`**（docx 内嵌图片的唯一正当需求）。`image/svg+xml` **不在**内 —— SVG 是脚本上下文，放它等于把刚补上的洞重新打开。判定前先剥掉 C0 控制字符：浏览器解析 scheme 时会忽略它们，`data:\ttext/html` 与 `java\tscript:` 都是活的绕过
+    - **CSP 是第二道防线**（`csp` + 单独的 `devCsp`，后者含 vite 的 `ws://localhost:5173`，否则 HMR 会连不上）：`object-src 'none'`、`form-action 'none'`、`base-uri 'self'`，图片来源显式列出 asset 协议 / `blob:` / `data:`。⚠️ Tauri **不会**自动补 `ipc:` / `http://ipc.localhost`（官方注释里是手写的），漏一条会静默打死全部 IPC
+    - ⚠️ **`script-src` 必须留 `'wasm-unsafe-eval'`**：libheif 的 wasm 以 base64 内嵌并直接 `WebAssembly` 实例化，CSP 视同 eval，去掉这条 HEIC 预览直接坏
+    - 测试：`scripts/docx-sanitize-check.mjs`（已挂进 `npm test`），33 个攻击载荷 + 结构断言 + CSP 配置守卫。**带对照臂**：同一批载荷过一遍旧黑名单实现，实测漏掉 **17/33** —— 没有这条，任何「全部通过」都可能只是harness 坏了
   - **HEIC 耗时诊断**：每次预览在 devtools 控制台打一张折叠表（`[heic] <文件名> <总耗时> ms`），分 `start / file-read / worker-decode / encoded / ready / painted` 六步，**每文件一张**可左右对比。`worker-decode` 的 note 里进一步拆出 `hevc=Xms`（比特流解码）和 `rgba=Yms`（颜色转换）。失败、翻页中断、超限中止三种情况也会补打（末行标 `failed` / `interrupted` / `aborted`）；多帧文件在 `ready` 步显示 `frame 1/N`
   - **⚠️ libheif-js 的 embind 调用约定（实测，别猜）**：高层 `HeifDecoder.decode()` 拿到的 `HeifImage` 有 `.handle`（原生 handle）和 decoder 的 `.decoder`（`heif_context`），可直接调 `heif_item_get_item_type` / `heif_item_is_item_hidden` / `heif_js_context_get_image_handle(ctx,id)` / `heif_image_handle_release`。但**返回 struct 的函数分两类**：`heif_context_read_from_memory(ctx, buf)`、`heif_context_has_sequence(ctx)` 这类已被 embind 封装，正常传参、返回 `{code, subcode, message}`；而 `heif_image_handle_get_image_tiling` / `decode_image_tile` 等裸导出**必须自己 `_malloc` 传隐藏 sret 指针**再从 `HEAP32` 读，少传会静默返回垃圾值而不报错 —— 极易误判成「API 不可用」（grid 分块解码就走不通这条路，只能靠内嵌缩小版绕过）
   - **⚠️ 剩余慢点**：换成 wasm 后 12MP 仍需约 420 ms，**瓶颈依然是全尺寸 YUV420→RGBA 转换**（HEVC 比特流解码只占 2–10 ms）。根治要靠降采样，但 libheif-js 的高层 API 不暴露尺寸参数（C API 有 `heif_image_scale_image`，但如上所述在 embind 下调不通）。后端 Rust `libheif-rs` 有干净的 `HeifDecodingOptions::max_width`，是后续方向
@@ -230,7 +236,7 @@ npm test                       # 只跑单元测试
 
 改动 `.vue` / `src/*.js` 后跑一次，比等运行时白屏再回头找快得多。
 
-`npm test` 目前覆盖九块前端纯逻辑：
+`npm test` 目前覆盖十块前端纯逻辑：
 
 - `scripts/rename-rules-check.mjs` —— 批量重命名的规则与两阶段执行（含失败回滚）
 - `scripts/selection-remap-check.mjs` —— 文件列表选中态在排序 / 过滤后的重映射。
@@ -360,6 +366,29 @@ npm test                       # 只跑单元测试
     「剥注释后数出全部调用点，逐个必须带参」才抓住。
   - 对照臂的两份旧实现在 **0.5 B 上结果恰好相同**（都是 `512.0 undefined`）——
     别断言「每个旧实现在每个输入上都不同」，那会逼我把正确的对照改成错的。漂移是逐副本的。
+- `scripts/docx-sanitize-check.mjs` —— docx 预览的内容净化与 CSP 配置（`src/docxSanitize.js`）。
+
+  这是唯一一处把**外部内容**渲染进 webview 的地方（mammoth → `v-html`），所以它按
+  攻击面而不是按功能来测：33 个攻击载荷（`data:text/html` 导航、`srcdoc`、`formaction`、
+  `xlink:href`、`svg`/`math` 命名空间、mXSS、控制字符混淆 scheme…），断言不是比对输出
+  字符串，而是**解析回 DOM** 逐个属性检查 —— 比对字符串会被转义顺序之类的无关差异带偏。
+
+  三层验证：
+
+  - **纯逻辑**：`isAllowedInlineImageSrc()` 的作用域（只有 `img@src` 放行 `data:image`）、
+    白名单与黑名单不重叠、合法文档结构与内嵌图片不误伤、幂等、非字符串输入。
+  - **行为**（jsdom 里跑真实 DOMPurify）：载荷逐个过 `sanitizeDocxHtml()`。
+  - **静态断言**：`FilePreview.vue` 确实 `import` 并调用了 `sanitizeDocxHtml`，且旧黑名单
+    已不在（只测纯逻辑的话，「改实现但调用点仍走旧函数」会全绿）。
+  - **CSP 守卫**：`csp` 与 `devCsp` 的每条必需来源都在（附**为什么需要它**：`connect-src`
+    的 `ipc:` 漏了会静默打死全部 IPC，`script-src` 少了 `'wasm-unsafe-eval'` 会坏 HEIC），
+    `object-src`/`form-action` 保持 `'none'`，`assetProtocol` 未被关掉，且 `csp` 不是 `null`。
+
+  ⚠️ **这条测试的必要组成部分是那个对照臂**：同一批载荷再过一遍**旧黑名单实现**，
+  要求它至少漏掉 3 个（实测漏 **17/33**）。没有它，一个「净化器彻底坏了」的 harness
+  照样能全绿 —— 而这正是安全测试最常见的假阳性。另有三次变异验证：关掉 `data:` 钩子
+  → 6 条失败；把许可放宽到任意 `data:image`（含 svg）→ 3 条失败；连合法内嵌图片一起禁
+  → 3 条失败（**攻击侧和正常侧同时被钉住**）。
 
 ## 后端单元测试
 

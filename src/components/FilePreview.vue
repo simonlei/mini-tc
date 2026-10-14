@@ -110,6 +110,7 @@ import { readFilePreview } from "../api.js";
 import { previewLands } from "../previewGate.js";
 import { decodeHeic, decodeHeicFrame, pixelsToBlob } from "../heicDecoder.js";
 import { formatBytes as formatSize } from "../format.js";
+import { sanitizeDocxHtml } from "../docxSanitize.js";
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
 // Vite web build). The browser build is pure-JS (uses a browser jszip) and
@@ -383,40 +384,12 @@ async function copyAll() {
 }
 
 // ── Word (.docx) preview ──
-// mammoth reads the raw OOXML and emits a limited, safe subset of HTML
-// (headings, paragraphs, lists, tables, bold/italic, hyperlinks, images).
-// Even so, we run a defensive sanitizer because the source is user-supplied
-// and parsed XML could carry <script>/on*=/javascript: payloads.
+// mammoth reads the raw OOXML and emits a limited subset of HTML (headings,
+// paragraphs, lists, tables, bold/italic, hyperlinks, images). It still needs
+// sanitizing: the .docx is user-supplied, so its XML is attacker-chosen, and
+// the result lands in the webview via v-html. See ../docxSanitize.js for why
+// this is an allowlist (and why a blacklist was not enough here).
 const MAX_DOCX_BYTES = 25 * 1024 * 1024; // 25 MB cap (mammoth loads the whole file)
-
-// Strip anything that could execute or escape the preview: <script>/<style>/
-// <iframe>/<object>/<embed>/<link>/<meta>, all event-handler attributes, and
-// javascript: URLs in href/src. Returns sanitized HTML string.
-function sanitizeHtml(html) {
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  doc
-    .querySelectorAll("script, style, iframe, object, embed, link, meta")
-    .forEach((el) => el.remove());
-  const walk = (node) => {
-    if (node.nodeType === 1) {
-      for (const attr of Array.from(node.attributes)) {
-        const name = attr.name.toLowerCase();
-        const value = attr.value.trim().toLowerCase();
-        if (name.startsWith("on")) {
-          node.removeAttribute(attr.name);
-        } else if (
-          (name === "href" || name === "src") &&
-          value.startsWith("javascript:")
-        ) {
-          node.removeAttribute(attr.name);
-        }
-      }
-    }
-    node.childNodes.forEach(walk);
-  };
-  walk(doc.body);
-  return doc.body.innerHTML;
-}
 
 async function loadDocxPreview(load) {
   docMessage.value = "";
@@ -438,7 +411,7 @@ async function loadDocxPreview(load) {
     // A 25 MB docx takes seconds to convert; without this the document the
     // user paged away from lands last and replaces the one they are reading.
     if (!load.lands()) return;
-    const html = sanitizeHtml(result.value || "");
+    const html = sanitizeDocxHtml(result.value || "");
     previewContent.value = html;
     previewType.value = "docx";
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
