@@ -319,7 +319,14 @@ fn drive_space(path: &str) -> (u64, u64) {
 }
 
 /// Expand `%ENV_VAR%` placeholders inside a path string into their values.
-fn expand_env_vars(input: &str) -> String {
+///
+/// The environment lookup is injected so the whole expansion is testable
+/// without touching the real process environment (which is neither settable
+/// safely from a parallel test runner nor stable across machines).
+fn expand_env_vars_with<F>(input: &str, lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut result = String::new();
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
@@ -332,13 +339,27 @@ fn expand_env_vars(input: &str) -> String {
             }
             if j < len {
                 let var_name: String = chars[(i + 1)..j].iter().collect();
-                if let Ok(v) = std::env::var(&var_name) {
-                    result.push_str(&v);
+                // An EMPTY name (`%%`) is not a placeholder — it is a literal
+                // the user typed, so it must survive verbatim. Expanding it
+                // would silently blank the path with no visible cause.
+                if !var_name.is_empty() {
+                    if let Some(v) = lookup(&var_name) {
+                        result.push_str(&v);
+                    }
+                } else {
+                    result.push('%');
+                    result.push('%');
                 }
                 i = j + 1;
             } else {
+                // Unterminated placeholder: there is no closing `%`, so the
+                // run to the end of the input is ordinary text. Advance by ONE
+                // character — jumping to `j + 1` skips past `len` and would
+                // DROP the remainder of the path (`%USERPROF` -> `%`), turning
+                // a typo into a silently wrong path instead of a visible
+                // "not found".
                 result.push('%');
-                i = j + 1;
+                i += 1;
             }
         } else {
             result.push(chars[i]);
@@ -346,6 +367,11 @@ fn expand_env_vars(input: &str) -> String {
         }
     }
     result
+}
+
+/// Expand `%ENV_VAR%` placeholders inside a path string into their values.
+fn expand_env_vars(input: &str) -> String {
+    expand_env_vars_with(input, |name| std::env::var(name).ok())
 }
 
 /// Normalize path separators to the platform-native form so that a mixed
@@ -4592,6 +4618,130 @@ mod tests {
         assert!(name_matches(&pats, "main.rs", false));
         assert!(name_matches(&pats, "Cargo.toml", false));
         assert!(!name_matches(&pats, "main.js", false));
+    }
+
+    // ── Address-bar `%VAR%` expansion ──
+
+    /// A fixed environment, so these tests neither read nor mutate the real
+    /// process environment (unstable across machines, and `set_var` is unsafe
+    /// to race from a parallel test runner).
+    fn fake_env(name: &str) -> Option<String> {
+        match name {
+            "USERPROFILE" => Some("C:\\Users\\simon".to_string()),
+            "TEMP" => Some("C:\\Temp".to_string()),
+            _ => None,
+        }
+    }
+
+    fn expand(input: &str) -> String {
+        expand_env_vars_with(input, fake_env)
+    }
+
+    #[test]
+    fn expands_a_terminated_placeholder() {
+        assert_eq!(expand("%USERPROFILE%"), "C:\\Users\\simon");
+        assert_eq!(expand("%TEMP%\\x.txt"), "C:\\Temp\\x.txt");
+        assert_eq!(
+            expand("%USERPROFILE%\\docs\\%TEMP%"),
+            "C:\\Users\\simon\\docs\\C:\\Temp"
+        );
+    }
+
+    #[test]
+    fn unterminated_placeholder_keeps_the_rest_of_the_path() {
+        // The bug: the scan runs to the end of the input, and advancing by
+        // `j + 1` stepped PAST `len` — so everything after the `%` was dropped
+        // and the user got a silently wrong path instead of a visible typo.
+        assert_eq!(expand("%USERPROF"), "%USERPROF");
+        assert_eq!(expand("a%b"), "a%b");
+        assert_eq!(expand("C:\\x\\%FOO"), "C:\\x\\%FOO");
+        assert_eq!(expand("%USERPROFILE%\\doc%"), "C:\\Users\\simon\\doc%");
+    }
+
+    #[test]
+    fn empty_placeholder_is_literal_not_a_silent_blank() {
+        // `%%` names no variable. Expanding it to "" would blank the path with
+        // nothing on screen to explain why.
+        assert_eq!(expand("%%"), "%%");
+        assert_eq!(expand("C:\\a%%\\b"), "C:\\a%%\\b");
+        // The first `%` pairs with the second, so the name is empty and the
+        // WHOLE thing is literal — no escape syntax is defined, and inventing
+        // one here would make `%%` mean something in this app and nowhere else.
+        assert_eq!(expand("%%USERPROFILE%%"), "%%USERPROFILE%%");
+    }
+
+    #[test]
+    fn unknown_variable_expands_to_nothing_but_keeps_siblings() {
+        // Unchanged behaviour, pinned so a later "fix" can't quietly start
+        // echoing `%NOSUCH%` back into a path the backend then has to resolve.
+        assert_eq!(expand("%NOSUCH%"), "");
+        assert_eq!(expand("\\a\\%NOSUCH%\\b"), "\\a\\\\b");
+    }
+
+    #[test]
+    fn paths_without_placeholders_pass_through_untouched() {
+        assert_eq!(expand(""), "");
+        assert_eq!(expand("C:\\Users\\simon"), "C:\\Users\\simon");
+        assert_eq!(expand("~"), "~");
+        assert_eq!(expand("文档\\报告 2026.docx"), "文档\\报告 2026.docx");
+        // A trailing `%` on its own is text, not a broken placeholder.
+        assert_eq!(expand("100%"), "100%");
+        assert_eq!(expand("%"), "%");
+        // Two terminated placeholders in a row: each is independent.
+        assert_eq!(expand("%TEMP%%TEMP%"), "C:\\TempC:\\Temp");
+    }
+
+    #[test]
+    fn multibyte_text_around_placeholders_survives() {
+        // The scan is over `Vec<char>`, so indices are char-based. Getting
+        // that wrong would truncate mid-codepoint and panic on slicing.
+        assert_eq!(expand("文档\\%TEMP%\\报告"), "文档\\C:\\Temp\\报告");
+        assert_eq!(expand("%TEMP%文%"), "C:\\Temp文%");
+    }
+
+    #[test]
+    fn expand_env_vars_wrapper_reads_the_process_environment() {
+        // The seam must not become a second, divergent implementation: the
+        // production entry point has to keep delegating to the tested one.
+        // `PATH` exists on every platform this runs on, and setting the var we
+        // assert on keeps the expected value machine-independent.
+        std::env::set_var("MINITC_TEST_EXPAND_PROBE", "probe-value");
+        assert_eq!(
+            expand_env_vars("%MINITC_TEST_EXPAND_PROBE%/x"),
+            "probe-value/x"
+        );
+        // A typo must stay VISIBLE rather than resolve to some other variable:
+        // `%MINITC_TEST_EXPAND_PROBE` with no closing `%` is literal text.
+        assert_eq!(
+            expand_env_vars("%MINITC_TEST_EXPAND_PROBE"),
+            "%MINITC_TEST_EXPAND_PROBE"
+        );
+        std::env::remove_var("MINITC_TEST_EXPAND_PROBE");
+    }
+
+    #[test]
+    fn production_entry_point_still_reads_the_real_environment() {
+        // The runtime test above CANNOT catch this one: it seeds the variable
+        // itself, so an implementation that hard-codes the answer passes it
+        // happily (measured — a mutant hard-coding `probe-value` kept all 74
+        // tests green). Behaviour-only assertions are blind to "the wrapper
+        // stopped delegating", so pin the wiring down statically.
+        //
+        // The needle is assembled at RUNTIME from fragments. Spelling it out
+        // literally here would put the very text being searched for into this
+        // file's own source — which `include_str!` reads back — and the
+        // assertion would then match itself and pass unconditionally.
+        let needle: String = [
+            "expand_env",
+            "_vars_with(input, |name| std::",
+            "env::var(name)",
+        ]
+        .concat();
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains(&needle),
+            "expand_env_vars must keep delegating to expand_env_vars_with with a real env lookup"
+        );
     }
 
     // ── Undo-delete: picking our own entries out of the recycle bin ──
