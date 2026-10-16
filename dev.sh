@@ -63,7 +63,7 @@ T_SCRIPT_START="$(now_ms)"   # 整个脚本的起点，用于总耗时
 # 按**字典序**取第一个命中，于是 22.12.0 永远排在 22.22.2 前面被选中 ——
 # 选中的恰恰是最旧的那个。失败症状不是安装报错，而是运行时在 import 阶段
 # 崩（jsdom 30 要 node ^22.22.2，22.12.0 上调不到 zlib.createZstdDecompress），
-# 且没有任何告警。dev.bat 的 `for /d` 有同一个缺陷。
+# 且没有任何告警。当时并存的 dev.bat 用 `for /d` 有同一个缺陷，已随那次收敛删除。
 #
 # 下面这段只负责「找到任意一个能跑 node 的东西」用于 bootstrap 选择器本身；
 # 真正用哪个版本由 pick-node.js 按 engines + 版本序决定。
@@ -129,18 +129,20 @@ detect_msvc() {
     "/c/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools" \
     "/c/Program Files (x86)/Microsoft Visual Studio/2019/Community" ; do
     if [ -d "$vsroot/VC/Tools/MSVC" ]; then
-      MSVC_VER="$(ls -r "$vsroot/VC/Tools/MSVC" 2>/dev/null | grep -E '^[0-9]' | head -1)"
+      # 取版本号**最大**的那个子目录。原来是 `ls -r | head -1`，取的是
+      # 字典序最小的 —— 14.9 排在 14.44 前面，于是装着新工具链的机器
+      # 反而去用旧的。`sort -V` 才是版本序。
+      MSVC_VER="$(ls -1 "$vsroot/VC/Tools/MSVC" 2>/dev/null | grep -E '^[0-9]' | sort -V | tail -1)"
       if [ -n "$MSVC_VER" ]; then
         MSVC_BASE="$vsroot/VC/Tools/MSVC/$MSVC_VER"
-        vsroot_win="${vsroot/#\/c\//C:}"
-        vsroot_win="${vsroot_win//\//\\}"
-        MSVC_WIN="${vsroot_win}\\VC\\Tools\\MSVC\\${MSVC_VER}"
+        MSVC_WIN="${vsroot/#\/c\//C:}"
+        MSVC_WIN="${MSVC_WIN//\//\\}\\VC\\Tools\\MSVC\\${MSVC_VER}"
         break
       fi
     fi
   done
   if [ -d "$SDK_BASE/Include" ]; then
-    SDK_VER="$(ls -r "$SDK_BASE/Include" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+    SDK_VER="$(ls -1 "$SDK_BASE/Include" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
   fi
 }
 

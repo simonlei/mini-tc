@@ -164,7 +164,7 @@
 - Linux：`build-essential` + `libwebkit2gtk-4.1-dev` 等
 
 > **Windows 编译**：请装 **2022 Build Tools**（含 Community / Professional / Enterprise /
-> **BuildTools** 四个版本均可）。`dev.bat` / `dev.sh` 的 MSVC 探测会扫描这几个路径，
+> **BuildTools** 四个版本均可）。`dev.sh` 的 MSVC 探测会扫描这几个路径，
 > 但请注意把它们装在**默认路径下**（`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`），
 > 否则探测会漏检并静默退回 rustup 默认工具链，导致 `link.exe` 找不到。
 
@@ -194,7 +194,7 @@ npx tauri dev
 也可以用启动脚本，它会自动探测 Node.js 与 MSVC 环境：
 
 ```bash
-./dev.sh            # 或 Windows 下双击 dev.bat —— 开发模式
+./dev.sh            # 开发模式（Windows 上在 Git Bash 里跑）
 ./dev.sh build      # 构建发布版
 ./dev.sh check      # 仅 cargo check
 ./dev.sh clean      # 清理构建产物
@@ -203,7 +203,15 @@ npx tauri dev
 
 > `npm install` 只在 `package.json` / `package-lock.json` 变化后才会真正执行
 > （依赖已同步时 npm 仍要约 20 秒却什么都不装）。改依赖后若想手动强制安装，
-> 跑 `./dev.sh deps` / `dev.bat deps`。
+> 跑 `./dev.sh deps`。
+
+> **启动脚本只有一套**：`dev.sh`（Windows 上在 Git Bash 里跑）。项目此前并存
+> 四个探测脚本 —— `dev.bat`、`dev.sh`、`scripts/check.bat`、`scripts/check.ps1` ——
+> 四份 MSVC/Node 探测逻辑各写一遍且互相漂移，已删除后三个，收敛到 `dev.sh`
+> 与 `scripts/cargo-check.sh`。顺带修掉两处硬编码：`cargo-check.sh` 里写死的
+> MSVC/SDK 版本号与本机绝对路径（现按 `sort -V` 取最大版本 + 按脚本位置定位项目根），
+> 以及它硬编码的 node 目录 `22.22.2` —— 实际目录名是 `22.22.2-6`，
+> 即 `check.ps1` 那条路径**从来就不存在**，脚本是坏的（只是没人跑它）。
 
 > **启动器如何选 Node 版本**：两个启动器都把版本决策交给
 > [`scripts/pick-node.js`](scripts/pick-node.js) —— 它按 `engines.node` 过滤后
@@ -220,7 +228,7 @@ npx tauri dev
 > node scripts/pick-node.js --print-all   # 列出所有候选及其真实版本
 > ```
 
-`dev.sh` / `dev.bat` 的每个阶段都会打印耗时，便于定位慢在哪：
+`dev.sh` 的每个阶段都会打印耗时，便于定位慢在哪：
 
 ```
    [探测 Node.js] 569 ms
@@ -453,7 +461,7 @@ npm test                       # 只跑单元测试
 
   三处非平凡的坑，都是实测踩出来的：
 
-  - ⚠️ **`dev.sh` 与 `dev.bat` 有同一个 bug，TODO 只记了 `.bat`**。两者的目录枚举
+  - ⚠️ **`dev.sh` 与当时的 `dev.bat` 有同一个 bug，TODO 只记了 `.bat`**。两者的目录枚举
     （`for /d` 与 bash glob）都按字典序，`22.12.0` 永远排在 `22.22.2` 前被选中。
     实测真实目录序为 `22.12.0 22.22.2-6 24.0.0 9.1.2` → 旧逻辑选中**次旧**的那个。
   - ⚠️ **`realIo()` 一开始漏了 `readFile`**，`readEngines` 里的 TypeError 被
@@ -468,7 +476,8 @@ npm test                       # 只跑单元测试
   变异测试实测：把 `pickBest` 改回「取第一个」→ 5 条失败；`console.error` 全改
   `console.log` → 5 条失败；删掉 `readFile` → 2 条失败；`compareVersions` 改成字典序
   → 6 条失败（含 `9.1.2 < 22.12.0`、`22.22.10 > 22.22.9` 这类字符串比较必错的输入）。
-  ⚠️ 未覆盖：`dev.bat` 的 batch 语法本身（本机 cmd.exe 被沙箱封禁，无法端到端执行），
+  ⚠️ 未覆盖：当时的 `dev.bat` 的 batch 语法本身（本机 cmd.exe 被沙箱封禁，无法端到端执行；
+  该文件现已删除，见下方「启动脚本」）
   只做了静态检查（纯 ASCII、全 CRLF、无旧定型点）。**首次在 Windows 上跑请留意
   `[ERROR] Could not resolve a usable Node.js directory.` 这条消息。**
   - 🚨 **变异测试抓出一条「看起来在测」实则恒绿的断言**：我最初写「文件里有带参调用即可」，
@@ -514,7 +523,7 @@ npm test                       # 只跑单元测试
 ## 后端单元测试
 
 ```bash
-# 在 Git Bash 里（scripts/cargo-check.sh 已手动配好 MSVC 环境，dev.bat/dev.sh 的探测列表漏了 BuildTools）
+# 在 Git Bash 里（scripts/cargo-check.sh 会自动探测并配置 MSVC 环境）
 cargo test --lib                        # 全部
 cargo test --lib overwrite_tests        # 只跑某一组
 ```
@@ -602,7 +611,7 @@ cargo test --lib overwrite_tests        # 只跑某一组
   `code = 5`，而**独立 shell 工具在同一个目录里能成功建 junction**。写涉及链接的测试必须
   先断言前提、否则 skip。
 - **沙箱能挡什么 ≠ 代码对不对**。同一个 `code = 5`：沙箱里跑说明「无法验证」，而在
-  `dev.bat` 里跑出现则说明**代码有 bug**（当时确实是 `GENERIC_READ` 多要了权限）。
+  在 `dev.sh` 里跑出现则说明**代码有 bug**（当时确实是 `GENERIC_READ` 多要了权限）。
   **无法端到端验证的代码就不要交付** —— 该做的是把不可验证的部分拆成可测的纯函数，
   而不是降低对正确性的声明。
 

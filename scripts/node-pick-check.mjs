@@ -1,23 +1,32 @@
 // 验证「启动器选 Node」不再取字典序第一个，而是取满足 engines 的最新版本。
 // 直接 `node scripts/node-pick-check.mjs` 跑。
 //
-// 背景（TODO.md P2 第一条）：dev.bat 与 dev.sh 都用
+// 背景（TODO.md P2 第一条）：`dev.sh` 与当时的 `dev.bat` 都用
 //   for /d %%v in ("...\versions\*")   /   for dir in ".../versions"/*
 // 选 Node，两者都按**字典序**枚举，于是 22.12.0 永远排在 22.22.2 前面、
 // 被选中 —— 选中的恰恰是最旧的那个。症状不是安装报错，而是运行时在
 // import 阶段崩：jsdom 30 要 node ^22.22.2，在 22.12.0 上调
 // zlib.createZstdDecompress（node 22.15+ 才有）直接死，且**无告警**。
 //
-// 这里分四层，因为每层能抓住不同类型的回归：
-//   ① 纯函数表：版本解析 / 比较 / engines 区间（锚定 pick-node.js 自身）；
-//   ② 对照臂：把旧实现逐字复刻，证明这些断言真的有分辨力、不是恒真；
-//   ③ 真实文件系统集成：在临时目录里造版本树，跑**真的** pickBest，
-//      含旧代码会选错的那些组合；
-//   ④ 静态断言：dev.bat / dev.sh 确实改成了调用 pick-node.js，且
-//      pick-node.js 没有任何残留的「取第一个」逻辑。
+// ⚠️ 后续：`dev.bat` / `scripts/check.bat` / `scripts/check.ps1` 已删除
+//（项目曾有四份探测脚本，各自漂移），`dev.sh` 是唯一启动器。所以下面关于
+// dev.bat 的断言已改为「它必须保持删除」—— 不是不测，是测「别加回来」。
 //
-// 不测的部分：dev.bat 本身在本机跑不了（cmd.exe 被沙箱封禁），所以
-// 「batch 语法正确」无法端到端验证 —— 这一点如实记录，不假装覆盖了。
+// 这里分七段，因为每段能抓住不同类型的回归：
+//   ① 纯函数表：版本解析 / 比较（锚定 pick-node.js 自身）；
+//   ② engines 区间解析：>= <= > < = ^ ~、空格=AND、||=OR、
+//      语法不认识时返回 null 而非恒 false 谓词；
+//   ③ 对照臂：把旧实现逐字复刻，证明这些断言真的有分辨力、不是恒真；
+//   ④ 真实文件系统集成：在临时目录里造版本树，跑**真的**候选枚举与
+//      pickBest，含旧代码会选错的那些组合；
+//   ⑤ 边界：候选为空 / 版本不可解析 / 无人满足约束时的兜底与返回类型；
+//   ⑥ 静态断言：dev.sh 确实改成了调用 pick-node.js；已删的 dev.bat/
+//      check.bat/check.ps1 不得被加回来；两个 .sh 都不得含硬编码路径/版本；
+//      pick-node.js 没有任何残留的「取第一个」逻辑；
+//   ⑦ 本机冒烟：真的 spawn 每个候选问版本，验证选出的确实是本机最新的。
+//
+// 不测的部分：曾经的 dev.bat 的 batch 语法无法端到端验证（cmd.exe 被沙箱
+// 封禁）—— 该文件现已删除，此项不再是待验证的活，但如实留档。
 
 import fs from "node:fs";
 import os from "node:os";
@@ -26,18 +35,14 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-// stripComments.cjs 只认 JS 的 // 与 /* */。启动器各有自己的注释语法：
-// batch 是 REM，shell 是 #。不剥注释就会把「解释旧 bug 的说明文字」当成
-// 残留代码（实测踩过：`:node_found` 只出现在 REM 里，断言却报了 FAIL）。
+// shell 脚本的注释是 #。不剥注释就会把「解释旧 bug 的说明文字」当成残留代码
+// （实测踩过：dev.sh 顶部那段注释里写着 `for dir in ".../versions"/*`，直接
+// grep 会以为旧写法还在）。同构的 stripRem（batch 的 REM）随 dev.bat 一起
+// 删除了 —— 留着就是没人调用的死代码。
 const require = createRequire(import.meta.url);
 const pick = require("./pick-node.js");
 
-/** 剥掉 REM / REM. 开头的行（batch 注释）。 */
-function stripRem(src) {
-  return src.replace(/^\s*REM\.?\s.*$/gm, "").replace(/REM\s/g, " ");
-}
-
-/** 剥掉 # 开头的行（shell 注释），并去掉续行符，让 for 块变成单行可匹配。 */
+/** 剥掉 # 开头的行（shell 注释）。 */
 function stripHash(src) {
   return src.replace(/^\s*#.*$/gm, "");
 }
@@ -278,33 +283,53 @@ console.log("\n⑤ 边界：候选为空 / 版本不可解析 / 约束无人满�
   check("单个候选 + 单个约束", pickBest([V("22.22.2")], () => true).version.minor === 22);
 }
 
-console.log("\n⑥ 静态断言：两个启动器都把版本决策交给了 pick-node.js");
+/**
+ * 取出 `NAME="$( ... )"` 赋值**所在的完整命令替换**（含 `\` 续行），
+ * 用来断言「这一处具体用了什么命令」。
+ *
+ * 两个坑：
+ *  ① 命令替换常跨多行（`\` 续行），只按单行 find 必然找不到 ——
+ *     实测 cargo-check.sh 里 `MSVC_VER="$(ls -1 ...` 到 `tail -1)"`
+ *     跨了 5 行。
+ *  ② 不用大正则整体匹配：嵌套的 `$()` 括号极易写错（实测自己踩过：
+ *     括号没转义 → re.PatternError，连 baseline 都跑不起来）。
+ */
+function assignLine(code, name) {
+  const needle = `${name}="$(`;
+  const idx = code.indexOf(needle);
+  if (idx === -1) return null;
+  const from = code.lastIndexOf("\n", idx) + 1;
+  // 从 needle 起找到第一个未转义的 `)"`，其间允许换行。
+  const close = code.indexOf(')"', idx + needle.length);
+  if (close === -1) return null;
+  return code.slice(idx + needle.length, close).replace(/\\\r?\n\s*/g, " ");
+}
+
+console.log("\n⑥ 静态断言：版本决策收敛到 pick-node.js，且只剩一个启动器");
 {
-  const bat = fs.readFileSync(path.join(ROOT, "dev.bat"), "utf8");
   const sh = fs.readFileSync(path.join(ROOT, "dev.sh"), "utf8");
 
-  check("dev.bat 调用 pick-node.js", bat.includes("pick-node.js"));
-  check("dev.sh 调用 pick-node.js", sh.includes("pick-node.js"));
+  // ① 已删除的启动器必须**保持删除**。
+  //    这里原来有 6 条断言在检查 dev.bat 的内部结构（for /d、goto、
+  //    CRLF、纯 ASCII...）。文件既已删除，那些断言的前提消失 ——
+  //    留着会因 readFileSync ENOENT 让整个测试崩掉，删掉又会丢掉
+  //    「别把 dev.bat 加回来」这道关卡。所以改成断言「不存在」。
+  for (const f of ["dev.bat", "scripts/check.bat", "scripts/check.ps1"]) {
+    check(`${f} 已删除且未被加回来（启动器只留dev.sh 一套）`,
+      !fs.existsSync(path.join(ROOT, f)));
+  }
+  //反向：dev.sh 必须还在，否则上面三条就成了「都不存在也算对」。
+  check("dev.sh 存在（唯一的启动器）", fs.existsSync(path.join(ROOT, "dev.sh")));
+  check("scripts/cargo-check.sh 存在（cargo check 的唯一入口）",
+    fs.existsSync(path.join(ROOT, "scripts", "cargo-check.sh")));
 
+  // ② dev.sh 的选型路径。
+  check("dev.sh 调用 pick-node.js", sh.includes("pick-node.js"));
   // 不变量不是「不再出现 for 循环」—— bootstrap 阶段**必须**有一个目录扫描
   // 来找到「任意一个能跑 node 的东西」，没有它就无从执行 pick-node.js。
   // 不变量是：那个扫描的结果**不再直接决定用哪个 node**。
-  // ① dev.bat：旧的 for /d + goto :node_found 必须消失（goto = 直接定型）。
-  // 必须先剥注释 —— 新代码的 REM 里**故意**引用了 `:node_found` 来解释旧 bug，
-  // 直接对原文 grep 会把这段说明当成残留（实测踩过：断言假阴性）。
-  const batCode = stripRem(bat);
-  check("dev.bat 不再用 for /d + goto 自行定型 node 版本",
-    !/for \/d %%v in \([^)]*versions\\\*/.test(batCode));
-  check("dev.bat 不再有 :node_found 标签（旧定型点，剥注释后）",
-    !batCode.includes(":node_found"));
-  check("dev.bat 的选型结果来自 pick-node.js 的 stdout（for /f 捕获）",
-    /for \/f "usebackq delims=" %%n in \(`"!NODE_BOOT!" "%PROJECT_ROOT%scripts\\pick-node\.js"`\)/.test(batCode));
-  check("dev.bat 的 bootstrap 扫描与定型是两个不同标签（bootstrap 不定型）",
-    batCode.includes(":node_boot_found") && !batCode.includes(":node_found"));
-
-  // ② dev.sh：旧的 `for dir in ".../versions"/*` 后**立刻 return 0** 是定型信号。
+  // 旧的 `for dir in ".../versions"/*` 后**立刻 return 0** 是定型信号；
   // 现在的 bootstrap 循环用 break（跳出循环后仍交给 pick-node.js）。
-  // 正则用 multiline 且限制在 for 块内，避免跨注释误匹配。
   const shCode = stripHash(sh);
   check("dev.sh 的 node 选择结果来自 pick-node.js 的 stdout",
     /chosen="\$\("\$bootstrap" "\$\{SCRIPT_DIR\}\/scripts\/pick-node\.js"\)"/.test(shCode));
@@ -314,29 +339,63 @@ console.log("\n⑥ 静态断言：两个启动器都把版本决策交给了 pic
   // pick-node.js 挪到扫描之前，扫描就变成了「覆盖选型结果」。
   const bootIdx = shCode.indexOf("bootstrap=");
   const pickIdx = shCode.indexOf("pick-node.js");
-  check("dev.sh 里 bootstrap 扫描在 pick-node.js 之前（选型不被覆盖）",
+  check("dev.sh 里bootstrap 扫描在 pick-node.js 之前（选型不被覆盖）",
     bootIdx !== -1 && pickIdx !== -1 && bootIdx < pickIdx);
 
-  // batch 硬约束：非 ASCII 会让 cmd.exe 从中间切断长行。REM 注释也必须纯 ASCII。
-  const nonAscii = bat.match(/[\u0080-\uFFFF]/g);
-  check("dev.bat 保持纯 ASCII（cmd.exe 多字节切断长行的坑）", nonAscii === null);
-  if (nonAscii) console.log(`       非 ASCII 字符: ${JSON.stringify([...new Set(nonAscii)])}`);
+  // ③ cargo-check.sh：不得再有硬编码的 MSVC/SDK 版本号与本机绝对路径。
+  //    check.ps1 就是前车之鉴：它写死的 node 目录 `22.22.2` 实际叫
+  //    `22.22.2-6`，那条路径从来不存在 —— 脚本是坏的，只是没人跑它。
+  const cc = fs.readFileSync(path.join(ROOT, "scripts", "cargo-check.sh"), "utf8");
+  const ccCode = stripHash(cc);
+  check("cargo-check.sh 不含硬编码的 MSVC 版本号",
+    !/\b1[0-9]\.[0-9]+\.[0-9]+\.[0-9]{3,}\b/.test(ccCode));
+  check("cargo-check.sh 不含硬编码的 SDK 版本号",
+    !/\b10\.0\.[0-9]+\.[0-9]+\.[0-9]+\b/.test(ccCode));
+  check("cargo-check.sh 不含本机绝对路径 C:////Users////",
+    !ccCode.includes("C:////Users////") && !ccCode.includes("/c/Users/"));
+  check("cargo-check.sh 按脚本位置定位项目根（可换机器/用户名）",
+    ccCode.includes('SCRIPT_DIR="$(') &&
+    ccCode.includes('BASH_SOURCE[0]') &&
+    !/cd\s+["']?C:/.test(ccCode));
+  // ⚠️ 只查「文件里存在 sort -V」是不够的 —— 变异测试实测过：脚本里有
+  // **3 处** sort -V（MSVC 探测 1 处 + SDK 探测 2 处），把 MSVC 那处改回
+  // `head -1` 后，断言依然全绿，因为另外两处「顶住了」。
+  // 所以必须断言**具体那行**用的是版本序而不是字典序。
+  const ccMsvc = assignLine(ccCode, "MSVC_VER");
+  const ccSdk = assignLine(ccCode, "SDK_VER");
+  check("cargo-check.sh 的 MSVC 版本探测用 sort -V 取最大（不是字典序 head -1）",
+    ccMsvc !== null && ccMsvc.includes("sort -V") && ccMsvc.includes("tail -1"));
+  check("cargo-check.sh 的 SDK 版本探测用 sort -V 取最大",
+    ccSdk !== null && ccSdk.includes("sort -V") && ccSdk.includes("tail -1"));
+  check("cargo-check.sh 的版本探测里没有 head -1（那取的是字典序最小）",
+    ccMsvc !== null && ccSdk !== null &&
+    !ccMsvc.includes("head -1") && !ccSdk.includes("head -1"));
+  check("cargo-check.sh 不再用 ls -r | head -1 取最小版本",
+    !/ls -r[^|]*\| *head -1/.test(ccCode));
 
-  // CRLF：Edit 工具默认写 LF，混行尾会让 cmd.exe 解析错乱。
-  const raw = fs.readFileSync(path.join(ROOT, "dev.bat"), "latin1");
-  const crlf = (raw.match(/\r\n/g) || []).length;
-  const lf = (raw.match(/\n/g) || []).length;
-  check(`dev.bat 行尾全为 CRLF（CRLF=${crlf} 裸LF=${lf - crlf}）`, crlf === lf);
+  // ④ dev.sh 的 MSVC 探测同样不得取最小版本（原来也是 ls -r | head -1）。
+  // 同理不能只查「存在 sort -V」：dev.sh 里也有多处，必须定位到 MSVC 那行。
+  const shMsvc = assignLine(shCode, "MSVC_VER");
+  const shSdk = assignLine(shCode, "SDK_VER");
+  check("dev.sh 的 MSVC 版本探测用 sort -V 取最大",
+    shMsvc !== null && shMsvc.includes("sort -V") && shMsvc.includes("tail -1"));
+  check("dev.sh 的 SDK 版本探测用 sort -V 取最大",
+    shSdk !== null && shSdk.includes("sort -V") && shSdk.includes("tail -1"));
+  check("dev.sh 的版本探测里没有 head -1",
+    shMsvc !== null && shSdk !== null &&
+    !shMsvc.includes("head -1") && !shSdk.includes("head -1"));
+  check("dev.sh 不再用 ls -r | head -1 取最小 MSVC 版本",
+    !/ls -r[^|]*\| *head -1/.test(shCode));
 
-  // pick-node.js 自己不得残留「取第一个」的逻辑。
+  // ⑤ pick-node.js 自己不得残留「取第一个」的逻辑。
   const pj = fs.readFileSync(path.join(ROOT, "scripts", "pick-node.js"), "utf8");
   check("pick-node.js 没有 readdirSync 后取 [0] 的残留",
     !/readdirSync\([^)]*\)\s*\[\s*0\s*\]/.test(pj));
   check("pick-node.js 导出了 pickBest（供测试与复用）",
     /module\.exports[\s\S]*pickBest/.test(pj));
 
-  // stdout 契约：dev.bat 的 `for /f` 与 dev.sh 的 `$(...)` 都只吃 stdout。
-  // 诊断信息一旦混进 stdout，NODE_DIR 就变成多行文本拼成的废路径，且症状是
+  // stdout 契约：dev.sh 的 `chosen="$(... pick-node.js)"` 只吃 stdout，
+  // 混进诊断就会让 NODE_BIN 变成多行文本拼成的废路径，症状是
   // 「node 明明装了却说找不到」—— 极难排查。
   //
   // 这里**真的执行**一次 CLI 并检查 stdout 行数，而不是 grep 源码里的
@@ -352,7 +411,7 @@ console.log("\n⑥ 静态断言：两个启动器都把版本决策交给了 pic
     outLines.length === 1);
   check("CLI stdout 的那一行就是选中目录的绝对路径",
     outLines.length === 1 && /^[A-Za-z]:\\/.test(outLines[0]));
-  check("CLI stdout 带尾反斜杠（dev.bat 直接 set PATH=%NODE_DIR%;... 拼接）",
+  check("CLI stdout 带尾反斜杠（dev.sh 直接 export PATH=$NODE_BIN:$PATH 拼接）",
     outLines.length === 1 && outLines[0].endsWith("\\"));
   check("CLI 选出的目录里确有 node.exe（stdout 不是空壳）",
     outLines.length === 1 && fs.existsSync(path.join(outLines[0], "node.exe")));
