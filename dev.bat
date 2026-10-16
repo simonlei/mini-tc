@@ -5,44 +5,62 @@ REM Auto-detect project root (directory of this script)
 cd /d "%~dp0"
 set "PROJECT_ROOT=%~dp0"
 
-REM Auto-detect Node.js (non-absolute: use `where` first, then env-var locations)
-set "NODE_DIR="
+REM ---- Node.js bootstrap ----------------------------------------------------
+REM Stage 1 only: find ANY node that can RUN scripts/pick-node.js. Version
+REM choice is NOT made here -- the old code did `for /d %%v in
+REM ("...\versions\*")` + `goto :node_found`, which enumerates in
+REM LEXICOGRAPHIC order, so 22.12.0 always beat 22.22.2 and the OLDEST node
+REM won. The symptom is not an install error but a later runtime crash at
+REM import time (jsdom 30 wants node ^22.22.2 and calls
+REM zlib.createZstdDecompress, node 22.15+), with no warning.
+REM Keep this block ASCII-only: cmd.exe computes line offsets by CHARACTER
+REM count after chcp 65001, so a multi-byte char can cut a long line in half.
+set "NODE_BOOT="
 where node >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
-    REM Derive node directory from the first `where node` result (no hardcoding)
     for /f "delims=" %%n in ('where node') do (
-        if not defined NODE_DIR set "NODE_DIR=%%~dp"
+        if not defined NODE_BOOT set "NODE_BOOT=%%n"
     )
-) else (
-    REM Try common Node.js install locations
+)
+if not defined NODE_BOOT (
     for %%d in (
         "%ProgramFiles%\nodejs"
         "%ProgramFiles(x86)%\nodejs"
-        "%LOCALAPPDATA%\fnm_multishells"
         "%USERPROFILE%\.fnm"
-        "%USERPROFILE%\.nvm"
+        "%USERPROFILE%\.nvm\versions\node"
+        "%USERPROFILE%\.workbuddy\binaries\node\versions"
     ) do (
         if exist "%%d\node.exe" (
-            set "NODE_DIR=%%~dpd"
-            goto :node_found
+            set "NODE_BOOT=%%d\node.exe"
+            goto :node_boot_found
+        )
+        for /d %%v in ("%%d\*") do (
+            if exist "%%v\node.exe" (
+                set "NODE_BOOT=%%v\node.exe"
+                goto :node_boot_found
+            )
         )
     )
-    REM Try WorkBuddy-managed Node (non-absolute: %USERPROFILE%\.workbuddy\binaries\node\versions\<ver>\node.exe)
-    for /d %%v in ("%USERPROFILE%\.workbuddy\binaries\node\versions\*") do (
-        if exist "%%v\node.exe" (
-            set "NODE_DIR=%%v"
-            goto :node_found
-        )
-    )
+)
+:node_boot_found
+if not defined NODE_BOOT (
     echo [ERROR] Node.js not found. Please install Node.js or add it to PATH.
     exit /b 1
 )
-:node_found
 
-REM Put the resolved node directory on PATH so npm/npx (same dir) are reachable
-if defined NODE_DIR (
-    set "PATH=%NODE_DIR%;%PATH%"
+REM Stage 2: pick-node.js applies engines + version ordering (see dev.sh for
+REM the same explanation). stdout is exactly one line: the chosen directory,
+REM WITH a trailing backslash so it can be concatenated onto PATH as-is.
+set "NODE_DIR="
+for /f "usebackq delims=" %%n in (`"!NODE_BOOT!" "%PROJECT_ROOT%scripts\pick-node.js"`) do set "NODE_DIR=%%n"
+if not defined NODE_DIR (
+    echo [ERROR] Could not resolve a usable Node.js directory.
+    exit /b 1
 )
+for %%v in ("!NODE_DIR!") do set "NODE_DIR=%%~dp"
+
+REM Put the resolved node directory first on PATH so npm/npx (same dir) win
+if defined NODE_DIR set "PATH=%NODE_DIR%;%PATH%"
 
 REM Verify npm / npx are reachable (non-absolute lookup; warn if missing)
 where npm >nul 2>&1

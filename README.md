@@ -158,7 +158,7 @@
 ## 前置条件
 
 - [Rust](https://rustup.rs/) (stable-msvc on Windows，**1.99.0+**)
-- [Node.js](https://nodejs.org/) >= 18
+- [Node.js](https://nodejs.org/) **>= 22.12.0**（与 `package.json` 的 `engines.node` 一致）
 - Windows：Visual Studio 2022 Build Tools（含 C++ 桌面开发工作负载）
 - macOS：Xcode Command Line Tools
 - Linux：`build-essential` + `libwebkit2gtk-4.1-dev` 等
@@ -204,6 +204,21 @@ npx tauri dev
 > `npm install` 只在 `package.json` / `package-lock.json` 变化后才会真正执行
 > （依赖已同步时 npm 仍要约 20 秒却什么都不装）。改依赖后若想手动强制安装，
 > 跑 `./dev.sh deps` / `dev.bat deps`。
+
+> **启动器如何选 Node 版本**：两个启动器都把版本决策交给
+> [`scripts/pick-node.js`](scripts/pick-node.js) —— 它按 `engines.node` 过滤后
+> 取**最新**的一个（探测顺序：PATH 从前往后 → 各版本管理器目录），并只把
+> 选中目录写到 stdout，诊断信息走 stderr。
+>
+> 此前两个启动器都是「按字典序取第一个命中」：`for /d %%v in
+> ("...\versions\*")` 与 `for dir in ".../versions"/*` 都按字典序产出，
+> 于是 `22.12.0` 永远排在 `22.22.2` 前面被选中 —— 选中的恰恰是**最旧**的
+> 那个。症状不是安装报错，而是运行时在 import 阶段崩（见下文 jsdom 一节），
+> 且**无任何告警**。现在可这样自查：
+>
+> ```bash
+> node scripts/pick-node.js --print-all   # 列出所有候选及其真实版本
+> ```
 
 `dev.sh` / `dev.bat` 的每个阶段都会打印耗时，便于定位慢在哪：
 
@@ -429,6 +444,33 @@ npm test                       # 只跑单元测试
   - ⚠️ **静态断言会把注释当代码**：「守卫在 `Math.log` 之前」是顺序约束，而 `format.js`
     自己的注释里就出现了这两个名字，直接比 `indexOf` 等于**让文档自己判自己过**。
     抽 `scripts/stripComments.cjs`（原 `lint-imports.js` 里的私有函数，两边共用）先剥再比。
+- `scripts/node-pick-check.mjs` —— 启动器选 Node 的版本决策（`scripts/pick-node.js`）。
+
+  覆盖：版本解析 / 数值比较 / `engines` 区间（`>=` `<=` `>` `<` `=` `^` `~`、
+  空格=AND、`||`=OR、语法不认识时返回 `null` 而非恒 false）、候选枚举、
+  `pickBest` 的兜底与返回类型、CLI 的 stdout 契约，以及**两个启动器的静态断言**
+  （都已改为调用 `pick-node.js`，且旧定型点已消失）。
+
+  三处非平凡的坑，都是实测踩出来的：
+
+  - ⚠️ **`dev.sh` 与 `dev.bat` 有同一个 bug，TODO 只记了 `.bat`**。两者的目录枚举
+    （`for /d` 与 bash glob）都按字典序，`22.12.0` 永远排在 `22.22.2` 前被选中。
+    实测真实目录序为 `22.12.0 22.22.2-6 24.0.0 9.1.2` → 旧逻辑选中**次旧**的那个。
+  - ⚠️ **`realIo()` 一开始漏了 `readFile`**，`readEngines` 里的 TypeError 被
+    `catch {}` 吞掉 → **engines 永远读成空串，按 engines 过滤的那段代码从未生效**，
+    而测试依然全绿（「无约束时取最新」恰好也是想要的行为）。这类静默失效只能靠
+    **故意构造违反约束的场景**来暴露：测试里复制一份 `package.json`、把
+    `engines.node` 改成 `99.0.0`，强制触发告警分支。
+  - ⚠️ **`console.error` → `console.log` 的变异最初 0 FAIL**，因为本机根本没有告警
+    可发，那两行代码根本没执行。现在改成**真跑 CLI 并检查 stdout 恰好一行**
+    （dev.bat 的 `for /f` 与 dev.sh 的 `$(...)` 都只吃 stdout，混入诊断就会得到废路径）。
+
+  变异测试实测：把 `pickBest` 改回「取第一个」→ 5 条失败；`console.error` 全改
+  `console.log` → 5 条失败；删掉 `readFile` → 2 条失败；`compareVersions` 改成字典序
+  → 6 条失败（含 `9.1.2 < 22.12.0`、`22.22.10 > 22.22.9` 这类字符串比较必错的输入）。
+  ⚠️ 未覆盖：`dev.bat` 的 batch 语法本身（本机 cmd.exe 被沙箱封禁，无法端到端执行），
+  只做了静态检查（纯 ASCII、全 CRLF、无旧定型点）。**首次在 Windows 上跑请留意
+  `[ERROR] Could not resolve a usable Node.js directory.` 这条消息。**
   - 🚨 **变异测试抓出一条「看起来在测」实则恒绿的断言**：我最初写「文件里有带参调用即可」，
     于是把 PathBar 三处调用中的**一处**参数删掉，测试依然全绿。改成
     「剥注释后数出全部调用点，逐个必须带参」才抓住。
@@ -452,16 +494,16 @@ npm test                       # 只跑单元测试
     的 `ipc:` 漏了会静默打死全部 IPC，`script-src` 少了 `'wasm-unsafe-eval'` 会坏 HEIC），
     `object-src`/`form-action` 保持 `'none'`，`assetProtocol` 未被关掉，且 `csp` 不是 `null`。
 
-  ⚠️ **`jsdom` 锁在 `~28.1.0`，这个锁是承重的**（`package.json`）。jsdom 30 要求
-  node `^22.22.2` 并拉 `whatwg-url` 17（要求 `^22.14.0`），而 `dev.bat` 可能选中 node
-  22.12.0 —— 在那个版本上这套测试**在 import 阶段就整体崩掉**（不是某条断言失败）：
-  undici 的 `decompress.js` 调用 `zlib.createZstdDecompress`（node 22.15+ 才有），
-  那里它是 `undefined`。jsdom 28 拉的是 `whatwg-url` 16，其 engines（`^22.12.0`）
-  正好容纳该版本。
+  ⚠️ **`jsdom` 锁在 `~28.1.0`，这个锁目前仍是承重的**（`package.json`）。jsdom 30 要求
+  node `^22.22.2` 并拉 `whatwg-url` 17（要求 `^22.14.0`）；jsdom 28 拉的是
+  `whatwg-url` 16，其 engines（`^22.12.0`）正好容纳启动器会选中的版本。
   ⚠️ **陷阱在于 `undici` 7.x 声明的是 `engines: >=20.18.1`**，纸面上 22.12.0 完全受支持。
   **engines 是声明不是保证** —— 新增依赖后要用启动器实际会选中的那个 node 实跑一遍，
   别只看告警文本（或只看它没告警）。实测：jsdom@30 在 22.12.0 上产生 45 条 EBADENGINE
   且测试崩溃，jsdom@28 为 0 条且 90 条断言全过、对照臂数字不变。
+  ✅ 启动器选错版本这件事**本身已修**（`scripts/pick-node.js`，见「前置条件」一节）：
+  现在按 `engines.node` 过滤后取最新，不再取字典序第一个。jsdom 暂时留在 28，
+  是因为「升级到 30 并在 22.22.2 上验证通过」是另一件事，不在本次改动范围内。
 
   ⚠️ **这条测试的必要组成部分是那个对照臂**：同一批载荷再过一遍**旧黑名单实现**，
   要求它至少漏掉 3 个（实测漏 **17/33**）。没有它，一个「净化器彻底坏了」的 harness

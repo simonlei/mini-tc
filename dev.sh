@@ -57,31 +57,53 @@ T_SCRIPT_START="$(now_ms)"   # 整个脚本的起点，用于总耗时
 
 # ---- Node.js 自动探测（不依赖 PATH 中是否已配置；本机未把
 #      ~/.workbuddy/binaries/node/versions/22.22.2/ 加进 PATH 也能跑） ----
+#
+# 决策逻辑在 scripts/pick-node.js，不在这里。原因是原来的写法：
+#     for dir in "$HOME/.workbuddy/binaries/node/versions"/*; do ... return 0
+# 按**字典序**取第一个命中，于是 22.12.0 永远排在 22.22.2 前面被选中 ——
+# 选中的恰恰是最旧的那个。失败症状不是安装报错，而是运行时在 import 阶段
+# 崩（jsdom 30 要 node ^22.22.2，22.12.0 上调不到 zlib.createZstdDecompress），
+# 且没有任何告警。dev.bat 的 `for /d` 有同一个缺陷。
+#
+# 下面这段只负责「找到任意一个能跑 node 的东西」用于 bootstrap 选择器本身；
+# 真正用哪个版本由 pick-node.js 按 engines + 版本序决定。
 detect_node() {
-  # 1) 已在 PATH 上
+  local bootstrap=""
+
+  # 1) 已在 PATH 上 —— 任意版本都够，它只用来跑 pick-node.js
   if command -v node >/dev/null 2>&1; then
-    NODE_BIN="$(dirname "$(command -v node)")"
-    return 0
+    bootstrap="$(command -v node)"
   fi
-  # 2) 常见安装位置（Git Bash 下用 /c/... 形式）
-  local dir
-  for dir in \
-    "/c/Program Files/nodejs" \
-    "/c/Program Files (x86)/nodejs" \
-    "$LOCALAPPDATA/fnm_multishells"/* \
-    "$HOME/.fnm"/* \
-    "$HOME/.nvm/versions/node"/* ; do
-    if [ -x "${dir}/node.exe" ]; then NODE_BIN="$dir"; return 0; fi
-  done
-  # 3) WorkBuddy 管理的 Node：~/.workbuddy/binaries/node/versions/<ver>/node.exe
-  for dir in "$HOME/.workbuddy/binaries/node/versions"/*; do
-    if [ -x "${dir}/node.exe" ]; then NODE_BIN="$dir"; return 0; fi
-  done
-  return 1
+
+  # 2) 常见安装位置（Git Bash 下用 /c/... 形式）；同样只求「有」，不求「新」
+  if [ -z "$bootstrap" ]; then
+    local dir
+    for dir in \
+      "/c/Program Files/nodejs" \
+      "/c/Program Files (x86)/nodejs" \
+      "$LOCALAPPDATA/fnm_multishells"/* \
+      "$HOME/.fnm"/* \
+      "$HOME/.nvm/versions/node"/* \
+      "$HOME/.workbuddy/binaries/node/versions"/* ; do
+      if [ -x "${dir}/node.exe" ] || [ -x "${dir}/node" ]; then
+        bootstrap="${dir}/node.exe"
+        [ -x "$bootstrap" ] || bootstrap="${dir}/node"
+        break
+      fi
+    done
+  fi
+
+  [ -n "$bootstrap" ] || return 1
+
+  # 3) 交给 pick-node.js 决定真正用哪个（stdout 只有一行路径）
+  local chosen
+  chosen="$("$bootstrap" "${SCRIPT_DIR}/scripts/pick-node.js")" || return 1
+  [ -n "$chosen" ] || return 1
+  NODE_BIN="${chosen%/}"
 }
 
 if detect_node; then
-  echo ">> 使用 Node.js: ${NODE_BIN}"
+  echo ">> 使用 Node.js: ${NODE_BIN} ($( "${NODE_BIN}/node.exe" -v 2>/dev/null || "${NODE_BIN}/node" -v 2>/dev/null || echo '?' ))"
   export PATH="${NODE_BIN}:$PATH"
 else
   echo "[ERROR] 未找到 Node.js。请安装 Node.js 或将其加入 PATH。" >&2
