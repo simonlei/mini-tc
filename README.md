@@ -236,7 +236,7 @@ npm test                       # 只跑单元测试
 
 改动 `.vue` / `src/*.js` 后跑一次，比等运行时白屏再回头找快得多。
 
-`npm test` 目前覆盖十块前端纯逻辑：
+`npm test` 目前覆盖十二块前端纯逻辑：
 
 - `scripts/rename-rules-check.mjs` —— 批量重命名的规则与两阶段执行（含失败回滚）
 - `scripts/selection-remap-check.mjs` —— 文件列表选中态在排序 / 过滤后的重映射。
@@ -337,6 +337,46 @@ npm test                       # 只跑单元测试
     后者必须传 `panelId`，并断言守卫出现在写入之前（顺序，不是「存在即可」）。
     四个变异（判据恒 true / 漏比活动面板 / 删守卫调用 / `panelId` 改回读 `activePanel`）
     都被抓住。
+- `scripts/delete-scope-check.mjs` —— 删除操作的目的地快照与落地判定（`src/deleteScope.js`）。
+
+  `onDelete` 逐项 `await`（进回收站 / 永久删除 / 提权重试，每项一次 IPC），一次几百项的
+  删除能跑上好几秒，期间用户完全可以点进别的目录或切标签。**而 `entries` 是这个面板
+  当前正在显示的那份列表，不是删除发生时的那份。**
+
+  这条修复本身有个教训：**原代码的入口快照早就存在**（连注释都写着「reading `activeTab`
+  inside the loop then points at a different directory」），但循环之后仍然直接读活的
+  `entries.value` —— 判据被写在了注释里而没落到代码上，只修了一半。所以这次不只改代码，
+  还要**钉住调用点真的查了守卫**。
+
+  三个落地点，后果各不相同：
+
+  - 过滤落在**新目录**的行上：真正的删除结果不反映到任何面板，且那个目录的列表被换成一个
+    内容相同的副本 —— 数组身份一变，`FileList` 的 entries watcher 就重置了用户在新目录里
+    的选中集。
+  - `remainingCount` 把**新目录**的条目数上报给父组件（用于「预览中删光目录 → 自动退出
+    预览」）：新目录恰好为空就关掉一个毫不相关的预览，非空就让一个文件已被删掉的预览继续
+    开着。
+  - 提权删除后的 2 秒延迟刷新里，`refresh()` 读的是**活动 tab**，同一个错误再犯一次，
+    且这次连「刷新了哪个目录」都是错的。
+
+  三条通用结论：
+
+  - 🚨 **`remainingCount` 必须是快照算的，不能改成「切走了就不 emit」**。不 emit 等于放弃
+    联动 —— 用户在预览中对侧面板删光整个目录、随后走开，预览就该关掉。正确做法是
+    **始终 emit，但用快照列表减掉已删路径**算个数（`remainingAfterDelete`）。
+  - **判据仍是「目的地还是不是它」，不是请求序号**（理由同 `loadGate.js`）：A→B→A 折返时
+    迟到的删除**应该**落地，那些文件确实已不在磁盘上。快照记三项 —— tabId、目录、列表；
+    tabId 与目录都得比，因为 Ctrl+T 克隆当前目录会造出「两个 tab 开着同一个目录」。
+  - ⚠️ **纯逻辑表抓不住「改实现不改调用点」**，这条正是该形状的样本：把守卫调用从
+    FilePanel.vue 删掉后，27 条纯逻辑断言**全绿**。所以额外钉了静态断言（`stripComments`
+    剥注释后按花括号配平抽出 `onDelete` 函数体），钉住快照在第一个 `await` 之前、
+    `filter` 被 `if (stillOnTarget())` 包住、两次 `emit` 的 `remainingCount` 来源、
+    延迟刷新里守卫查了两次。四个变异（判据恒 true / 改按 name 扣 / 删守卫调用 /
+    `remainingCount` 改回读活的 `entries`）都被抓住。
+
+  ⚠️ 写这条的静态断言时，helper 自己踩了一次坑：`bodyOf` 用 `indexOf("{", at)` 找函数体，
+  而 `onDelete(targets, opts = {})` 的**默认参数里就有一对花括号** → 配平后返回 `{}`，
+  13 条断言全灭而代码毫无问题。**抽函数体必须先配平圆括号跳过参数列表。**
 - `scripts/config-writer-check.mjs` —— 配置写入的落地顺序（`src/configWriter.js`）。
 
   这条测的是**顺序**而非完整性 —— 完整性由后端 `write_atomic` 保证，前端补不了也无需补。

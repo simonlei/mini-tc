@@ -105,6 +105,7 @@ import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, beginTrashDelete, commitTrashDelete, undoTrashDelete, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { loadLands, createSpinner } from "../loadGate.js";
+import { makeDeleteScope, deleteScopeLands, remainingAfterDelete } from "../deleteScope.js";
 import { cancelSearch, startSearch } from "../api.js";
 import { formatBytes } from "../format.js";
 import {
@@ -1424,14 +1425,21 @@ async function onDelete(targets, opts = {}) {
 
   const remove = permanent ? deletePermanently : deleteToTrash;
 
-  // Snapshot the tab this delete was aimed at. The loop below awaits per
-  // item (and may take seconds for a large selection), during which the user
-  // can navigate or switch tabs — reading `activeTab` inside the loop then
-  // points at a different directory, and the row filtering / tab bookkeeping
-  // would land on the wrong list.
+  // Snapshot the tab AND the listing this delete was aimed at. The loop below
+  // awaits per item (and may take seconds for a large selection), during which
+  // the user can navigate or switch tabs — reading `entries` inside the loop
+  // then points at a different directory, and the row filtering / the reported
+  // remaining count would describe that other directory instead of this one.
   const tab = activeTab.value;
   const tabId = tab.id;
   const dir = tab.path;
+  const scope = makeDeleteScope({ tabId, dir, list: entries.value });
+  // True while the panel still displays the listing this delete was aimed at.
+  // Re-read after every await — never cached across one. See src/deleteScope.js
+  // for why the test is "does the panel still point at this list" rather than a
+  // request sequence number.
+  const stillOnTarget = () =>
+    deleteScopeLands(scope, { tabId: activeTabId.value, dir: activeTab.value?.path });
 
   const successNames = [];
   const successPaths = [];    // absolute paths, for exact row removal
@@ -1478,11 +1486,20 @@ async function onDelete(targets, opts = {}) {
   // not take its namesake with it.
   if (successPaths.length) {
     const removed = new Set(successPaths);
-    entries.value = entries.value.filter((e) => !removed.has(e.path));
+    // Only touch the live listing while it is still the one this delete was
+    // aimed at. If the panel has navigated or switched tabs, `entries` describes
+    // a different directory — filtering it would silently drop the real result
+    // (the deleted rows stay on screen when the user comes back) and hand the
+    // other directory's list a fresh array identity, resetting its selection.
+    if (stillOnTarget()) {
+      entries.value = entries.value.filter((e) => !removed.has(e.path));
+    }
     // Drop both keyings — the row may have been cached under its name (real
     // directory) or its path (search-results tab). Written through
     // `updateDirSizes` so the bucket's path stamp survives; a deleted folder's
     // size would otherwise linger and be resurrected on a later re-list.
+    // Keyed by the snapshotted (tabId, dir), so it stays correct even after the
+    // panel has moved on.
     if (tab) {
       updateDirSizes(tabId, dir, (m) => {
         const next = { ...m };
@@ -1493,7 +1510,8 @@ async function onDelete(targets, opts = {}) {
     }
     // Keep the tab's own snapshot in sync — it is the source of truth for a
     // search tab, and anything that re-applies it (a refresh, a tab switch back)
-    // would otherwise resurrect the deleted rows.
+    // would otherwise resurrect the deleted rows. Safe to do unconditionally:
+    // it is this tab's private data, not the visible list.
     if (tab && tab.search) {
       tab.search.hits = tab.search.hits.filter((e) => !removed.has(e.path));
     }
@@ -1503,7 +1521,14 @@ async function onDelete(targets, opts = {}) {
   }
 
   // 通知父组件删除结果（含本面板剩余条目数），供「预览中删光目录 → 自动退出预览」联动。
-  emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
+  // remainingCount MUST come from the snapshot, never from `entries.value`: the
+  // latter describes whatever directory is on screen now, so a user who
+  // navigated away mid-delete would have an unrelated directory's row count
+  // close (or keep open) a preview it has nothing to do with.
+  emit("deleted", {
+    panelId: props.panelId,
+    remainingCount: remainingAfterDelete(scope.list, new Set(successPaths)),
+  });
 
   // For failed items: retry with admin elevation immediately. The UAC prompt
   // serves as the user's confirmation — no need for an extra dialog.
@@ -1529,9 +1554,20 @@ async function onDelete(targets, opts = {}) {
     );
     // Elevated delete runs in its own process; delay-refresh to pick up results,
     // then re-check empty state so the preview can exit if the whole directory
-    // is now gone.
+    // is now gone. Both steps are gated on the panel still showing the listing
+    // this delete was aimed at: `refresh()` re-reads the ACTIVE tab, so running
+    // it after the user navigated away would pointlessly reload (and reset the
+    // selection of) some unrelated directory, and re-emitting here would repeat
+    // the original bug with an even staler count. Nothing is lost by skipping —
+    // switching back to the tab re-lists from disk anyway.
     setTimeout(() => {
+      if (!stillOnTarget()) {
+        refreshDrives();
+        return;
+      }
       refresh().then(() => {
+        // Re-check after the refresh's own await: it may have been superseded.
+        if (!stillOnTarget()) return;
         emit("deleted", { panelId: props.panelId, remainingCount: entries.value.length });
       });
       refreshDrives();
