@@ -6,6 +6,8 @@
 // that is reachable from `vite build`. This exercises it directly with a stub for
 // the IPC layer.
 
+import fs from "node:fs";
+
 import {
   splitName,
   validateName,
@@ -109,6 +111,88 @@ eq(
   "2.txt",
   "placeholder inside replacement"
 );
+
+// ── numbering: emptied inputs must fall back, NOT become 0 ──
+// The dialog binds seqStart/seqStep/seqPad with `v-model.number` on
+// `<input type="number">`. Clearing one leaves the empty STRING (Vue's
+// `looseToNumber("")` is `parseFloat("") || ""`), not 0 — and the old guard
+// `Number.isFinite(+v) ? +v : 1` was blind to it because `+""` is 0, which is
+// finite, so the fallback could never fire.
+//
+// Every case below is asserted against the DEFAULT the dialog starts from, so
+// they pin "empty behaves as untouched" rather than a magic number.
+{
+  const seqOf = (over, index) => computeNewName("a.txt", index, num(over)).seq;
+
+  // Clearing START must number from 1, not from 0.
+  eq(seqOf({ seqStart: "" }, 0), "1", "emptied seqStart falls back to 1");
+  eq(seqOf({ seqStart: "" }, 2), "3", "emptied seqStart keeps numbering per row");
+  // Clearing STEP must advance by 1. This is the load-bearing one: with step 0
+  // every row computes the SAME number.
+  eq(seqOf({ seqStep: "" }, 0), "1", "emptied seqStep falls back to 1");
+  eq(seqOf({ seqStep: "" }, 2), "3", "emptied seqStep still advances across rows");
+  // Whitespace is what a user actually leaves behind after select-all + space.
+  eq(seqOf({ seqStart: "   " }, 1), "2", "whitespace-only seqStart falls back");
+  eq(seqOf({ seqStep: "  " }, 1), "2", "whitespace-only seqStep falls back");
+  // Both at once, and together with a padding that IS set. index 3 with the
+  // defaults gives n = 4, which is already two digits — so pad 2 leaves it
+  // alone. (Asserted at index 1 too, where padding genuinely shows.)
+  eq(seqOf({ seqStart: "", seqStep: "", seqPad: 2 }, 1), "02", "both emptied, padding still applies");
+  eq(seqOf({ seqStart: "", seqStep: "", seqPad: 2 }, 3), "04", "both emptied, two-digit number is not truncated");
+
+  // 0 is a LEGAL start (the input is min="0"), so it must be honoured rather
+  // than treated as "absent" — this is what separates a falsy check from an
+  // emptiness check.
+  eq(seqOf({ seqStart: 0 }, 0), "0", "seqStart 0 is honoured, not treated as empty");
+  eq(seqOf({ seqStart: 0 }, 2), "2", "seqStart 0 still advances");
+  eq(seqOf({ seqStep: 0 }, 2), "1", "explicit step 0 is honoured (frozen numbering)");
+
+  // seqPad's own default is 0, which is why the old `parseInt(...) || 0`
+  // happened to dodge the same trap — assert the empty case anyway so a future
+  // refactor can't quietly reintroduce it there.
+  eq(seqOf({ seqPad: "" }, 0), "1", "emptied seqPad falls back to no padding");
+  eq(seqOf({ seqPad: "" }, 5), "6", "emptied seqPad still numbers per row");
+
+  // Non-numeric junk falls back too, and must not partially parse.
+  // The discriminating case: `parseInt("3abc")` is 3, `Number("3abc")` is NaN.
+  // At index 1 that is n = 2 (fallback step 1) versus n = 4 (partial parse), so
+  // this single assertion separates the two implementations.
+  eq(seqOf({ seqStart: "abc" }, 1), "2", "non-numeric seqStart falls back");
+  eq(seqOf({ seqStep: "3abc" }, 1), "2", "partial numeric is not parsed as 3");
+  eq(seqOf({ seqStart: null }, 1), "2", "null seqStart falls back");
+  eq(seqOf({ seqStep: undefined }, 1), "2", "undefined seqStep falls back");
+
+  // Padding is still clamped to the input's 0..10 range — 99 becomes ten zeros.
+  eq(seqOf({ seqPad: 99 }, 0), "0000000001", "seqPad clamped to 10");
+  eq(seqOf({ seqPad: -5 }, 0), "1", "negative seqPad clamped to 0");
+}
+
+// End-to-end through the real planner: with STEP emptied the three rows used to
+// land on a_1/b_1/c_1 — all distinct, so the duplicate check never fired and the
+// batch ran silently with the wrong numbers. Assert the whole batch, not just
+// the helper, so a future change to the collision check can't mask this.
+{
+  const SRC = [
+    { path: "D:\\d\\a.txt", name: "a.txt" },
+    { path: "D:\\d\\b.txt", name: "b.txt" },
+    { path: "D:\\d\\c.txt", name: "c.txt" },
+  ];
+  const namesFor = (over) =>
+    buildRenamePlan(SRC, new Set(), { ...base, numbering: true, ...over }).map((r) => r.newName);
+
+  eq(namesFor({ seqStep: "" }), ["a_1.txt", "b_2.txt", "c_3.txt"], "emptied step numbers the batch correctly");
+  eq(namesFor({ seqStart: "" }), ["a_1.txt", "b_2.txt", "c_3.txt"], "emptied start numbers the batch correctly");
+
+  // Control arm proving the assertions above have teeth: the OLD behaviour is
+  // reachable by asking for step 0 explicitly, and it is genuinely different.
+  eq(namesFor({ seqStep: 0 }), ["a_1.txt", "b_1.txt", "c_1.txt"], "control: explicit step 0 freezes numbering");
+
+  // And the frozen case really does pass the collision check — which is why
+  // this was a silent wrong-write rather than a visible refusal.
+  const frozen = buildRenamePlan(SRC, new Set(), { ...base, numbering: true, seqStep: 0 });
+  eq(summarizePlan(frozen), { total: 3, ok: 3, unchanged: 0, errors: 0 },
+    "control: frozen numbering is NOT caught by the duplicate check");
+}
 
 // ── computeNewName: prefix / suffix / case ──
 eq(computeNewName("a.txt", 0, R({ prefix: "pre_", suffix: "_suf" })).name, "pre_a_suf.txt", "prefix+suffix");
@@ -494,6 +578,31 @@ function makeFs() {
     threw = true;
   }
   ok(threw, "applyRenamePlan rejects without a move callback");
+}
+
+// ── static check: the three numbering fields must all go through seqNumber ──
+// Pure-logic assertions stay green if someone reintroduces an inline coercion
+// at ONE call site, so pin the wiring as well. This is the "changed the
+// implementation, not the caller" guard.
+{
+  const src = fs.readFileSync(new URL("../src/renameRules.js", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf("function sequenceNumber"));
+  const seqBody = body.slice(0, body.indexOf("\n}"));
+
+  eq(
+    (seqBody.match(/seqNumber\(/g) || []).length,
+    3,
+    "all three numbering fields route through seqNumber"
+  );
+  ok(/seqNumber\(rules\.seqStart,\s*1\)/.test(seqBody), "seqStart uses the 1 default");
+  ok(/seqNumber\(rules\.seqStep,\s*1\)/.test(seqBody), "seqStep uses the 1 default");
+  ok(/seqNumber\(rules\.seqPad,\s*0\)/.test(seqBody), "seqPad uses the 0 default");
+
+  // The trap itself must not reappear anywhere in the numbering code.
+  const seqSrc = src.slice(src.indexOf("function seqNumber"), src.indexOf("function sequenceNumber"));
+  ok(!/\+\s*rules\.seq/.test(src), "no `+rules.seq*` coercion is left anywhere");
+  ok(!/parseInt\(\s*rules\.seqPad/.test(src), "seqPad is not parseInt-based");
+  ok(seqSrc.length > 0, "seqNumber helper is present");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

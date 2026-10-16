@@ -137,11 +137,37 @@ function applyTokens(text, num) {
   return String(text == null ? "" : text).replace(/\[N\]/g, String(num));
 }
 
+/// Read one of the numbering fields, falling back to `fallback` when the box
+/// was left empty.
+///
+/// The dialog binds these with `v-model.number` on `<input type="number">`.
+/// Clearing such an input does NOT produce `0` — Vue's number modifier runs
+/// `looseToNumber("")`, which is `parseFloat("") || ""`, i.e. the empty STRING.
+/// The old guard (`Number.isFinite(+v) ? +v : 1`) was blind to that: `+""` is `0`,
+/// which IS finite, so the `: 1` fallback could never fire.
+///
+/// Consequences measured, not assumed (`scripts/rename-rules-check.mjs` covers
+/// both): clearing START silently numbers from 0; clearing STEP gives EVERY row
+/// the same number. Note the latter is NOT caught by the duplicate check —
+/// `a.txt/b.txt/c.txt` map to `a_1/b_1/c_1`, all distinct, so the batch runs and
+/// writes the wrong names with no error anywhere.
+///
+/// Only genuinely absent values fall back. `0` is a legal start (the input is
+/// `min="0"`) and must be honoured, so the test is emptiness, not falsiness.
+/// Coercion goes through `Number()` rather than `parseInt` so a partial parse
+/// ("3abc") cannot silently become 3; a number input rejects such text anyway.
+function seqNumber(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "string" && value.trim() === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 /// The number for row `index` (0-based, in the order the list is displayed).
 function sequenceNumber(index, rules) {
-  const start = Number.isFinite(+rules.seqStart) ? +rules.seqStart : 1;
-  const step = Number.isFinite(+rules.seqStep) ? +rules.seqStep : 1;
-  const pad = Math.min(10, Math.max(0, parseInt(rules.seqPad, 10) || 0));
+  const start = seqNumber(rules.seqStart, 1);
+  const step = seqNumber(rules.seqStep, 1);
+  const pad = Math.min(10, Math.max(0, Math.round(seqNumber(rules.seqPad, 0))));
   const n = start + index * step;
   const s = String(n);
   return pad > s.length ? "0".repeat(pad - s.length) + s : s;

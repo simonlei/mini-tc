@@ -7,7 +7,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint:imports": "node scripts/lint-imports.js",
-    "test": "node scripts/rename-rules-check.mjs && node scripts/selection-remap-check.mjs && node scripts/entry-key-check.mjs && node scripts/row-key-identity-check.mjs && node scripts/load-gate.test.mjs && node scripts/preview-gate.test.mjs && node scripts/preview-request.test.mjs && node scripts/autoplay-gate.test.mjs && node scripts/delete-scope-check.mjs && node scripts/config-writer-check.mjs && node scripts/format-size-check.mjs && node scripts/docx-sanitize-check.mjs && node scripts/node-pick-check.mjs && node scripts/keyboard-text-check.mjs",
+    "test": "node scripts/rename-rules-check.mjs && node scripts/seq-number-mutation.mjs && node scripts/selection-remap-check.mjs && node scripts/entry-key-check.mjs && node scripts/row-key-identity-check.mjs && node scripts/load-gate.test.mjs && node scripts/preview-gate.test.mjs && node scripts/preview-request.test.mjs && node scripts/autoplay-gate.test.mjs && node scripts/delete-scope-check.mjs && node scripts/config-writer-check.mjs && node scripts/format-size-check.mjs && node scripts/docx-sanitize-check.mjs && node scripts/node-pick-check.mjs && node scripts/keyboard-text-check.mjs",
     "check": "npm run lint:imports && npm test",
     "tauri": "tauri"
   },
