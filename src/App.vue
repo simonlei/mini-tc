@@ -269,6 +269,13 @@ import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, set
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
 import { makePreviewRequest, previewRequestLands } from "./previewRequest.js";
 import { formatBytes } from "./format.js";
+import {
+  isTypingTarget,
+  previewTextRoot,
+  selectionPreviewRoot,
+  classifySelectAll,
+  selectAllPreviewText,
+} from "./keyboardText.js";
 import { splitName, validateName } from "./renameRules.js";
 import { loadShortcuts, saveShortcuts, matches, markHandled, isHandled, eventCombo } from "./shortcuts.js";
 import { loadBookmarks, findBookmark, addBookmark, removeBookmark } from "./bookmarks.js";
@@ -2014,12 +2021,6 @@ let lastRegainAt = 0;
 let unlistenTauriFocus = null;
 let appUnmounted = false;
 
-function isTypingTarget(el) {
-  if (!el) return false;
-  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return true;
-  return el.isContentEditable === true;
-}
-
 // Put keyboard focus back on the active panel's file list. Skipped while the
 // user is typing somewhere (address bar, filename filter, inline rename) or is
 // inside a preview surface, so we never yank focus out of a live interaction.
@@ -2106,10 +2107,7 @@ onMounted(() => {
     // address bar, which stay interactive during preview), let that input handle
     // Esc on its own (e.g. cancel the filter) instead of closing the preview.
     if (matches("preview.close", e) && previewVisible.value) {
-      const t = e.target;
-      const inEditable =
-        t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
-      if (!inEditable) {
+      if (!isTypingTarget(e.target)) {
         e.preventDefault();
         markHandled(e);
         closePreview();
@@ -2137,11 +2135,28 @@ onMounted(() => {
       return;
     }
 
-    // Ctrl+A: select all entries in the active panel (skip when typing in a text input).
+    // Ctrl+A: select all entries in the active panel -- but only when the key
+    // isn't already owned by a text surface. Three cases, in order:
+    //   - an editable element (address bar / filter / dialog input): the webview
+    //     already does the right thing, so don't consume the event at all;
+    //   - the preview text surface: "select all" means the text on screen, not
+    //     the file list behind it. `<pre class="preview-text">` is neither an
+    //     input nor contenteditable and has no tabindex, so this used to fall
+    //     through and select every file while the user was looking at text;
+    //   - otherwise: the file grid.
     if (matches("edit.selectAll", e)) {
-      const t = e.target;
-      if (t && t.tagName === "INPUT") return; // let the filter input select its text
+      const intent = classifySelectAll(e.target, window.getSelection());
+      if (intent === "native") return; // let the browser select the text
       e.preventDefault();
+      if (intent === "previewText") {
+        markHandled(e);
+        const root = previewTextRoot(e.target) || selectionPreviewRoot(window.getSelection());
+        if (selectAllPreviewText(root, document, window)) return;
+        // No Selection available: fall through to the file grid rather than
+        // swallowing the key.
+        getActivePanelRef()?.selectAll?.();
+        return;
+      }
       markHandled(e);
       getActivePanelRef()?.selectAll?.();
       return;
@@ -2158,8 +2173,7 @@ onMounted(() => {
     const isCut = matches("edit.cut", e);
     const isPaste = matches("edit.paste", e);
     if (isCopy || isCut || isPaste) {
-      const t = e.target;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+      if (isTypingTarget(e.target)) {
         return; // let the browser do native text copy/cut/paste
       }
       if (isCopy || isCut) {
@@ -2337,8 +2351,7 @@ onMounted(() => {
       // A text input owns its own keys: while renaming a bookmark the ⭐
       // dropdown has a focused `.bm-input`, and toggling the bookmark out from
       // under the user's cursor would be a nasty surprise.
-      const t = e.target;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+      if (isTypingTarget(e.target)) {
         return;
       }
       const panel = getActivePanelRef();
@@ -2366,8 +2379,7 @@ onMounted(() => {
     // always returns the full listing), so the toggle is instant even in a
     // directory with thousands of entries — no re-listing.
     if (matches("view.toggleHidden", e)) {
-      const t = e.target;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+      if (isTypingTarget(e.target)) {
         return;
       }
       const panelId = activePanel.value;

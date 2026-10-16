@@ -72,12 +72,16 @@
     <!-- Text / JSON preview -->
     <div class="preview-body text-body" v-else-if="previewType === 'text' || previewType === 'json' || previewType === 'log'">
       <div class="json-warn" v-if="jsonWarn">{{ jsonWarn }}</div>
-      <pre class="preview-text"><code>{{ previewContent }}</code></pre>
+      <!-- tabindex: these are non-editable, so without a focus stop the keyboard
+           user can never reach them and Ctrl+A / screen readers skip the content.
+           Focus alone grants no editing rights -- App.vue's guards key off the
+           element type and the selection, not off focus. -->
+      <pre class="preview-text" tabindex="0"><code>{{ previewContent }}</code></pre>
     </div>
 
     <!-- Word (.docx) preview: rendered HTML from mammoth (v-html, sanitized) -->
     <div class="preview-body doc-body" v-else-if="previewType === 'docx'">
-      <div class="preview-doc" v-html="previewContent"></div>
+      <div class="preview-doc" tabindex="0" v-html="previewContent"></div>
     </div>
 
     <!-- Legacy .doc: friendly notice to re-save as .docx -->
