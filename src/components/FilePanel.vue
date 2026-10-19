@@ -105,6 +105,7 @@ import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, beginTrashDelete, commitTrashDelete, undoTrashDelete, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { loadLands, createSpinner } from "../loadGate.js";
+import { createCtxGate } from "../ctxMenuGate.js";
 import { makeDeleteScope, deleteScopeLands, remainingAfterDelete } from "../deleteScope.js";
 import { cancelSearch, startSearch } from "../api.js";
 import { formatBytes } from "../format.js";
@@ -280,8 +281,11 @@ const spinner = createSpinner();
 // Discovered external extraction tools (filled on mount).
 const archiveTools = ref([]);
 
-// Right-click context menu state.
-const ctxMenu = ref({ visible: false, x: 0, y: 0, items: [] });
+// Right-click context menu state. `path` is the directory the menu was BUILT
+// for — actions resolve rows against it, so it must be the snapshot taken at
+// right-click time, not whatever the active tab happens to be when the user
+// clicks an item.
+const ctxMenu = ref({ visible: false, x: 0, y: 0, items: [], path: "" });
 // Which entry the open menu was invoked on (null = background).
 const ctxEntry = ref(null);
 // Whether the row the open menu was invoked on is a runnable target, resolved
@@ -289,6 +293,12 @@ const ctxEntry = ref(null);
 // derived from the file's CONTENT (PE signature / script body), not from the
 // listing row, and must never make the row itself look different.
 const ctxIsExecutable = ref(false);
+
+// Which right-click is still allowed to produce a menu. Building one means
+// awaiting the archive-tool probe and the backend executable check, so two
+// right-clicks can be in flight at once; without this the slower, older one
+// lands last and takes over the newer row's menu. See src/ctxMenuGate.js.
+const ctxGate = createCtxGate();
 
 // Lightweight toast (mirrors App.vue's, kept local so this panel is self-contained).
 const toast = ref({ visible: false, text: "", type: "info" });
@@ -1161,7 +1171,7 @@ function navigateTo(newPath) {
   setPath(activeTab.value, newPath);
 }
 
-async function navigateInto(entryOrName) {
+async function navigateInto(entryOrName, basePath) {
   if (!activeTab.value) return;
   const entry =
     typeof entryOrName === "string" ? { name: entryOrName } : entryOrName;
@@ -1171,7 +1181,9 @@ async function navigateInto(entryOrName) {
   // hit takes you out of the result set and into the filesystem). The absolute
   // path on the row is what makes this work — a name-only join would resolve
   // against the sentinel `minitc://search/…` path and fail.
-  const newPath = await entryPath(entry, activeTab.value.path);
+  // `basePath` is passed by the context menu so a row is resolved against the
+  // directory the menu was built for, not the active tab if it moved on.
+  const newPath = await entryPath(entry, basePath || activeTab.value.path);
   // Leaving the result set for a real directory: the tab is no longer virtual.
   activeTab.value.search = null;
   setPath(activeTab.value, newPath);
@@ -1611,12 +1623,15 @@ async function onRename(entry, newName) {
 
 // ── Open file ──
 
-async function onOpen(fileNameOrEntry) {
+async function onOpen(fileNameOrEntry, basePath) {
   if (!activeTab.value) return;
   const entry =
     typeof fileNameOrEntry === "string" ? { name: fileNameOrEntry } : fileNameOrEntry;
   if (!entry || !entry.name) return;
-  const fullPath = await entryPath(entry, activeTab.value.path);
+  // `basePath` comes from the context menu: the row must be resolved against the
+  // directory the menu was built for, not the active tab if it moved on while
+  // the menu was open.
+  const fullPath = await entryPath(entry, basePath || activeTab.value.path);
 
   // Double-clicking any file opens it with the OS default app/player. Videos
   // are no exception — the in-app video preview is still reachable via Ctrl+Q
@@ -1633,6 +1648,12 @@ async function onOpen(fileNameOrEntry) {
 
 function closeCtxMenu() {
   ctxMenu.value = { ...ctxMenu.value, visible: false };
+  // Also invalidate builds that haven't produced a menu yet: dismissing a menu
+  // (or any click landing outside it) is the user saying "not that one", and a
+  // probe still in flight must not pop a menu afterwards. Safe to call from
+  // `handleCtxSelect` — by then the menu is already on screen, so the token has
+  // landed and there is nothing left to cancel.
+  ctxGate.reset();
 }
 
 // Does this row belong to the pending "cut" set? Mirrors FileList's isCut():
@@ -1762,26 +1783,62 @@ function ensureArchiveTools() {
 }
 
 // Open the context menu at the cursor for the given entry.
+//
+// Three awaits stand between the right-click and the menu appearing (archive
+// tool probe → row→path resolution → executable check), and the first one can
+// take seconds on a cold start. Every one of them hands control back to the
+// user, who may right-click another row, navigate, or switch tabs meanwhile —
+// so each await is followed by a landing check, and NOTHING is written to the
+// shared `ctxMenu` / `ctxEntry` / `ctxIsExecutable` state until the very end.
+// Writing them earlier is what let a stale build overwrite a newer menu:
+// `ctxEntry` had already moved on, so the menu showed row A while every action
+// it offered applied to row B — renaming or elevating the wrong file, silently.
 async function onCtxMenu({ entry, x, y }) {
-  ctxEntry.value = entry;
+  // The tab this right-click belongs to, captured before the first await:
+  // `entryPath` resolves the row against the *active* tab, so reading it later
+  // would resolve the row against wherever the user has since navigated to.
+  const tab = activeTab.value;
+  const path = tab?.path || "";
+  const tabId = tab?.id;
+  const token = ctxGate.begin();
+  const superseded = () =>
+    !ctxGate.lands(token, {
+      path,
+      currentPath: activeTab.value?.path || "",
+      tabId,
+      currentTabId: activeTab.value?.id,
+    });
+
   // Ensure the archive-tool list is available before building the menu (first
   // right-click only; afterwards it's cached and instant).
   await ensureArchiveTools();
+  if (superseded()) return;
+
   // Whether to offer "以管理员身份运行" needs the backend (extension + PE
   // header / script body check), so it has to be resolved before the menu is
   // built. Both probes are one-shot and cheap after the first right-click.
-  ctxIsExecutable.value = false;
+  // The result is held in a local: `ctxIsExecutable` is read by
+  // `buildMenuItems`, so it must reflect THIS row, not a half-updated mix.
+  let isExecutableRow = false;
   if (entry && !entry.is_dir) {
     try {
-      const full = await entryPath(entry, activeTab.value?.path || "");
-      ctxIsExecutable.value = await isExecutable(full);
+      const full = await entryPath(entry, path);
+      if (superseded()) return;
+      isExecutableRow = await isExecutable(full);
+      if (superseded()) return;
     } catch (e) {
       // A row we can't even resolve to a path can't be launched; just leave the
       // entry out rather than showing an action that would fail.
       console.warn("is_executable failed:", e);
+      if (superseded()) return;
     }
   }
-  ctxMenu.value = { visible: true, x, y, items: buildMenuItems(entry) };
+  ctxIsExecutable.value = isExecutableRow;
+  // `ctxEntry` is committed here, together with the menu — never before. It is
+  // what `handleCtxSelect` acts on, so it must always describe the menu that is
+  // actually on screen, never an earlier right-click's row.
+  ctxEntry.value = entry;
+  ctxMenu.value = { visible: true, x, y, items: buildMenuItems(entry), path };
 }
 
 // Dispatch a menu selection.
@@ -1789,15 +1846,20 @@ async function handleCtxSelect(item) {
   closeCtxMenu();
   if (item.disabled) return;
   const entry = ctxEntry.value;
-  const path = activeTab.value?.path;
+  // The directory the menu was BUILT for, not the active tab's path now. The
+  // overlay swallows mouse clicks, but keyboard navigation (Ctrl+Tab, Alt+←)
+  // still reaches the global handler while the menu is open, so the active tab
+  // can have moved on. Resolving rows against it would aim every action at
+  // another directory.
+  const path = ctxMenu.value.path;
   if (!path) return;
 
   switch (item.action) {
     case "open":
       if (entry.is_dir) {
-        navigateInto(entry);
+        navigateInto(entry, path);
       } else {
-        onOpen(entry);
+        onOpen(entry, path);
       }
       break;
     case "open-container": {
@@ -1818,10 +1880,10 @@ async function handleCtxSelect(item) {
       refresh({ force: true });
       break;
     case "run-as-admin":
-      await doRunAsAdmin(entry);
+      await doRunAsAdmin(entry, path);
       break;
     case "new-folder":
-      await doNewFolder();
+      await doNewFolder(path);
       break;
     case "rename":
       fileListRef.value?.startRenameByEntry?.(entry);
@@ -1837,11 +1899,11 @@ async function handleCtxSelect(item) {
       // Batch case: the menu item carries the full set of selected archives
       // (see extractTargets); fall back to the right-clicked row alone.
       const targets = item.targets?.length ? item.targets : extractTargets(entry);
-      await doExtract(targets, item.tool, item.mode);
+      await doExtract(targets, item.tool, item.mode, path);
       break;
     }
     case "add-to-archive":
-      await doAddToArchive();
+      await doAddToArchive(path);
       break;
   }
 }
@@ -1874,9 +1936,9 @@ function applyRenames(pairs) {
 // Launch an entry elevated (UAC prompt shown by the OS). Only ever applies to
 // the row that was right-clicked — deliberately not to the whole selection:
 // "run these three programs as admin" is not a thing anyone means.
-async function doRunAsAdmin(entry) {
+async function doRunAsAdmin(entry, basePath) {
   try {
-    const full = await entryPath(entry, activeTab.value?.path || "");
+    const full = await entryPath(entry, basePath || activeTab.value?.path || "");
     await runAsAdmin(full);
     // No toast on success: the elevated window coming up IS the feedback, and a
     // toast would linger while the user is dealing with the UAC/child window.
@@ -1906,8 +1968,8 @@ function uniqueNewFolderName() {
 // right-click "新建目录" menu item). After creation we refresh the listing and
 // immediately drop the new folder into inline-rename, mirroring Explorer's
 // "create + edit name" flow.
-async function doNewFolder() {
-  const path = activeTab.value?.path;
+async function doNewFolder(basePath) {
+  const path = basePath || activeTab.value?.path;
   if (!path) return;
   // A search-results directory has no real parent to create anything inside —
   // its rows merely *look* co-located. Refuse rather than silently creating
@@ -1935,8 +1997,8 @@ async function doNewFolder() {
 
 // Compress the current selection (or the right-clicked entry) into a single
 // archive named after the current folder, using the first available CLI tool.
-async function doAddToArchive() {
-  const path = activeTab.value?.path;
+async function doAddToArchive(basePath) {
+  const path = basePath || activeTab.value?.path;
   if (!path) return;
 
   // The set to compress: the full multi-selection when it's non-empty (the
@@ -2001,8 +2063,8 @@ async function doAddToArchive() {
 // afterwards. `targets` is extracted strictly in order: GUI tools are waited
 // on (bounded) so only one tool window is open at a time, and CLI tools run to
 // completion before the next archive starts.
-async function doExtract(targets, tool, mode) {
-  const path = activeTab.value?.path;
+async function doExtract(targets, tool, mode, basePath) {
+  const path = basePath || activeTab.value?.path;
   if (!path) return;
   const list = (targets || []).filter(Boolean);
   if (list.length === 0) return;

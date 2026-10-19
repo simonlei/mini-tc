@@ -418,6 +418,58 @@ npm test                       # 只跑单元测试
   ⚠️ 写这条的静态断言时，helper 自己踩了一次坑：`bodyOf` 用 `indexOf("{", at)` 找函数体，
   而 `onDelete(targets, opts = {})` 的**默认参数里就有一对花括号** → 配平后返回 `{}`，
   13 条断言全灭而代码毫无问题。**抽函数体必须先配平圆括号跳过参数列表。**
+- `scripts/ctx-menu-gate-check.mjs` —— 右键菜单的并发落地判定（`src/ctxMenuGate.js`）。
+
+  右键菜单不是「取到结果就渲染」，而是**建菜单之前要先 await**：`ensureArchiveTools()`
+  （首次右键要扫盘找 7-Zip/WinRAR，可能数秒）→ `entryPath()`（行解析成绝对路径）→
+  `isExecutable()`（后端判 PE 头 / 脚本体）。三个 await 都把控制权交回用户，而用户
+  在这三秒里完全可以右键**另一行**。
+
+  原来的代码在第一个 await **之前**就写了 `ctxEntry`，又在每个 await 之后无条件写
+  `ctxIsExecutable` 与 `ctxMenu`。于是慢的那次右键会**接管快的那次的菜单**：
+  菜单显示的是 B 行的项目、坐标却是 A 行的位置，而 `ctxEntry` 早已指向 B ——
+  用户点「重命名」改的是另一个文件，点「以管理员身份运行」提权跑的是另一个文件。
+  **静默的错误对象操作，全程无报错。**
+
+  判据是 `src/ctxMenuGate.js` 的 `ctxMenuLands()`，两条都在问「目的地还是不是它」：
+
+  - **意图身份**：每次右键 `begin()` 拿一个全新的对象 token。用**对象身份而不是自增
+    序号** —— 本项目里序号已被反复证伪（`rerunSearch` 用 `Date.now() % 1000000`，
+    16.7 分钟循环一次）。且 A→B→A 折返时第一个 A 的 token 已被第三次右键换掉，
+    不会「谁都不落地」。
+  - **目的地**：tab 身份 + 目录路径。`entryPath` 是拿**活动 tab 的 path** 去拼行的，
+    等待期间面板一旦导航走，菜单动作就打到别的目录上。两项都得比：Ctrl+T 克隆当前
+    目录会造出「两个 tab 开着同一个目录」。
+
+  配套的三条通用结论：
+
+  - 🚨 **共享状态只在末尾一次性提交**。守卫的真正价值不在「少弹一个菜单」，而在把
+    `ctxEntry` / `ctxIsExecutable` / `ctxMenu` 三次写入从 await 中间挪到全部 await
+    之后 —— 半更新的中间态比完全不更新更毒。`ctxIsExecutable` 因此改成局部变量，
+    确认落地了才赋给 ref。
+  - 🚨 **关闭语义必须与落地判据分开**。第一版想把「菜单是否可见」也写进判据 ——
+    但 `handleCtxSelect` 的**第一行就是 `closeCtxMenu()`**，那会让自己作废自己，
+    右键菜单永远弹不出来。所以关闭单独由 `gate.reset()` 承担：它作废的是**仍在飞的
+    构建**（用户在探测期间点掉遮罩，之后不该再弹一次），与「结果能否落地」是两件事。
+    测试里专门钉了「同一 token 连续复核 5 次都通过」这条前提。
+  - 🚨 **路径快照要一路传下去，停在半路等于没做**。`ctxMenu` 现在存着菜单**建的时候**
+    的 path，`handleCtxSelect` 用它、并透传给 `doRunAsAdmin` / `doExtract` /
+    `doAddToArchive` / `doNewFolder` / `onOpen` / `navigateInto` 六个 action。
+    原因是菜单的遮罩吞掉鼠标点击，但**键盘导航（Ctrl+Tab、Alt+←）仍会打到全局处理器**
+    —— 菜单开着时面板完全可能已经换目录了。
+
+  ⚠️ 纯逻辑断言抓不住「改实现不改调用点」（把 `superseded()` 从 FilePanel.vue 删掉，
+  51 条断言里只有静态那几条会红），所以额外钉了静态断言：守卫被 import、`ctxGate`
+  实例存在、**3 个 await 逐个查**后面都有复核、三处共享状态赋值都在最后一个 await
+  之后、`closeCtxMenu` 调了 `reset`、`handleCtxSelect` 用 `ctxMenu.value.path`
+  且不再重读 `activeTab`、六个 action 都接了 `basePath` 形参。
+  ⚠️ 「逐个查 await」的边界一开始写错了：跨度取到函数末尾，于是 `catch` 分支里的
+  那次复核被算到了前一个 `await` 头上，**「删掉 `isExecutable` 之后的复核」这个变异
+  0 FAIL 逃过了**。边界收紧到下一个 `await` / `catch` / `finally` 才抓住。
+  变异测试实测 **14/14 全被抓到**（判据恒 true / 漏比目的地 / 漏比 tabId / 路径改宽松
+  相等 / `reset` 变空操作 / `begin` 不换 token / 删任一 await 后的复核 / `ctxEntry`
+  提前赋值 / `closeCtxMenu` 不 reset / 路径快照改回读 `activeTab` / `doExtract` 不接
+  `basePath`）。带对照臂：判据退化为恒 true 时，4 个「必须作废」场景全部反向。
 - `scripts/config-writer-check.mjs` —— 配置写入的落地顺序（`src/configWriter.js`）。
 
   这条测的是**顺序**而非完整性 —— 完整性由后端 `write_atomic` 保证，前端补不了也无需补。

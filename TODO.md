@@ -9,7 +9,6 @@
 
 ## P1 — 真 bug / 竞态 / 泄漏 / 明显性能
 
-- [ ] **修复：`onCtxMenu` 两个 await 之间无序号，慢的旧右键会覆盖新右键的可执行判定** — `FilePanel.vue:1639-1659`。首次右键要扫盘探测压缩工具（可能数秒），用户在 B 行右键后 A 的流程才落地，把 `ctxIsExecutable` 改成 A 的结果，而菜单已按 B 弹出。修法：`let ctxSeq = 0`，每个 await 后校验；`handleCtxSelect` 的 `activeTab.value?.path`（`1666`）在菜单打开时快照。
 - [ ] **修复：`VideoPreview.loadVideo()` 与 `detectSubtitles()` 无并发守卫 → 字幕串台** — `VideoPreview.vue:655-670/672-695`。`onMounted` 的 `await loadPlayerConfig()` 未 resolve 时若 `filePath` 变了，watcher 的 `loadVideo()` 先跑、随后 `onMounted` 又跑一次；两次各自 `await detectSubtitles()`，而 `loadSubtitleByPath` 会在新 `loadVideo()` 已执行 `subtitleTracks.value = []` 之后才 resolve，把**旧文件目录**的字幕推进新文件的轨道列表。修法：同一套 `loadToken`。
 - [ ] **修复：`loadVideo()` 不 pause 旧视频，切文件时旧音频继续响到新资源起播；`videoSrc = ""` 是死代码** — `VideoPreview.vue:655-660`。`videoSrc.value = ""` 与下面的赋值在同一个同步块内，Vue 渲染批处理会合并，`<video>` 的 `src` 从旧 URL 直接跳到新 URL，`""` 从未落到 DOM —— 这行代码给人「先清空」的错觉，实际什么也没做。同时 `resW/resH`（`195-196`）没重置，标题栏加载期间显示上一条的分辨率。修法：清理搬进 DOM（`pause()` + `removeAttribute("src")` + `load()`），重置 `resW/resH`。
 - [ ] **修复：全局 keydown 监听器注册在 `onMounted` 匿名函数里，`onUnmounted` 无法移除** — `App.vue:1858` ↔ `2179-2190`。这条监听闭包持有整个组件作用域（所有 ref、panel ref），组件卸载后仍驻留在 `document` 上，HMR 或任何重新挂载都会再叠一份。修法：提取具名 `onGlobalKeydown`，`onMounted`/`onUnmounted` 对称增删。
