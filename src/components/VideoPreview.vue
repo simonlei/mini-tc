@@ -507,11 +507,6 @@ function parseSubtitle(text, e) {
   return parseSRT(text);
 }
 
-function getExt(name) {
-  const p = name.split(".");
-  return p.length > 1 ? p.pop().toLowerCase() : "";
-}
-
 // ── Subtitle detection (concurrency-guarded; see ../subtitleGate.js) ──
 //
 // `loadVideo()` awaits the whole chain: getParentDir → listDirectory → one fetch

@@ -343,6 +343,25 @@ npm test                       # 只跑单元测试
   顺带一处值得记的窗口：`await entryPath(...)` 期间用户可能已关掉预览，await 后的
   快照一律不可信；而「关闭预览」会 unmount 播放器、`loadVideo()` 根本不会跑 ——
   撤销必须做在**事件发生处**（`closePreview` 里 `arm(null)`），不能等「状态不匹配时」。
+- `scripts/sfc-check.mjs` —— 把 `src/components/*.vue` 逐个过一遍
+  `@vue/compiler-sfc` 的 `parse` + `compileScript`。挂在 `npm run check` 里
+  （**先于 `npm test`**）。
+
+  为什么需要它：其余套件的静态断言只把 `.vue` 当**文本**读，抓不到**语法/作用域**
+  错误。真实案例（2026-10-19）：修字幕守卫时把 `function getExt` 又插了一份，而
+  246 行已有一个 → `Identifier 'getExt' has already been declared`，**当轮 70 断言
+  + 20 变异全绿**—— 没有一条断言会去编译这个文件。是用户跑 `dev.sh` 时由 vite
+  报出来的。
+
+  - 关键在 `compileScript`：`parse()` 只校验 SFC 分块结构，**重复声明是
+    `compileScript` 才报的**。
+  - 传给编译器的 `id` 用**正斜杠**（`src/components/X.vue`）—— Windows 反斜杠
+    路径会让编译器自己的报错位置不可解析。
+  - 已做变异验证：把重复声明注回去，脚本以 exit 1 失败并复现同一条报错，
+    不是恒绿。
+  - ⚠️ **不要用 `git checkout -- <file>` 来还原变异注入的现场** —— 它会把同一轮
+    里**尚未提交的修复一起回滚**（实测踩到：锚点没命中 → 注入未发生 →
+    `git checkout` 把刚删掉的重复声明又恢复了）。还原只写回内存里的原文。
 - `scripts/subtitle-gate-check.mjs` + `scripts/subtitle-gate-mutation.mjs` ——
   视频字幕探测的并发闸门与候选筛选（70 断言 / 20 变异全抓）。
 
