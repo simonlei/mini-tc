@@ -121,8 +121,6 @@
   - **验证**：`cargo test --lib` **36 passed**（新增 6 条 `undo_batch_*`）、`cargo fmt --check` 干净、`vite build` exit 0（主 bundle 259.78 kB，改动前 257.26 kB）、`npm run check` 全绿（导入 28 文件 + 102 + 22 断言）。⚠️ **新测试的有效性是实测过的，不是看着绿就算**：先回退交集守卫 → 「他人条目」与「快照失败」两条失败；再回退取最新逻辑 → **第一版测试竟然全绿**（因为两条目恰好把新的排在前面，「先到先得」蒙对了），改成**对称断言两种顺序**后才抓住。教训与上次同款：`list()` 不保证顺序，任何依赖「先到先得」的测试都必须两种顺序都断言，否则它测的是运气。
   - **待用户双击 `dev.bat` 实测**：① 删一个文件 → `Ctrl+Z` 回来；② 多选 5 个一起删 → 一次 `Ctrl+Z` 全部回来；③ 删完立刻在原目录新建同名文件 → `Ctrl+Z` 弹冲突框，选「改名恢复」得到 `x (1).ext`、选「跳过」则留在回收站且**原文件毫发无损**；④ `Shift+Delete` 后按 `Ctrl+Z` → 提示「没有可撤销的删除」；⑤ 地址栏里按 `Ctrl+Z` → 是文本撤销不是恢复；⑥ 删完切到另一栏再 `Ctrl+Z` → 该栏正确刷新。
 
----
-
 ## P0 — 数据丢失 / 崩溃 / 安全
 
 - [x] **修复：mammoth 预览的 `v-html` 净化器是黑名单且漏 `data:` URL，配合 `csp: null` 可在 Tauri 源上执行脚本** — `FilePreview.vue:386-409` + `tauri.conf.json:27`。✅ **已实现（2026-10-14）**。
@@ -341,6 +339,14 @@
   - ⚠️ **两次「存活变异」都是真盲区，不是等价变异**（逐个实测判别，别硬凑断言）：① 「排除目录」恒真 —— 测试数据里目录叫 `sub`，不带字幕扩展名，过滤器去掉也不改变输出 → 补一个 `video.srt`（**是目录**）；② 「matched 优先排序」恒真 —— 未命中项 `a2/AAA` 在纯码顺序与 localeCompare 下**巧合同序** → 补一组视频叫 `z.mp4`、未命中项叫 `A.srt` 的数据（纯码顺序下 `A` < `z`，只有 matched 分量才能救）。同理 `stemOf`/`extOf` 的长度判断也是补数据后才抓到的。
   - 其余套件全绿（`npm test` exit 0），`lint-imports` 39 文件通过。**待用户双击 `dev.sh` 实测**：找一个**同目录有多个视频、且每个各有 `.srt`** 的目录，选中视频 A 后**立刻**按 ↓ 切到视频 B —— B 的字幕下拉框里只应出现 B 相关的字幕，不含 A 的；再快速 ↓↓ 连切几个（构造多链在飞），最终只显示最后一个视频的字幕。
 
+- [x] **审计项（不修）：`renamingIndex` 不随列表变化重置，内联改名可能改到别的文件** — `FileList.vue:242` / `255-291`（现址）。
+  - ⚠️⚠️ **2026-10-19 实测：TODO 原文的因果已过期，且原文给的修法照做会引入新 bug。本条应改写为「审计项」或直接归档。** 上一次取证（2026-10-16）留下的「两个 watcher 的 flush 顺序与谁覆盖谁尚未实测」现已实测完毕 —— 用 `@vue/compiler-sfc` 编译**未经修改的** `FileList.vue`、stub 掉 `api.js`、jsdom 挂载真实组件，走真实 DOM 点击 + F2：
+    - **watcher 次序实测为 `["W-remap(pre)", "W-props-entries(post)", "W-snapshot(post)"]`** —— pre 的身份重映射**先**跑，post 的 `props.entries` watcher 后跑，且后者**根本不写 `renamingIndex`** → **不会覆盖**前者。原文猜测的顺序问题不存在。
+    - **端到端场景正确**：`a.txt` 改名中 → 改按 Modified 降序（行序变 `["b.txt","c.txt","a.txt"]`），输入框仍在 `a.txt` 那一行；整体替换（`entries.value = res.entries`）与 `.filter()` 换新数组时新对象身份不在旧列表 → `renamingIndex` 归 `-1`，改不到别的文件。
+    - 🚨 **原文的修法「watcher 里加 `renamingIndex.value = -1`」是有害的**：它会与现有身份重映射打架，把排序变更场景下**正在进行的合法改名误杀**。
+    - **残留的真实缺口**（实测复现，但当前调用方不可达）：`sortedEntries:327-329` 对 `found` 排序**直接返回 `props.entries` 本身**（`displayedEntries:387-391` 无搜索词时再透传一层）→ computed 不失效；若该数组被**就地** `splice` 移位，pre watcher **完全不触发**，`renamingIndex` 停在旧下标，`commitRename` 会改到隔壁行。核查 `FilePanel.vue` 对显示行的全部变更（`:500/:1093/:1113/:1137/:1286/:1507/:1528` 整体替换、`:1326/:831/:893` push 追加不移位、`:993` splice 作用于 nav.entries 非显示行）—— **当前均未触发**，属潜在加固项非现行缺陷。
+    - **建议改写为**：`commitRename`（`789-801`）按 entry 身份取行而非下标（它现在仍是 `displayedEntries.value[idx]`）+ `sortedEntries` 的 `found` 分支返回副本以断掉同引用。
+
 ## P2 — 可维护性 / 重复实现 / 测试缺口
 
 - [x] **修：`BatchRenameDialog` 序号输入框清空时 `v-model.number` 得 `""` 被当成 0 而非回落到默认** — `renameRules.js:141-148`。
@@ -394,3 +400,7 @@
   - 🚨 **写断言时自己踩了一次「存在即可型恒绿」**：分支完整性首版用 `app.includes(needle)`，而变异 `if (false && matches("preview.toggle", e))` 里**那段字面量仍然在**，行为已成死代码而断言通过 —— 首版变异测试 `0 FAIL` 逃过。修法：加 `conditionOf()` 反查每个分支的 `if (...)` 条件文本（只配平圆括号、起点固定在 `if (` 之后），拒绝 `false &&` / `true ||` 之类恒假/恒真前缀，并额外断言「条件可定位」以防判据自身静默失效。
   - **5 个变异全部实测被抓到**（每个打印 `anchor found: N` 并断言 N==1）：① 改回匿名箭头（原 bug 形状）② 删掉 `removeEventListener` ③ 移除时引用另一个名字（看起来成对实则不是同一引用）④ 函数名打错（注册 undefined）⑤ 掏空分支体。
   - `npm run check` exit 0（lint 37 文件 + 16 个套件全绿）、`npx vite build` 通过。**待用户双击 `dev.sh` 实测**：快捷键应与改动前完全一致（Esc 关预览、Ctrl+Q、Ctrl+A、Ctrl+C/X/V、Ctrl+Z、F5/Shift+F5、Alt+←/→、Ctrl+D、Ctrl+H、Tab）；编辑任一 `.vue` 触发 HMR 后再按快捷键**不应出现一次按键触发两遍**的现象（改动前旧闭包仍驻留时会叠加）。
+
+- [x] **修：`dev.bat` / `dev.sh` 选 Node 取字典序第一个 → 永远用最旧的那个，而不是最新的** — `dev.bat:30-36` + `dev.sh:60-81`。**两个启动器都有此缺陷**（TODO 原文只记了 `.bat`）。WorkBuddy 管理的多个版本目录用 `for /d %%v in ("...\versions\*")`（bat）与 `for dir in ".../versions"/*`（sh）遍历，两者**都按字典序产出**且**命中第一个就定型** → `22.12.0` 排在 `22.22.2` 之前，永远被选中。实测真实目录序 `22.12.0 22.22.2-6 24.0.0 9.1.2` → 旧逻辑选中**次旧**的那个。这不是 inconsequential：jsdom 30 要求 node `^22.22.2`，在 22.12.0 上 `undici/lib/interceptor/decompress.js` 调用 node 22.15+ 才有的 `zlib.createZstdDecompress` → **整个测试套件在 import 阶段崩溃**（已用降级 jsdom 绕开，见 `README.md`）。⚠️ 真正的问题在于**任何新依赖都会更早撞上这个版本下限**，且症状是运行时崩溃而非安装时报错、`undici` 还声明着 `engines: >=20.18.1`（纸面完全受支持）。**engines 是声明不是保证**。
+  - ✅ **已修**：版本决策抽到 `scripts/pick-node.js`（按 `engines.node` 过滤后取**最新**；PATH 优先 → 版本管理器目录；诊断走 stderr、stdout 只有一行给两个启动器捕获），`package.json` 补上 `engines.node: ">=22.12.0"`，配 `scripts/node-pick-check.mjs`（99 条断言 + 4 次变异验证）。**附带查出并修掉一个静默失效**：初版 `realIo()` 漏了 `readFile`，`readEngines` 的 TypeError 被 `catch {}` 吞掉 → engines 永远读成空串、过滤代码从未执行而测试全绿。⚠️ `dev.bat` 的 batch 语法未能端到端验证（cmd.exe 被沙箱封禁），只做了静态检查。
+  - 📌 **后续（2026-10-16 晚）**：`dev.bat` / `scripts/check.bat` / `scripts/check.ps1` 已删除，`dev.sh` 是唯一启动器（四份探测逻辑各写一遍且互相漂移）。`cargo-check.sh` 顺带改为动态定位（原写死 MSVC/SDK 版本号与本机绝对路径），两个 `.sh` 的 MSVC 探测由 `ls -r | head -1`（取字典序最小）改为 `sort -V | tail -1`。
