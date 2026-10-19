@@ -343,6 +343,36 @@ npm test                       # 只跑单元测试
   顺带一处值得记的窗口：`await entryPath(...)` 期间用户可能已关掉预览，await 后的
   快照一律不可信；而「关闭预览」会 unmount 播放器、`loadVideo()` 根本不会跑 ——
   撤销必须做在**事件发生处**（`closePreview` 里 `arm(null)`），不能等「状态不匹配时」。
+- `scripts/subtitle-gate-check.mjs` + `scripts/subtitle-gate-mutation.mjs` ——
+  视频字幕探测的并发闸门与候选筛选（70 断言 / 20 变异全抓）。
+
+  曾有一个「视频 B 配着视频 A 的字幕」的 bug。字幕探测要串四次 await
+  （`getParentDir` → `listDirectory` → 每个字幕文件一次 `fetch`），而 `loadVideo()`
+  在链的开头就把 `subtitleTracks` 清空了。期间 `props.filePath` 一变，watcher 就为新
+  文件跑第二次 `loadVideo()`（**同样清空**），旧链随后 resolve 时无条件
+  `subtitleTracks.value.push(...)` —— **旧目录的字幕被推进新文件的轨道列表**。
+
+  另一半更隐蔽：`detectSubtitles` 在 `listDirectory` **之后**才读 `props.fileName` 算
+  主干名，于是 dir 取自旧文件、base 取自新文件，「同名前缀」判定直接跨了两个文件。
+  守卫救不了这个 —— **快照必须在 await 之前取，并透传到每一个消费者**。
+
+  判据是 `src/subtitleGate.js` 的 `begin()` / `lands()`。为什么这里可以用「意图身份」
+  而 `loadGate` / `previewRequest` 要用「目的地还是不是它」：那边有**同 key 的
+  in-flight 折叠**，序号判据会让 A→B→A 谁都不落地；字幕探测**没有折叠**（每次
+  `loadVideo()` 都真的扫一遍），所以折返时第一个 A 的链不落地是对的。
+
+  - **`begin()` 必须无条件调用**，包括 `isExternalOnly` 分支：那些分支不探测字幕，
+    但它们同样换了目的地，必须作废仍在飞的探测。`autoplayGate.claim()` 的「消费点
+    放在所有分支的共同入口」是同一条纪律。
+  - **共享状态只在全部 await 之后一次性提交**。逐文件 push 会暴露一个「新列表已被
+    清空、旧链还在往里塞」的半更新中间态 —— 它喂给下游一个看起来合法的组合
+    （轨道非空，但一半来自别的文件）。
+  - **循环内也要查守卫，且在写 `loaded` 之前查**：陈旧链继续累积是纯浪费。
+  - `onMounted` 里 `await loadPlayerConfig()` 期间 `filePath` 可能已变，watcher 已经
+    为新文件跑过一次 —— 此时再 `loadVideo()` 就是两条链探测两个视频。判据是同步捕获
+    的 `mountedPath`。
+  - 手工外挂字幕（`onFilePicked`）是用户对**当前**视频的主动行为，不走探测链，但也
+    改成展开成新数组而非 `push`（`push` 会就地改动 `<select>` 正在渲染的数组）。
 - `scripts/preview-request.test.mjs` —— 打开预览的并发守卫（`src/previewRequest.js`）。
 
   与上面两条同源但层次不同：`previewGate` 管的是**预览组件内部**（HEIC 解码），

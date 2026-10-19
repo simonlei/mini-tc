@@ -132,6 +132,7 @@ import { loadConfig, saveConfig } from "../api.js";
 import { listDirectory, getParentDir, joinPath, openFile } from "../api.js";
 import { matches, markHandled } from "../shortcuts.js";
 import { autoplayGate } from "../autoplayGate.js";
+import { createSubtitleGate, subtitleCandidates } from "../subtitleGate.js";
 import { formatBytes as fmtSize } from "../format.js";
 
 const props = defineProps({
@@ -227,6 +228,11 @@ const subtitleTracks = ref([]); // { id, label, cues: [{start, end, text}] }
 const selectedTrackId = ref(null);
 const subtitleOffset = ref(0);
 let trackCounter = 0;
+// Tracks which subtitle-detection chain, if any, is allowed to write into
+// subtitleTracks. `begin()` is called by EVERY loadVideo() — including the
+// external-only branch, which detects nothing but still changes the target and
+// therefore must invalidate whatever is still in flight.
+const subtitleGate = createSubtitleGate();
 
 const selectedTrack = computed(() => subtitleTracks.value.find((t) => t.id === selectedTrackId.value) || null);
 const subtitleText = computed(() => {
@@ -501,45 +507,65 @@ function parseSubtitle(text, e) {
   return parseSRT(text);
 }
 
-async function addTrack(label, text, e, autoSelect) {
-  const cues = parseSubtitle(text, e);
-  if (!cues.length) return false;
-  const id = ++trackCounter;
-  subtitleTracks.value.push({ id, label, cues });
-  if (autoSelect || selectedTrackId.value === null) selectedTrackId.value = id;
-  return true;
+function getExt(name) {
+  const p = name.split(".");
+  return p.length > 1 ? p.pop().toLowerCase() : "";
 }
-async function loadSubtitleByPath(path, label, e, autoSelect) {
+
+// ── Subtitle detection (concurrency-guarded; see ../subtitleGate.js) ──
+//
+// `loadVideo()` awaits the whole chain: getParentDir → listDirectory → one fetch
+// per subtitle file. props.filePath can change several times in that window (the
+// watcher fires another loadVideo, which CLEARS subtitleTracks), so the results
+// of a superseded chain must not land in the new file's track list. Every await
+// below is followed by a `subtitleGate.lands(token)` re-check, and the tracks
+// are committed in ONE assignment after the last await — pushing per file would
+// expose a half-updated mix of the two videos' tracks.
+async function detectSubtitles(token, filePath, base) {
+  try {
+    const dir = await getParentDir(filePath);
+    if (!dir || !subtitleGate.lands(token)) return;
+    const list = (await listDirectory(dir)).entries;
+    if (!subtitleGate.lands(token)) return;
+    const candidates = subtitleCandidates(list, base, SUB_EXTS);
+    const loaded = [];
+    for (const c of candidates) {
+      const p = c.path || (await joinPath(dir, c.name));
+      const track = await readSubtitle(p, c);
+      // Check BEFORE touching `loaded` as well as after: a stale chain that keeps
+      // accumulating is pure waste, and `loaded` is read again below.
+      if (!subtitleGate.lands(token)) return;
+      if (track) loaded.push(track);
+    }
+    if (!subtitleGate.lands(token)) return;
+    // Single commit. Ids are assigned here, in the sorted candidate order, so
+    // the list the <select> renders matches `loaded` exactly.
+    const tracks = [];
+    for (const t of loaded) {
+      const id = ++trackCounter;
+      tracks.push({ id, label: t.label, cues: t.cues });
+      if (t.matched || selectedTrackId.value === null) selectedTrackId.value = id;
+    }
+    subtitleTracks.value = tracks;
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// Read + parse one subtitle file. Returns null when it is absent or unparseable
+// (a .srt that yields no cues is not worth a track in the dropdown).
+async function readSubtitle(path, candidate) {
   try {
     const url = convertFileSrc(path);
     const res = await fetch(url);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const text = await res.text();
-    return await addTrack(label, text, e, autoSelect);
+    const cues = parseSubtitle(text, candidate.ext);
+    if (!cues.length) return null;
+    return { label: candidate.name, cues, matched: candidate.matched };
   } catch (err) {
     console.error("load subtitle failed:", err);
-    return false;
-  }
-}
-async function detectSubtitles() {
-  try {
-    const dir = await getParentDir(props.filePath);
-    if (!dir) return;
-    const list = (await listDirectory(dir)).entries;
-    const base = props.fileName.replace(/\.[^.]+$/, "");
-    const found = list.filter((e) => !e.is_dir && SUB_EXTS.includes(getExt(e.name)));
-    const enriched = await Promise.all(
-      found.map(async (e) => {
-        const p = await joinPath(dir, e.name);
-        const s = e.name.replace(/\.[^.]+$/, "");
-        const matched = s === base || s.startsWith(base + ".");
-        return { name: e.name, path: p, ext: getExt(e.name), matched };
-      })
-    );
-    enriched.sort((a, b) => (b.matched ? 1 : 0) - (a.matched ? 1 : 0) || a.name.localeCompare(b.name));
-    for (const c of enriched) await loadSubtitleByPath(c.path, c.name, c.ext, c.matched);
-  } catch (err) {
-    console.error(err);
+    return null;
   }
 }
 function triggerFilePick() { fileInput.value?.click(); }
@@ -549,7 +575,15 @@ function onFilePicked(e) {
   const reader = new FileReader();
   reader.onload = () => {
     const text = String(reader.result || "");
-    addTrack(f.name, text, getExt(f.name), true);
+    // A hand-picked file is a deliberate act on the CURRENTLY open video, so it
+    // appends straight away instead of going through the detection chain. It
+    // still commits as one assignment (push on the ref array would mutate the
+    // very array the select is rendering from).
+    const cues = parseSubtitle(text, getExt(f.name));
+    if (!cues.length) return;
+    const id = ++trackCounter;
+    subtitleTracks.value = [...subtitleTracks.value, { id, label: f.name, cues }];
+    selectedTrackId.value = id;
   };
   reader.readAsText(f, "utf-8");
   e.target.value = "";
@@ -653,10 +687,20 @@ function onStageLeave() {
 // handled by the parent via the file list, not here.
 async function loadVideo() {
   cancelFrameWatch();
+  // Snapshot BEFORE any await. Reading props.filePath / props.fileName after an
+  // await is the other half of the original bug: `detectSubtitles` used to look
+  // up the parent dir with one file's path and compute the name prefix with
+  // another file's name.
+  const filePath = props.filePath;
+  const base = props.fileName.replace(/\.[^.]+$/, "");
+  // Claim a subtitle-detection identity unconditionally — even for external-only
+  // containers, which detect nothing: they still change the target, so a chain
+  // still in flight for the PREVIOUS file must be invalidated.
+  const token = subtitleGate.begin();
   // Consume the autoplay authorisation FIRST — before the isExternalOnly
   // early-return below. This is the common entry of every load, so an
   // authorisation can never survive into a later, user-initiated selection.
-  autoplayNext.value = autoplayGate.claim(props.filePath);
+  autoplayNext.value = autoplayGate.claim(filePath);
   videoSrc.value = "";
   externalFallback.value = false;
   loadError.value = "";
@@ -667,10 +711,15 @@ async function loadVideo() {
   duration.value = 0;
   playing.value = false;
   if (!isExternalOnly.value) {
-    videoSrc.value = convertFileSrc(props.filePath);
-    await detectSubtitles();
+    videoSrc.value = convertFileSrc(filePath);
+    await detectSubtitles(token, filePath, base);
   }
 }
+
+// The file this component instance mounted on. Captured synchronously at
+// setup time so `onMounted`'s post-await check can tell "still the same file"
+// from "the watcher already took over".
+const mountedPath = props.filePath;
 
 onMounted(async () => {
   window.addEventListener("keydown", onKey, true);
@@ -683,7 +732,12 @@ onMounted(async () => {
       volume.value = cfg.volume;
       muted.value = cfg.muted;
     }
-    await loadVideo();
+    // `filePath` may have changed during the await above — in which case the
+    // watcher has already started a load for the NEW file, and calling
+    // loadVideo() here would race it (two chains detecting subtitles for two
+    // different videos, one of them stale). Only load when we're still looking
+    // at the file we mounted for.
+    if (props.filePath === mountedPath) await loadVideo();
   }
 });
 
@@ -700,6 +754,8 @@ watch(
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey, true);
   cancelFrameWatch();
+  // Nothing still in flight may write into subtitleTracks after this point.
+  subtitleGate.reset();
   if (videoEl.value) videoEl.value.pause();
   clearTimeout(ctrlsTimer);
 });
