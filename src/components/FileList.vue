@@ -164,6 +164,7 @@ import { startNativeDrag } from "../api.js";
 import { entryPath, isSearchPath, entryKey } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
 import { formatBytes as formatSize } from "../format.js";
+import { isImeKeydown } from "../keyboardText.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -668,7 +669,7 @@ function closeSearch() {
 function onSearchKeydown(e) {
   // During IME composition (Chinese input), let the IME handle every key
   // (including Enter to confirm a candidate) without our interference.
-  if (e.isComposing || e.keyCode === 229) return;
+  if (isImeKeydown(e)) return;
 
   if (e.key === "ArrowDown") {
     e.preventDefault();
@@ -772,7 +773,7 @@ async function startRenameByEntry(entry) {
 // Keydown inside the rename input: Enter commits, Esc cancels. IME composition
 // is respected so confirming a Chinese candidate doesn't commit prematurely.
 function onRenameKeydown(e) {
-  if (e.isComposing || e.keyCode === 229) return;
+  if (isImeKeydown(e)) return;
   if (e.key === "Enter") {
     e.preventDefault();
     commitRename();
@@ -861,6 +862,16 @@ function deleteSelected({ permanent = false } = {}) {
 // handler (which runs later on document) doesn't fire a second command for the
 // same keystroke.
 function onKeydown(e) {
+  // While an IME composition is running, every keystroke belongs to the IME.
+  // This MUST be the first line: `matches()` derives the combo from `e.code`
+  // and never looks at the composition state, so without this guard a Chinese
+  // user picking a candidate with Space would fire `list.dirSize`, Enter would
+  // fire `list.open` (opening a file mid-composition!), Backspace would fire
+  // `list.parent`, and the preventDefault() would kill the commit on top of
+  // that. Measured: all 18 default `list.*` bindings are claimable while
+  // keyCode === 229. See `isImeKeydown` in keyboardText.js.
+  if (isImeKeydown(e)) return;
+
   // If focus is inside the search input, let it handle keys itself.
   if (e.target && e.target.tagName === "INPUT") return;
 

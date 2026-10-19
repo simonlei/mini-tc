@@ -37,6 +37,34 @@ export function isTypingTarget(el) {
 }
 
 /**
+ * True while the event belongs to an IME composition rather than to a
+ * shortcut — every keydown handler must bail out before calling matches().
+ *
+ * Two signals, because no single one is reliable across IMEs and webviews:
+ *   - `isComposing` is set on keydown events dispatched *during* an ongoing
+ *     composition, but NOT on the keydown that *starts* one (that one fires
+ *     with isComposing === false).
+ *   - `keyCode === 229` ("IME processed key") covers that first keystroke and
+ *     is what Chromium/WebView2 report for keys the IME has swallowed.
+ *
+ * This is not a hypothetical: measured against the real `matches()`, all 18
+ * default `list.*` bindings are claimed while `keyCode === 229` — Space /
+ * Enter / Backspace / "/" / arrows / PageUp / PageDown / Home / End / Delete /
+ * F2 and their Shift variants. `eventCombo()` is built from `e.code` and never
+ * looks at the composition state. So a Chinese user picking a candidate with
+ * Space would trigger `list.dirSize`, Enter would trigger `list.open` — on
+ * top of preventDefault() killing the commit itself.
+ *
+ * ⚠️ A bare letter does NOT leak: its `e.code` is `KeyN` → combo "N", and no
+ * command is bound to a bare letter. Only the function keys do. Do not reason
+ * about this from "the first pinyin letter" — that was measured and is false.
+ */
+export function isImeKeydown(e) {
+  if (!e) return false;
+  return e.isComposing === true || e.keyCode === 229;
+}
+
+/**
  * The preview text surface containing `el`, or null.
  */
 export function previewTextRoot(el) {

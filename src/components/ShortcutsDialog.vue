@@ -122,6 +122,7 @@ import {
   setBindings,
   shortcutsEditing,
 } from "../shortcuts.js";
+import { isImeKeydown } from "../keyboardText.js";
 
 const metaLabel = META_LABEL;
 
@@ -293,7 +294,7 @@ function stopRecord() {
 function onRecordKeydown(e) {
   e.preventDefault();
   e.stopPropagation();
-  if (e.isComposing || e.keyCode === 229) return;
+  if (isImeKeydown(e)) return;
 
   // Bare Esc cancels the recording instead of being bound.
   if (e.key === "Escape" && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
