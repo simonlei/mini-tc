@@ -2075,360 +2075,372 @@ onMounted(() => {
   window.addEventListener("focus", onWindowFocusRegain);
   document.addEventListener("visibilitychange", onVisibilityRegain);
 
-  document.addEventListener("keydown", (e) => {
-    // Skip keys already consumed by a more specific scope (the file list runs
-    // first because it listens on the element, the video preview runs first
-    // because it listens on the capture phase).
-    if (isHandled(e)) return;
+  document.addEventListener("keydown", onGlobalKeydown);
+});
 
-    // The search dialog is modal and owns the keyboard: Esc is caught in its
-    // capture phase, Enter lives on its inputs. Everything else must be let
-    // go — otherwise typing a pattern also drives the panels underneath
-    // (Backspace walks up a directory, Delete removes files, arrows move the
-    // cursor behind the overlay).
+// The global keydown handler, extracted as a NAMED function.
+//
+// This must not be an inline arrow passed straight to
+// `document.addEventListener`: an anonymous handler cannot be removed again,
+// so `onUnmounted` could only drop the reference, never the listener.
+// Every re-mount (Vite HMR, or any future remount) would then leave
+// another copy of this entire component scope — every ref, both panel
+// refs — resident on `document`, each one still reacting to every key.
+// A named function makes registration symmetric: add in `onMounted`,
+// remove the same reference in `onUnmounted`.
+function onGlobalKeydown(e) {
+  // Skip keys already consumed by a more specific scope (the file list runs
+  // first because it listens on the element, the video preview runs first
+  // because it listens on the capture phase).
+  if (isHandled(e)) return;
+
+  // The search dialog is modal and owns the keyboard: Esc is caught in its
+  // capture phase, Enter lives on its inputs. Everything else must be let
+  // go — otherwise typing a pattern also drives the panels underneath
+  // (Backspace walks up a directory, Delete removes files, arrows move the
+  // cursor behind the overlay).
+  if (searchVisible.value) return;
+
+  // Same for the batch-rename dialog: it owns Esc (capture phase) and its
+  // rule inputs. Ctrl+M itself is re-checked below so it isn't swallowed.
+  if (batchRenameVisible.value) return;
+
+  // The conflict prompt raised by an undo is modal too. Without this,
+  // pressing Ctrl+Z again while it is open would raise a SECOND prompt and
+  // overwrite `confirmResolve` — the first Promise then never resolves and
+  // that undo silently evaporates (the general "dialogs don't gate the
+  // global keys" hole; see the review notes).
+  if (confirmDialog.value.visible) return;
+
+  // Esc: close the current preview (image / text / pdf / video / unsupported)
+  // and return the source file list to the file that was just previewed. When
+  // no preview is open, this is a no-op — Esc no longer cancels selection on
+  // the file grid, so we only act while a preview is visible.
+  // If focus is inside a text input (the source panel's filename filter or
+  // address bar, which stay interactive during preview), let that input handle
+  // Esc on its own (e.g. cancel the filter) instead of closing the preview.
+  if (matches("preview.close", e) && previewVisible.value) {
+    if (!isTypingTarget(e.target)) {
+      e.preventDefault();
+      markHandled(e);
+      closePreview();
+      return;
+    }
+  }
+
+  // Ctrl+Q: Toggle file preview
+  if (matches("preview.toggle", e)) {
+    e.preventDefault();
+    markHandled(e);
+    togglePreview();
+    return;
+  }
+
+  // Alt+F7 / Ctrl+F: recursive file search. Plain function-ish keys with no
+  // webview meaning of their own, so they're consumed even while an input has
+  // focus — except inside the search dialog itself (the dialog owns its own
+  // Enter/Esc handling and the user may be typing a pattern).
+  if (matches("search.open", e)) {
     if (searchVisible.value) return;
+    e.preventDefault();
+    markHandled(e);
+    openSearch();
+    return;
+  }
 
-    // Same for the batch-rename dialog: it owns Esc (capture phase) and its
-    // rule inputs. Ctrl+M itself is re-checked below so it isn't swallowed.
-    if (batchRenameVisible.value) return;
-
-    // The conflict prompt raised by an undo is modal too. Without this,
-    // pressing Ctrl+Z again while it is open would raise a SECOND prompt and
-    // overwrite `confirmResolve` — the first Promise then never resolves and
-    // that undo silently evaporates (the general "dialogs don't gate the
-    // global keys" hole; see the review notes).
-    if (confirmDialog.value.visible) return;
-
-    // Esc: close the current preview (image / text / pdf / video / unsupported)
-    // and return the source file list to the file that was just previewed. When
-    // no preview is open, this is a no-op — Esc no longer cancels selection on
-    // the file grid, so we only act while a preview is visible.
-    // If focus is inside a text input (the source panel's filename filter or
-    // address bar, which stay interactive during preview), let that input handle
-    // Esc on its own (e.g. cancel the filter) instead of closing the preview.
-    if (matches("preview.close", e) && previewVisible.value) {
-      if (!isTypingTarget(e.target)) {
-        e.preventDefault();
-        markHandled(e);
-        closePreview();
-        return;
-      }
-    }
-
-    // Ctrl+Q: Toggle file preview
-    if (matches("preview.toggle", e)) {
-      e.preventDefault();
+  // Ctrl+A: select all entries in the active panel -- but only when the key
+  // isn't already owned by a text surface. Three cases, in order:
+  //   - an editable element (address bar / filter / dialog input): the webview
+  //     already does the right thing, so don't consume the event at all;
+  //   - the preview text surface: "select all" means the text on screen, not
+  //     the file list behind it. `<pre class="preview-text">` is neither an
+  //     input nor contenteditable and has no tabindex, so this used to fall
+  //     through and select every file while the user was looking at text;
+  //   - otherwise: the file grid.
+  if (matches("edit.selectAll", e)) {
+    const intent = classifySelectAll(e.target, window.getSelection());
+    if (intent === "native") return; // let the browser select the text
+    e.preventDefault();
+    if (intent === "previewText") {
       markHandled(e);
-      togglePreview();
-      return;
-    }
-
-    // Alt+F7 / Ctrl+F: recursive file search. Plain function-ish keys with no
-    // webview meaning of their own, so they're consumed even while an input has
-    // focus — except inside the search dialog itself (the dialog owns its own
-    // Enter/Esc handling and the user may be typing a pattern).
-    if (matches("search.open", e)) {
-      if (searchVisible.value) return;
-      e.preventDefault();
-      markHandled(e);
-      openSearch();
-      return;
-    }
-
-    // Ctrl+A: select all entries in the active panel -- but only when the key
-    // isn't already owned by a text surface. Three cases, in order:
-    //   - an editable element (address bar / filter / dialog input): the webview
-    //     already does the right thing, so don't consume the event at all;
-    //   - the preview text surface: "select all" means the text on screen, not
-    //     the file list behind it. `<pre class="preview-text">` is neither an
-    //     input nor contenteditable and has no tabindex, so this used to fall
-    //     through and select every file while the user was looking at text;
-    //   - otherwise: the file grid.
-    if (matches("edit.selectAll", e)) {
-      const intent = classifySelectAll(e.target, window.getSelection());
-      if (intent === "native") return; // let the browser select the text
-      e.preventDefault();
-      if (intent === "previewText") {
-        markHandled(e);
-        const root = previewTextRoot(e.target) || selectionPreviewRoot(window.getSelection());
-        if (selectAllPreviewText(root, document, window)) return;
-        // No Selection available: fall through to the file grid rather than
-        // swallowing the key.
-        getActivePanelRef()?.selectAll?.();
-        return;
-      }
-      markHandled(e);
+      const root = previewTextRoot(e.target) || selectionPreviewRoot(window.getSelection());
+      if (selectAllPreviewText(root, document, window)) return;
+      // No Selection available: fall through to the file grid rather than
+      // swallowing the key.
       getActivePanelRef()?.selectAll?.();
       return;
     }
+    markHandled(e);
+    getActivePanelRef()?.selectAll?.();
+    return;
+  }
 
-    // Ctrl+C / Ctrl+X / Ctrl+V: clipboard copy / cut / paste.
-    // When focus is in a text input (the address bar or the filename filter),
-    // let the browser handle these natively — e.g. pasting a copied path
-    // string into the address bar. The file-clipboard handler below only makes
-    // sense on the file grid, and intercepting here would preventDefault the
-    // native text paste (and then wrongly report "剪贴板为空" when the
-    // clipboard holds plain text, not a file list).
-    const isCopy = matches("edit.copy", e);
-    const isCut = matches("edit.cut", e);
-    const isPaste = matches("edit.paste", e);
-    if (isCopy || isCut || isPaste) {
-      if (isTypingTarget(e.target)) {
-        return; // let the browser do native text copy/cut/paste
+  // Ctrl+C / Ctrl+X / Ctrl+V: clipboard copy / cut / paste.
+  // When focus is in a text input (the address bar or the filename filter),
+  // let the browser handle these natively — e.g. pasting a copied path
+  // string into the address bar. The file-clipboard handler below only makes
+  // sense on the file grid, and intercepting here would preventDefault the
+  // native text paste (and then wrongly report "剪贴板为空" when the
+  // clipboard holds plain text, not a file list).
+  const isCopy = matches("edit.copy", e);
+  const isCut = matches("edit.cut", e);
+  const isPaste = matches("edit.paste", e);
+  if (isCopy || isCut || isPaste) {
+    if (isTypingTarget(e.target)) {
+      return; // let the browser do native text copy/cut/paste
+    }
+    if (isCopy || isCut) {
+      // If the user has selected text inside a preview pane, let the browser
+      // copy that text natively instead of treating it as a file clipboard op
+      // (file-list selection → copy file; preview text selection → copy text).
+      if (hasPreviewTextSelection()) return;
+      // PDF 预览聚焦时放行 Ctrl+C（复制 PDF 内文本），交由 WebView 原生处理。
+      // Ctrl+X 不放行（PDF 只读，无剪切内容语义，仍按文件剪切逻辑处理）。
+      if (isCopy && isPdfIframeFocused()) return;
+    }
+    e.preventDefault();
+    markHandled(e);
+    if (isCopy) setClipboard("copy");
+    else if (isCut) setClipboard("cut");
+    else pasteFromClipboard();
+    return;
+  }
+
+  // Ctrl+Z: restore the most recent batch that went to the recycle bin.
+  // NOT a general undo stack — permanent / elevated deletes never reach the
+  // bin and are deliberately unrecoverable, so there's nothing to undo for
+  // them and the user is told so rather than left guessing.
+  // Skipped while typing: Ctrl+Z inside a text input is the browser's own
+  // text undo (address bar, filename filter, inline rename), and hijacking
+  // it there would be both surprising and destructive-looking.
+  if (matches("edit.undoDelete", e)) {
+    const t = e.target;
+    if (isTypingTarget(t)) return;
+    e.preventDefault();
+    markHandled(e);
+    onUndoDelete();
+    return;
+  }
+
+  // F5 / Shift+F5: copy / move the selection into the OTHER panel's current
+  // directory (Total Commander keys). Deliberately NOT part of the clipboard
+  // branch above: these never touch the system clipboard, they go straight
+  // from the active panel's selection to the inactive panel's path.
+  //
+  // Both are plain function keys with no webview-native meaning, so they are
+  // consumed even while the address bar or the filename filter has focus
+  // (same reasoning as Ctrl+T below) — the one exception is a rename box,
+  // which is a text field where a stray F5 clearly means "not for me".
+  if (matches("edit.copyToOther", e) || matches("edit.moveToOther", e)) {
+    const t = e.target;
+    if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
+    // Resolve BOTH bindings before consuming: markHandled() makes every
+    // later matches() on the same event return false.
+    const isMove = matches("edit.moveToOther", e);
+    e.preventDefault();
+    markHandled(e);
+    transferToOtherPanel(isMove ? "cut" : "copy");
+    // Focus stays on the SOURCE panel (like TC): the user usually wants to
+    // keep working through the same selection. doPaste refreshes both panels.
+    return;
+  }
+
+  // Ctrl+M: batch rename the active panel's selection. Plain Ctrl combo with
+  // no webview-native meaning, so it is consumed even while an input has
+  // focus — except in a rename box, which is a text field where Ctrl+M
+  // clearly means "insert a newline", not "rename files".
+  if (matches("list.batchRename", e)) {
+    const t = e.target;
+    if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
+    // Already open: let the key reach the dialog's own inputs rather than
+    // reopening (and resetting) it.
+    if (batchRenameVisible.value) return;
+    e.preventDefault();
+    markHandled(e);
+    openBatchRename();
+    return;
+  }
+
+  // Ctrl+Tab / Ctrl+Shift+Tab: rotate to the next / previous tab of the
+  // ACTIVE panel (Total Commander keys). Checked BEFORE panel.switch so
+  // these two combos can never be claimed by the bare-Tab handler, which
+  // still owns plain `Tab`. Both are plain Ctrl combos with no webview-native
+  // meaning, so they are always consumed — even while the filename filter or
+  // the address bar has focus.
+  if (matches("tab.next", e) || matches("tab.prev", e)) {
+    // Resolve BOTH bindings before consuming the event: `markHandled` makes
+    // every later `matches()` on the same event return false.
+    const delta = matches("tab.next", e) ? 1 : -1;
+    e.preventDefault();
+    markHandled(e);
+    const panel = getActivePanelRef();
+    const tab = panel?.cycleTab?.(delta);
+    // Only one tab open → nothing moved; stay quiet instead of a toast that
+    // repeats the same text on every keypress.
+    if (tab) showToast(`已切换到标签页：${tab.path}`, "info");
+    // Keep the DOM focus on the file grid so the arrow keys immediately
+    // drive the newly active tab.
+    getActivePanelRef()?.focusList?.();
+    return;
+  }
+
+  // Ctrl+T / Ctrl+W: new / close a tab in the ACTIVE panel (Total Commander
+  // keys). Both are plain Ctrl combos with no webview-native meaning, so we
+  // always consume them — even while the filename filter or the address bar
+  // has focus, which is where a new tab is most often wanted.
+  if (matches("tab.new", e) || matches("tab.close", e)) {
+    // Resolve BOTH bindings before consuming the event: `markHandled` makes
+    // every later `matches()` on the same event return false.
+    const isNew = matches("tab.new", e);
+    e.preventDefault();
+    markHandled(e);
+    const panel = getActivePanelRef();
+    if (isNew) panel?.addTab?.();
+    else panel?.closeActiveTab?.();
+    // Keep the DOM focus on the file grid so the arrow keys immediately
+    // drive the (new) active tab.
+    getActivePanelRef()?.focusList?.();
+    return;
+  }
+
+  // Ctrl+Shift+L / Ctrl+Y: lock / unlock the active panel's current tab, and
+  // jump it back to its locked dir (Total Commander's "lock tab, directory
+  // changes allowed"). Locking only records an anchor — the tab keeps
+  // navigating freely, exactly like TC.
+  if (matches("tab.lock", e) || matches("tab.jumpLocked", e)) {
+    // Resolve both before markHandled() (which makes later matches() false).
+    const isLock = matches("tab.lock", e);
+    e.preventDefault();
+    markHandled(e);
+    const panel = getActivePanelRef();
+    if (isLock) {
+      const res = panel?.toggleLock?.();
+      if (res?.locked) showToast(`已锁定当前标签页：${res.tab.path}`, "info");
+      else if (res) showToast("已解除标签页锁定", "info");
+    } else {
+      const res = panel?.jumpToLocked?.();
+      if (res?.ok) showToast(`已回到锁定位置：${res.path}`, "info");
+      else if (res?.reason === "unlocked") showToast("当前标签页未锁定", "info");
+      // reason === "same" / "none": already there (or no panel) — stay quiet.
+    }
+    // Keep DOM focus on the file grid so navigation continues from here.
+    getActivePanelRef()?.focusList?.();
+    return;
+  }
+
+  // Alt+← / Alt+→: walk the active tab's own directory history (browser
+  // style). Each tab keeps an independent stack, persisted with it, so a
+  // restart can still walk back. Alt+ArrowLeft/Right have no webview-native
+  // meaning of their own (the browser's back/forward is plain Alt+← only on
+  // some builds and never fires inside a Tauri webview), so they're always
+  // consumed — same reasoning as Ctrl+T above.
+  if (matches("nav.back", e) || matches("nav.forward", e)) {
+    // Resolve both before markHandled() (which makes later matches() false).
+    const isBack = matches("nav.back", e);
+    const panel = getActivePanelRef();
+    // Don't consume the key when this panel has nowhere to go: letting it
+    // fall through keeps the combo available to the webview, and the
+    // PathBar's ← / → buttons already show the state as disabled.
+    if (!(isBack ? panel?.canGoBack?.() : panel?.canGoForward?.())) return;
+    e.preventDefault();
+    markHandled(e);
+    const res = isBack ? panel.goBack() : panel.goForward();
+    // `stepHistory` awaits a pathExists() probe per skipped entry, so it
+    // settles asynchronously even on the fast path.
+    Promise.resolve(res).then((r) => {
+      if (r?.ok && r.dropped) {
+        showToast(`已跳过 ${r.dropped} 个已不存在的目录`, "info");
       }
-      if (isCopy || isCut) {
-        // If the user has selected text inside a preview pane, let the browser
-        // copy that text natively instead of treating it as a file clipboard op
-        // (file-list selection → copy file; preview text selection → copy text).
-        if (hasPreviewTextSelection()) return;
-        // PDF 预览聚焦时放行 Ctrl+C（复制 PDF 内文本），交由 WebView 原生处理。
-        // Ctrl+X 不放行（PDF 只读，无剪切内容语义，仍按文件剪切逻辑处理）。
-        if (isCopy && isPdfIframeFocused()) return;
-      }
-      e.preventDefault();
-      markHandled(e);
-      if (isCopy) setClipboard("copy");
-      else if (isCut) setClipboard("cut");
-      else pasteFromClipboard();
+      getActivePanelRef()?.focusList?.();
+    });
+    return;
+  }
+
+  // Ctrl+D: add the active panel's current directory to the global bookmark
+  // list (~/.minitc/bookmarks.json), or remove it when it's already there.
+  // A search-results tab has no real directory to bookmark, so it's rejected
+  // rather than storing the `minitc://search/…` sentinel.
+  if (matches("bookmark.toggle", e)) {
+    // A text input owns its own keys: while renaming a bookmark the ⭐
+    // dropdown has a focused `.bm-input`, and toggling the bookmark out from
+    // under the user's cursor would be a nasty surprise.
+    if (isTypingTarget(e.target)) {
       return;
     }
+    const panel = getActivePanelRef();
+    const cur = panel?.currentPath;
+    // No panel at all, or one parked on a search-results tab → let the key
+    // fall through to the webview instead of consuming it for nothing.
+    if (!cur || panel?.isVirtual?.()) return;
+    e.preventDefault();
+    markHandled(e);
+    const existing = findBookmark(cur);
+    if (existing) {
+      removeBookmark(existing.id);
+      showToast(`已移除书签：${existing.name}`, "info");
+    } else {
+      const res = addBookmark(cur);
+      if (res.ok) showToast(`已添加书签：${res.bookmark.name}`, "success");
+    }
+    getActivePanelRef()?.focusList?.();
+    return;
+  }
 
-    // Ctrl+Z: restore the most recent batch that went to the recycle bin.
-    // NOT a general undo stack — permanent / elevated deletes never reach the
-    // bin and are deliberately unrecoverable, so there's nothing to undo for
-    // them and the user is told so rather than left guessing.
-    // Skipped while typing: Ctrl+Z inside a text input is the browser's own
-    // text undo (address bar, filename filter, inline rename), and hijacking
-    // it there would be both surprising and destructive-looking.
-    if (matches("edit.undoDelete", e)) {
+  // Ctrl+H: show / hide hidden entries (dotfiles, hidden & system attributes)
+  // in the ACTIVE panel. The two panels keep independent state, so this
+  // never touches the other side. Filtering is purely front-end (the backend
+  // always returns the full listing), so the toggle is instant even in a
+  // directory with thousands of entries — no re-listing.
+  if (matches("view.toggleHidden", e)) {
+    if (isTypingTarget(e.target)) {
+      return;
+    }
+    const panelId = activePanel.value;
+    const now = toggleHiddenForPanel(panelId);
+    e.preventDefault();
+    markHandled(e);
+    showToast(
+      `${now ? "已显示" : "已隐藏"}隐藏文件（${panelId === "left" ? "左" : "右"}栏）`,
+      "info"
+    );
+    // The row set changed under the cursor, so put keyboard focus back on
+    // the list rather than leaving it on <body>.
+    getActivePanelRef()?.focusList?.();
+    return;
+  }
+
+  // Tab / Ctrl+Tab: Switch active panel (skip if target is showing preview)
+  if (matches("panel.switch", e)) {
+    // A bare Tab is a real browser key (focus traversal), so it only means
+    // "switch panel" when a file list actually owns the focus — the Total
+    // Commander behaviour. Anywhere else (address bar, filename filter,
+    // inline rename, dialog buttons, right-click menu) we must fall through
+    // and let the webview move focus natively, otherwise keyboard users can't
+    // leave a text field or reach a dialog button.
+    // Only a bare `Tab` is bound now — Ctrl+Tab belongs to tab.next above —
+    // but the guard stays on the combo so a user rebinding can't reintroduce
+    // a Ctrl combo that would then hijack the filter input's focus exit.
+    const bareTab = eventCombo(e) === "Tab";
+    if (bareTab) {
       const t = e.target;
       if (isTypingTarget(t)) return;
-      e.preventDefault();
-      markHandled(e);
-      onUndoDelete();
+      // Reject anything outside the file grids (menus, dialogs, preview
+      // surfaces) — only `.file-list` containers opt in.
+      if (!t || !t.closest || !t.closest(".file-list")) return;
+    }
+    if (previewVisible.value) {
+      // Don't allow switching to the preview panel. Fall through WITHOUT
+      // consuming the key so a bare Tab still traverses focus natively.
       return;
     }
-
-    // F5 / Shift+F5: copy / move the selection into the OTHER panel's current
-    // directory (Total Commander keys). Deliberately NOT part of the clipboard
-    // branch above: these never touch the system clipboard, they go straight
-    // from the active panel's selection to the inactive panel's path.
-    //
-    // Both are plain function keys with no webview-native meaning, so they are
-    // consumed even while the address bar or the filename filter has focus
-    // (same reasoning as Ctrl+T below) — the one exception is a rename box,
-    // which is a text field where a stray F5 clearly means "not for me".
-    if (matches("edit.copyToOther", e) || matches("edit.moveToOther", e)) {
-      const t = e.target;
-      if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
-      // Resolve BOTH bindings before consuming: markHandled() makes every
-      // later matches() on the same event return false.
-      const isMove = matches("edit.moveToOther", e);
-      e.preventDefault();
-      markHandled(e);
-      transferToOtherPanel(isMove ? "cut" : "copy");
-      // Focus stays on the SOURCE panel (like TC): the user usually wants to
-      // keep working through the same selection. doPaste refreshes both panels.
-      return;
-    }
-
-    // Ctrl+M: batch rename the active panel's selection. Plain Ctrl combo with
-    // no webview-native meaning, so it is consumed even while an input has
-    // focus — except in a rename box, which is a text field where Ctrl+M
-    // clearly means "insert a newline", not "rename files".
-    if (matches("list.batchRename", e)) {
-      const t = e.target;
-      if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
-      // Already open: let the key reach the dialog's own inputs rather than
-      // reopening (and resetting) it.
-      if (batchRenameVisible.value) return;
-      e.preventDefault();
-      markHandled(e);
-      openBatchRename();
-      return;
-    }
-
-    // Ctrl+Tab / Ctrl+Shift+Tab: rotate to the next / previous tab of the
-    // ACTIVE panel (Total Commander keys). Checked BEFORE panel.switch so
-    // these two combos can never be claimed by the bare-Tab handler, which
-    // still owns plain `Tab`. Both are plain Ctrl combos with no webview-native
-    // meaning, so they are always consumed — even while the filename filter or
-    // the address bar has focus.
-    if (matches("tab.next", e) || matches("tab.prev", e)) {
-      // Resolve BOTH bindings before consuming the event: `markHandled` makes
-      // every later `matches()` on the same event return false.
-      const delta = matches("tab.next", e) ? 1 : -1;
-      e.preventDefault();
-      markHandled(e);
-      const panel = getActivePanelRef();
-      const tab = panel?.cycleTab?.(delta);
-      // Only one tab open → nothing moved; stay quiet instead of a toast that
-      // repeats the same text on every keypress.
-      if (tab) showToast(`已切换到标签页：${tab.path}`, "info");
-      // Keep the DOM focus on the file grid so the arrow keys immediately
-      // drive the newly active tab.
-      getActivePanelRef()?.focusList?.();
-      return;
-    }
-
-    // Ctrl+T / Ctrl+W: new / close a tab in the ACTIVE panel (Total Commander
-    // keys). Both are plain Ctrl combos with no webview-native meaning, so we
-    // always consume them — even while the filename filter or the address bar
-    // has focus, which is where a new tab is most often wanted.
-    if (matches("tab.new", e) || matches("tab.close", e)) {
-      // Resolve BOTH bindings before consuming the event: `markHandled` makes
-      // every later `matches()` on the same event return false.
-      const isNew = matches("tab.new", e);
-      e.preventDefault();
-      markHandled(e);
-      const panel = getActivePanelRef();
-      if (isNew) panel?.addTab?.();
-      else panel?.closeActiveTab?.();
-      // Keep the DOM focus on the file grid so the arrow keys immediately
-      // drive the (new) active tab.
-      getActivePanelRef()?.focusList?.();
-      return;
-    }
-
-    // Ctrl+Shift+L / Ctrl+Y: lock / unlock the active panel's current tab, and
-    // jump it back to its locked dir (Total Commander's "lock tab, directory
-    // changes allowed"). Locking only records an anchor — the tab keeps
-    // navigating freely, exactly like TC.
-    if (matches("tab.lock", e) || matches("tab.jumpLocked", e)) {
-      // Resolve both before markHandled() (which makes later matches() false).
-      const isLock = matches("tab.lock", e);
-      e.preventDefault();
-      markHandled(e);
-      const panel = getActivePanelRef();
-      if (isLock) {
-        const res = panel?.toggleLock?.();
-        if (res?.locked) showToast(`已锁定当前标签页：${res.tab.path}`, "info");
-        else if (res) showToast("已解除标签页锁定", "info");
-      } else {
-        const res = panel?.jumpToLocked?.();
-        if (res?.ok) showToast(`已回到锁定位置：${res.path}`, "info");
-        else if (res?.reason === "unlocked") showToast("当前标签页未锁定", "info");
-        // reason === "same" / "none": already there (or no panel) — stay quiet.
-      }
-      // Keep DOM focus on the file grid so navigation continues from here.
-      getActivePanelRef()?.focusList?.();
-      return;
-    }
-
-    // Alt+← / Alt+→: walk the active tab's own directory history (browser
-    // style). Each tab keeps an independent stack, persisted with it, so a
-    // restart can still walk back. Alt+ArrowLeft/Right have no webview-native
-    // meaning of their own (the browser's back/forward is plain Alt+← only on
-    // some builds and never fires inside a Tauri webview), so they're always
-    // consumed — same reasoning as Ctrl+T above.
-    if (matches("nav.back", e) || matches("nav.forward", e)) {
-      // Resolve both before markHandled() (which makes later matches() false).
-      const isBack = matches("nav.back", e);
-      const panel = getActivePanelRef();
-      // Don't consume the key when this panel has nowhere to go: letting it
-      // fall through keeps the combo available to the webview, and the
-      // PathBar's ← / → buttons already show the state as disabled.
-      if (!(isBack ? panel?.canGoBack?.() : panel?.canGoForward?.())) return;
-      e.preventDefault();
-      markHandled(e);
-      const res = isBack ? panel.goBack() : panel.goForward();
-      // `stepHistory` awaits a pathExists() probe per skipped entry, so it
-      // settles asynchronously even on the fast path.
-      Promise.resolve(res).then((r) => {
-        if (r?.ok && r.dropped) {
-          showToast(`已跳过 ${r.dropped} 个已不存在的目录`, "info");
-        }
-        getActivePanelRef()?.focusList?.();
-      });
-      return;
-    }
-
-    // Ctrl+D: add the active panel's current directory to the global bookmark
-    // list (~/.minitc/bookmarks.json), or remove it when it's already there.
-    // A search-results tab has no real directory to bookmark, so it's rejected
-    // rather than storing the `minitc://search/…` sentinel.
-    if (matches("bookmark.toggle", e)) {
-      // A text input owns its own keys: while renaming a bookmark the ⭐
-      // dropdown has a focused `.bm-input`, and toggling the bookmark out from
-      // under the user's cursor would be a nasty surprise.
-      if (isTypingTarget(e.target)) {
-        return;
-      }
-      const panel = getActivePanelRef();
-      const cur = panel?.currentPath;
-      // No panel at all, or one parked on a search-results tab → let the key
-      // fall through to the webview instead of consuming it for nothing.
-      if (!cur || panel?.isVirtual?.()) return;
-      e.preventDefault();
-      markHandled(e);
-      const existing = findBookmark(cur);
-      if (existing) {
-        removeBookmark(existing.id);
-        showToast(`已移除书签：${existing.name}`, "info");
-      } else {
-        const res = addBookmark(cur);
-        if (res.ok) showToast(`已添加书签：${res.bookmark.name}`, "success");
-      }
-      getActivePanelRef()?.focusList?.();
-      return;
-    }
-
-    // Ctrl+H: show / hide hidden entries (dotfiles, hidden & system attributes)
-    // in the ACTIVE panel. The two panels keep independent state, so this
-    // never touches the other side. Filtering is purely front-end (the backend
-    // always returns the full listing), so the toggle is instant even in a
-    // directory with thousands of entries — no re-listing.
-    if (matches("view.toggleHidden", e)) {
-      if (isTypingTarget(e.target)) {
-        return;
-      }
-      const panelId = activePanel.value;
-      const now = toggleHiddenForPanel(panelId);
-      e.preventDefault();
-      markHandled(e);
-      showToast(
-        `${now ? "已显示" : "已隐藏"}隐藏文件（${panelId === "left" ? "左" : "右"}栏）`,
-        "info"
-      );
-      // The row set changed under the cursor, so put keyboard focus back on
-      // the list rather than leaving it on <body>.
-      getActivePanelRef()?.focusList?.();
-      return;
-    }
-
-    // Tab / Ctrl+Tab: Switch active panel (skip if target is showing preview)
-    if (matches("panel.switch", e)) {
-      // A bare Tab is a real browser key (focus traversal), so it only means
-      // "switch panel" when a file list actually owns the focus — the Total
-      // Commander behaviour. Anywhere else (address bar, filename filter,
-      // inline rename, dialog buttons, right-click menu) we must fall through
-      // and let the webview move focus natively, otherwise keyboard users can't
-      // leave a text field or reach a dialog button.
-      // Only a bare `Tab` is bound now — Ctrl+Tab belongs to tab.next above —
-      // but the guard stays on the combo so a user rebinding can't reintroduce
-      // a Ctrl combo that would then hijack the filter input's focus exit.
-      const bareTab = eventCombo(e) === "Tab";
-      if (bareTab) {
-        const t = e.target;
-        if (isTypingTarget(t)) return;
-        // Reject anything outside the file grids (menus, dialogs, preview
-        // surfaces) — only `.file-list` containers opt in.
-        if (!t || !t.closest || !t.closest(".file-list")) return;
-      }
-      if (previewVisible.value) {
-        // Don't allow switching to the preview panel. Fall through WITHOUT
-        // consuming the key so a bare Tab still traverses focus natively.
-        return;
-      }
-      e.preventDefault();
-      markHandled(e);
-      activePanel.value = activePanel.value === "left" ? "right" : "left";
-      // Hand the DOM keyboard focus to the newly active panel so the arrow
-      // keys that follow drive THAT list, not the one we just left.
-      getActivePanelRef()?.focusList?.();
-    }
-  });
-});
+    e.preventDefault();
+    markHandled(e);
+    activePanel.value = activePanel.value === "left" ? "right" : "left";
+    // Hand the DOM keyboard focus to the newly active panel so the arrow
+    // keys that follow drive THAT list, not the one we just left.
+    getActivePanelRef()?.focusList?.();
+  }
+}
 
 onUnmounted(() => {
   appUnmounted = true;
@@ -2439,6 +2451,8 @@ onUnmounted(() => {
   if (unlistenDragLeave) unlistenDragLeave();
   window.removeEventListener("focus", onWindowFocusRegain);
   document.removeEventListener("visibilitychange", onVisibilityRegain);
+  // Same reference that onMounted added — see the note on onGlobalKeydown.
+  document.removeEventListener("keydown", onGlobalKeydown);
   // Never leave the window pinned above other apps on the way out.
   alwaysOnTop.reset();
 });

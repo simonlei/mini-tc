@@ -263,7 +263,7 @@ npm test                       # 只跑单元测试
 
 改动 `.vue` / `src/*.js` 后跑一次，比等运行时白屏再回头找快得多。
 
-`npm test` 目前覆盖十五个前端纯逻辑套件（此数字是照 `package.json` 的 `test` 脚本数出来的；
+`npm test` 目前覆盖十六个前端纯逻辑套件（此数字是照 `package.json` 的 `test` 脚本数出来的；
 早先这里写「十二块」时就已经落后于实际条目数了 —— 与其手工维护，不如按脚本数）：
 
 - `scripts/rename-rules-check.mjs` —— 批量重命名的规则与两阶段执行（含失败回滚）。
@@ -378,6 +378,22 @@ npm test                       # 只跑单元测试
   ⚠️ jsdom **不实现 `isContentEditable`**（真实元素上返回 `undefined`），脚本显式补种并注明，
   否则该分支在套件里静默不可达。10 个变异全部实测被抓到，含「判据退回只看焦点」
   （原 bug 复活）、「窄守卫被误改」与「落地点换回内联三段判定」。
+- `scripts/global-keydown-check.mjs` —— App.vue 的全局 keydown 监听器是「具名 + 对称增删」。
+  64 例，**全部是静态断言**，因为这个 bug 只有静态形态：handler 原本是 `onMounted` 里的
+  匿名箭头，`onUnmounted` 手里没有可传给 `removeEventListener` 的引用，DOM 上那份注册
+  永远留着，闭包钉住整个组件作用域（所有 ref、两个 panel ref），HMR 每热更一次叠一份。
+  纯逻辑断言管不了它 —— 函数体搬前搬后一模一样，行为一模一样。
+  判据分四层：① 逐个列出全部 keydown 注册点，要求传入的是**裸标识符**（不是「没有箭头」
+  这种会被 `f && guard()` 骗过的判据）；② 移除点与注册点数量相等且**引用同一个标识符**；
+  ③ 移除必须发生在 `onUnmounted` 内（配平花括号取调用块）；④ 被注册的标识符有声明 ——
+  注册一个未声明的名字会让 `addEventListener` 收到 `undefined`，静默无操作。
+  另附对照臂：旧写法（匿名箭头 + 无移除）在本判据下必须露馅。
+  ⚠️ **写这条时真踩了一次「存在即可型恒绿」**：分支完整性用 `app.includes("matches(...)")`
+  判定，而变异 `if (false && matches("preview.toggle", e))` 里那段字面量**仍然在**，
+  首版断言 0 FAIL 逃过 —— 补了 `conditionOf()` 反查每个分支的 `if (...)` 条件、
+  拒绝恒假前缀才抓住（这条对应 `METHODOLOGY.md` 的「存在即可型断言恒绿」）。
+  5 个变异现已全部实测被抓到（改回匿名 / 删掉 removeEventListener / 移除时换名字 /
+  改错函数名 / 掏空分支体）。
 - `scripts/delete-scope-check.mjs` —— 删除操作的目的地快照与落地判定（`src/deleteScope.js`）。
 
   `onDelete` 逐项 `await`（进回收站 / 永久删除 / 提权重试，每项一次 IPC），一次几百项的
