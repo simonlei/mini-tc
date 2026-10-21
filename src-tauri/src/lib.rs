@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use tauri::Emitter;
 
 mod atomic_file;
+mod dedup;
 mod search_log;
 mod window_state;
 
@@ -1002,6 +1003,602 @@ fn hit_of(path: &Path, name: String, meta: &fs::Metadata, is_dir: bool) -> Searc
             meta,
         ),
     }
+}
+
+// ── Duplicate file finder (folder de-duplication) ──
+//
+// Walks a directory, groups files whose CONTENTS are byte-identical, and hands
+// the groups to the frontend. Nothing is deleted here: the dialog shows the
+// groups, the user picks which copy survives, and only then does the frontend
+// call `dedup_delete` — which re-checks each file before trashing it.
+//
+// The comparison itself lives in `dedup.rs` (pure, unit-tested); this section
+// is the IPC + event + cancellation shell around it.
+
+/// One file inside a duplicate group.
+#[derive(Serialize, Clone)]
+pub struct DedupFile {
+    pub path: String,
+    pub name: String,
+    pub dir: String,
+    pub size: u64,
+    pub modified: i64,
+}
+
+/// A set of two or more files with identical content.
+#[derive(Serialize, Clone)]
+pub struct DedupGroup {
+    /// All members share this length (bytes).
+    pub size: u64,
+    pub files: Vec<DedupFile>,
+}
+
+/// How far the scan got, so a slow disk is visibly alive.
+#[derive(Serialize, Clone)]
+struct DedupProgress {
+    id: u64,
+    /// "collect" while walking, "compare" while matching content.
+    phase: String,
+    scanned: u64,
+    current: String,
+}
+
+#[derive(Serialize, Clone)]
+struct DedupDone {
+    id: u64,
+    cancelled: bool,
+    scanned: u64,
+    /// Files that took part in at least one content comparison.
+    compared: u64,
+    groups: Vec<DedupGroup>,
+    errors: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupOptions {
+    pub root: String,
+    /// Descend into sub-directories. Off = this folder only.
+    pub recursive: bool,
+    pub include_hidden: bool,
+    /// Include zero-length files. Off by default: a directory full of empty
+    /// files is not a directory full of copies, and offering to delete them is
+    /// noise at best.
+    pub include_empty: bool,
+}
+
+/// Depth guard for the recursive walk, same reasoning as MAX_SEARCH_DEPTH.
+const MAX_DEDUP_DEPTH: usize = 64;
+/// Progress cadence. Content comparison of a large directory can take a while
+/// with no other signal, so the dialog must not be left staring at a spinner.
+const DEDUP_PROGRESS_INTERVAL_MS: u128 = 300;
+/// How often (in scanned entries) the wall clock is consulted. The cancel flag
+/// is an atomic load and is read on every entry.
+const DEDUP_PROGRESS_CHECK_MASK: u64 = 31;
+/// Hard cap on reported groups, so a pathological tree can't build a payload
+/// that stalls the webview.
+const MAX_DEDUP_GROUPS: usize = 2000;
+
+/// Cancellation flag of the de-dup scan with this id.
+///
+/// 🚨 Deliberately NOT shared with `SEARCH_CANCEL`. That one is a single slot
+/// that `start_search` cancels-and-replaces, so a de-dup scan living there
+/// would be killed by any new search and vice versa. Keyed by the caller's id
+/// instead, and a stale id simply isn't there.
+///
+/// `LazyLock`, not `Mutex::new(HashMap::new())`: `Mutex::new` is a const fn but
+/// `HashMap::new` is not, so a plain static does not compile.
+static DEDUP_CANCEL: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Kick off a background de-duplication scan. Returns immediately; results
+/// arrive as a single `dedup-done` (there is no streaming partial result — a
+/// half-built cluster set would be misleading).
+#[tauri::command]
+fn start_dedup(app: tauri::AppHandle, id: u64, options: DedupOptions) -> Result<(), String> {
+    search_log::install_panic_hook();
+    let root = Path::new(&options.root);
+    if !root.is_dir() {
+        return Err(format!("目录不存在: {}", options.root));
+    }
+    search_log::log(&format!(
+        "start_dedup id={id} root={:?} recursive={} include_hidden={} include_empty={}",
+        options.root, options.recursive, options.include_hidden, options.include_empty
+    ));
+
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut guard = DEDUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+        // A rescan under the same id supersedes the previous one; anything else
+        // keeps running (a second panel may legitimately scan at the same time).
+        if let Some(prev) = guard.insert(id, flag.clone()) {
+            prev.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let log_app = app.clone();
+    let log_flag = flag.clone();
+    std::thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_dedup(app, id, options, flag);
+        }));
+        if outcome.is_err() {
+            search_log::log(&format!("dedup worker PANICKED: id={id}"));
+            // The search worker logs the emit error rather than dropping it;
+            // do the same here instead of `let _ =`.
+            if let Err(e) = log_app.emit(
+                "dedup-done",
+                DedupDone {
+                    id,
+                    cancelled: true,
+                    scanned: 0,
+                    compared: 0,
+                    groups: Vec::new(),
+                    errors: vec!["去重线程异常终止，详情见搜索日志".to_string()],
+                },
+            ) {
+                search_log::log(&format!("emit dedup-done FAILED: id={id}: {e}"));
+            }
+        }
+        let mut guard = DEDUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+        // Only drop OUR entry: a newer scan may already have claimed this id.
+        if let Some(cur) = guard.get(&id) {
+            if std::sync::Arc::ptr_eq(cur, &log_flag) {
+                guard.remove(&id);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Ask the de-dup scan with this id to stop. An unknown id is a no-op.
+#[tauri::command]
+fn cancel_dedup(id: u64) {
+    let guard = DEDUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(flag) = guard.get(&id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        search_log::log(&format!("cancel_dedup id={id}"));
+    }
+}
+
+fn emit_dedup_progress(app: &tauri::AppHandle, id: u64, phase: &str, scanned: u64, current: &str) {
+    let message = format!("dedup progress: id={id} phase={phase} scanned={scanned} at={current}");
+    match app.emit(
+        "dedup-progress",
+        DedupProgress {
+            id,
+            phase: phase.to_string(),
+            scanned,
+            current: current.to_string(),
+        },
+    ) {
+        Ok(()) => search_log::log(&message),
+        Err(e) => search_log::log(&format!("{message} — emit FAILED: {e}")),
+    }
+}
+
+fn run_dedup(
+    app: tauri::AppHandle,
+    id: u64,
+    opt: DedupOptions,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+
+    // ── Phase 1: collect candidates ──
+    //
+    // Iterative DFS (an explicit stack keeps deep trees off the 1 MB thread
+    // stack). Symlinked directories are never descended into, and depth is
+    // capped, so the walk stays finite.
+    let mut candidates: Vec<dedup::Candidate> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut scanned: u64 = 0;
+    let mut cancelled = false;
+    let mut last_progress = std::time::Instant::now();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(&opt.root), 0)];
+
+    'walk: while let Some((dir_path, depth)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        if last_progress.elapsed().as_millis() >= DEDUP_PROGRESS_INTERVAL_MS {
+            let shown = dir_path.to_string_lossy().to_string();
+            emit_dedup_progress(&app, id, "collect", scanned, &shown);
+            last_progress = std::time::Instant::now();
+        }
+
+        let rd = match fs::read_dir(&dir_path) {
+            Ok(rd) => rd,
+            Err(e) => {
+                if errors.len() < 5 {
+                    errors.push(format!("{} ({})", dir_path.display(), e));
+                }
+                continue;
+            }
+        };
+
+        let mut subs: Vec<(PathBuf, fs::Metadata)> = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // `DirEntry::metadata()` reuses the attributes the directory scan
+            // already produced — `fs::metadata(&path)` re-resolves every entry
+            // and used to dominate the walk (373 ms vs 1.3 ms for 4 782 files).
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => match fs::metadata(entry.path()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                },
+            };
+            scanned += 1;
+
+            if meta.is_dir() {
+                // Never follow a symlinked directory: that is how a walk turns
+                // into an infinite loop.
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if opt.recursive && depth + 1 <= MAX_DEDUP_DEPTH {
+                    subs.push((entry.path(), meta));
+                }
+                continue;
+            }
+
+            // A file symlink is skipped rather than followed: two links to the
+            // same target are "identical" in content but deleting one is a
+            // link edit the user did not ask for.
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if !opt.include_hidden && is_hidden(&name, &meta) {
+                continue;
+            }
+            // Zero-length files are excluded by default (see `include_empty`).
+            if !opt.include_empty && meta.len() == 0 {
+                continue;
+            }
+            candidates.push(dedup::Candidate {
+                path: entry.path(),
+                size: meta.len(),
+                modified: system_time_to_millis(meta.modified()),
+            });
+
+            if scanned & DEDUP_PROGRESS_CHECK_MASK == 0
+                && last_progress.elapsed().as_millis() >= DEDUP_PROGRESS_INTERVAL_MS
+            {
+                let shown = dir_path.to_string_lossy().to_string();
+                emit_dedup_progress(&app, id, "collect", scanned, &shown);
+                last_progress = std::time::Instant::now();
+            }
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break 'walk;
+            }
+        }
+
+        subs.sort_by(|a, b| {
+            a.0.to_string_lossy()
+                .to_lowercase()
+                .cmp(&b.0.to_string_lossy().to_lowercase())
+        });
+        // Reverse-push so the LIFO stack visits them in name order.
+        for (p, _) in subs.into_iter().rev() {
+            stack.push((p, depth + 1));
+        }
+    }
+
+    // Sort by path so the candidate order — and therefore the cluster
+    // representatives — do not depend on the filesystem's enumeration order.
+    candidates.sort_by(|a, b| {
+        a.path
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&b.path.to_string_lossy().to_lowercase())
+    });
+    search_log::log(&format!(
+        "run_dedup collected: id={id} scanned={scanned} candidates={} cancelled={cancelled}",
+        candidates.len()
+    ));
+
+    // ── Phase 2: match contents ──
+    let mut compared: u64 = 0;
+    let mut clusters = dedup::cluster(&candidates, &cancel, || {
+        compared += 1;
+        if compared & DEDUP_PROGRESS_CHECK_MASK == 0
+            && last_progress.elapsed().as_millis() >= DEDUP_PROGRESS_INTERVAL_MS
+        {
+            let phase = format!("{compared}");
+            // The "current" column has no meaningful path during comparison;
+            // reporting the count keeps the status row alive.
+            emit_dedup_progress(&app, id, &phase, scanned, "");
+            last_progress = std::time::Instant::now();
+        }
+    });
+    if cancel.load(Ordering::Relaxed) {
+        cancelled = true;
+    }
+
+    // Biggest wins first, so the dialog's top row is the one that frees the
+    // most space.
+    clusters.sort_by(|a, b| b[0].size.cmp(&a[0].size));
+    let truncated = clusters.len() > MAX_DEDUP_GROUPS;
+    clusters.truncate(MAX_DEDUP_GROUPS);
+
+    let groups: Vec<DedupGroup> = clusters
+        .into_iter()
+        .map(|cl| DedupGroup {
+            size: cl[0].size,
+            files: cl
+                .into_iter()
+                .map(|c| {
+                    let name = c
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let dir = c
+                        .path
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    DedupFile {
+                        path: c.path.to_string_lossy().to_string(),
+                        name,
+                        dir,
+                        size: c.size,
+                        modified: c.modified,
+                    }
+                })
+                // Newest first, so the default keeper the dialog picks (index 0)
+                // is the most recently modified copy.
+                .collect(),
+        })
+        .collect();
+
+    search_log::log(&format!(
+        "run_dedup done: id={id} scanned={scanned} compared={compared} groups={} truncated={truncated} cancelled={cancelled} elapsed={:?}",
+        groups.len(),
+        started.elapsed()
+    ));
+    let done = DedupDone {
+        id,
+        cancelled,
+        scanned,
+        compared,
+        groups,
+        errors,
+    };
+    if let Err(e) = app.emit("dedup-done", done) {
+        search_log::log(&format!("emit dedup-done FAILED: id={id}: {e}"));
+    }
+    if truncated {
+        search_log::log(&format!(
+            "run_dedup truncated: id={id} only the first {MAX_DEDUP_GROUPS} groups were reported"
+        ));
+    }
+}
+
+/// One entry of a user-confirmed deletion request: the path plus the size and
+/// mtime observed during the scan.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupDeleteItem {
+    pub path: String,
+    pub size: u64,
+    pub modified: i64,
+}
+
+/// Outcome of `dedup_delete`.
+#[derive(Serialize, Clone)]
+pub struct DedupDeleteResult {
+    /// Paths that actually went to the recycle bin (undoable as one batch).
+    pub deleted: Vec<String>,
+    /// Skipped because the file changed (or vanished) since the scan: its size
+    /// or mtime no longer matches what was compared. Reported rather than
+    /// silently dropped — deleting it would delete something we never checked.
+    pub changed: Vec<String>,
+    /// Real failures, with the message (permission denied, locked, …).
+    pub failed: Vec<String>,
+}
+
+/// One step of an in-flight `dedup_delete`.
+///
+/// The delete is a single IPC call precisely so the recycle-bin bracket is
+/// opened and closed exactly once (the undo stack is one deep). That rules out
+/// the alternative of having the frontend call it in chunks, so progress has to
+/// come out as events instead.
+#[derive(Serialize, Clone)]
+struct DedupDeleteProgress {
+    /// Files processed so far, including the ones skipped.
+    processed: usize,
+    total: usize,
+    /// Name of the file just handled (display only).
+    current: String,
+    /// How many have actually gone into the bin — this is the number the
+    /// progress bar should advance on. A skipped or failed file never counts.
+    deleted: usize,
+}
+
+/// How often a delete step reports progress. Trashing a file is a cross-volume
+/// file move on Windows — hundreds of milliseconds each — so per-file events are
+/// genuinely useful, but a few thousand of them would drown the webview.
+const DEDUP_DELETE_PROGRESS_EVERY: usize = 1;
+const DEDUP_DELETE_PROGRESS_INTERVAL_MS: u128 = 60;
+
+/// Report delete progress, throttled by both a step mask and a wall clock.
+fn emit_dedup_delete_progress(
+    app: &tauri::AppHandle,
+    processed: usize,
+    total: usize,
+    deleted: usize,
+    current: &str,
+    force: bool,
+    last: &mut std::time::Instant,
+) {
+    if !force
+        && processed % DEDUP_DELETE_PROGRESS_EVERY != 0
+        && last.elapsed().as_millis() < DEDUP_DELETE_PROGRESS_INTERVAL_MS
+    {
+        return;
+    }
+    if let Err(e) = app.emit(
+        "dedup-delete-progress",
+        DedupDeleteProgress {
+            processed,
+            total,
+            current: current.to_string(),
+            deleted,
+        },
+    ) {
+        search_log::log(&format!("emit dedup-delete-progress FAILED: {e}"));
+    }
+    *last = std::time::Instant::now();
+}
+
+/// Trash every confirmed duplicate, skipping any whose file changed since the
+/// scan. Returns what happened per path; the caller decides how to report it.
+///
+/// `on_step` is called after each file with `(processed, total, deleted, name)`.
+/// It is a callback rather than an emitter so this stays a plain function that
+/// the delete wrappers (which own the `AppHandle`) can drive.
+///
+/// This is the platform-independent half — the undo bookkeeping needs the
+/// cfg-gated bin helpers, so it lives in the two `dedup_delete` wrappers below
+/// (mirroring how `begin_trash_delete` / `commit_trash_delete` are split).
+fn trash_dedup_items<F>(items: &[DedupDeleteItem], mut on_step: F) -> DedupDeleteResult
+where
+    F: FnMut(usize, usize, usize, &str),
+{
+    let mut deleted: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let total = items.len();
+    for (i, item) in items.iter().enumerate() {
+        let p = Path::new(&item.path);
+        // `symlink_metadata`, not `metadata`: the latter follows links, so a
+        // path that has since become a symlink would be checked as its target.
+        let meta = match fs::symlink_metadata(p) {
+            Ok(m) => m,
+            Err(_) => {
+                changed.push(item.path.clone());
+                on_step(i + 1, total, deleted.len(), &item.path);
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink()
+            || !meta.is_file()
+            || meta.len() != item.size
+            || system_time_to_millis(meta.modified()) != item.modified
+        {
+            changed.push(item.path.clone());
+            on_step(i + 1, total, deleted.len(), &item.path);
+            continue;
+        }
+        match trash::delete(p) {
+            Ok(()) => {
+                deleted.push(item.path.clone());
+                on_step(i + 1, total, deleted.len(), &item.path);
+            }
+            Err(e) => {
+                failed.push(format!("{} ({})", item.path, e));
+                on_step(i + 1, total, deleted.len(), &item.path);
+            }
+        }
+    }
+    DedupDeleteResult {
+        deleted,
+        changed,
+        failed,
+    }
+}
+
+/// Delete the confirmed duplicates, as ONE undoable recycle-bin batch.
+///
+/// Every path is re-`stat`ed first and skipped unless its size AND mtime still
+/// match the scan. Between "scan" and "confirm" the user may have edited, saved
+/// or replaced any of these files, and the content we compared is no longer
+/// necessarily what is on disk — the user would be deleting something they
+/// never saw. A skipped file is reported in `changed`, never deleted.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[tauri::command]
+fn dedup_delete(app: tauri::AppHandle, items: Vec<DedupDeleteItem>) -> DedupDeleteResult {
+    if items.is_empty() {
+        return DedupDeleteResult {
+            deleted: Vec::new(),
+            changed: Vec::new(),
+            failed: Vec::new(),
+        };
+    }
+    // One bracket for the whole batch: the undo stack is a single slot, so a
+    // per-file snapshot would leave only the last file recoverable.
+    let before = trash_snapshot_ids();
+    // Start the clock "already expired" so the first file reports immediately
+    // rather than waiting out the throttle window.
+    let mut last = std::time::Instant::now()
+        - std::time::Duration::from_millis(DEDUP_DELETE_PROGRESS_INTERVAL_MS as u64);
+    let result = trash_dedup_items(&items, |processed, total, deleted, name| {
+        emit_dedup_delete_progress(
+            &app,
+            processed,
+            total,
+            deleted,
+            name,
+            processed == total,
+            &mut last,
+        );
+    });
+    push_trash_undo_batch(before, &result.deleted);
+    log_dedup_delete(&result);
+    result
+}
+
+/// Platforms without a restorable bin still delete (via the OS's own trash),
+/// they just cannot offer one Ctrl+Z for the batch.
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+#[tauri::command]
+fn dedup_delete(app: tauri::AppHandle, items: Vec<DedupDeleteItem>) -> DedupDeleteResult {
+    let mut last = std::time::Instant::now();
+    let result = trash_dedup_items(&items, |processed, total, deleted, name| {
+        emit_dedup_delete_progress(
+            &app,
+            processed,
+            total,
+            deleted,
+            name,
+            processed == total,
+            &mut last,
+        );
+    });
+    log_dedup_delete(&result);
+    result
+}
+
+fn log_dedup_delete(result: &DedupDeleteResult) {
+    search_log::log(&format!(
+        "dedup_delete: deleted={} changed={} failed={}",
+        result.deleted.len(),
+        result.changed.len(),
+        result.failed.len()
+    ));
 }
 
 /// Preview data returned to the frontend.
@@ -4547,6 +5144,9 @@ pub fn run() {
             get_dir_size,
             start_search,
             cancel_search,
+            start_dedup,
+            cancel_dedup,
+            dedup_delete,
             delete_to_trash,
             delete_permanently,
             delete_with_admin,

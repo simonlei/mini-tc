@@ -167,6 +167,38 @@ export async function cancelSearch() {
   return invoke("cancel_search");
 }
 
+// ── Duplicate file finder ──
+
+/// Start a duplicate scan over `options.root`. Only spawns the worker and
+/// returns; the result arrives as ONE `dedup-done` event (there is no partial
+/// result — a half-built cluster set would be misleading). `id` is echoed back
+/// on every event so a stale scan's payload can be told apart from the current
+/// one.
+///
+/// `options` is `{ root, recursive, includeHidden, includeEmpty }`.
+/// Files are compared by CONTENT, not by name. 0-byte files are excluded
+/// unless `includeEmpty`: a folder full of empty files is not a folder full of
+/// copies.
+export async function startDedup(id, options) {
+  return invoke("start_dedup", { id, options });
+}
+
+/// Ask the scan with this id to stop at its next checkpoint.
+export async function cancelDedup(id) {
+  return invoke("cancel_dedup", { id });
+}
+
+/// Move the confirmed duplicates to the recycle bin as ONE undoable batch.
+///
+/// `items` are `{ path, size, modified }` triples as observed at SCAN time. The
+/// backend re-stats each one and skips any whose size or mtime has changed
+/// since — deleting a file we never compared is not a de-duplication, it is data
+/// loss. Resolves to `{ deleted: string[], changed: string[], failed: string[] }`
+/// — nothing is thrown for an individual failure; report all three lists.
+export async function dedupDelete(items) {
+  return invoke("dedup_delete", { items });
+}
+
 /// Load a named config blob from ~/.minitc/<name>.json.
 /// Resolves to the raw JSON string, or null when absent / unreadable.
 ///

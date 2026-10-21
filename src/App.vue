@@ -42,6 +42,9 @@
       <div class="menu-item" @click="openSearch">
         <span>搜索</span>
       </div>
+      <div class="menu-item" @click="openDedup">
+        <span>重复文件</span>
+      </div>
       <div class="menu-item" @click="toggleHelpMenu">
         <span>帮助</span>
         <span class="menu-arrow">▾</span>
@@ -131,6 +134,17 @@
       :existing="batchRenameExisting"
       @close="closeBatchRename"
       @applied="onBatchRenameApplied"
+    />
+
+    <!-- Duplicate file finder. Deletes nothing until the user confirms inside
+         the dialog, and the backend re-checks every file's size/mtime before
+         trashing it. -->
+    <DedupDialog
+      v-if="dedupVisible"
+      :initial-path="dedupRoot"
+      @close="closeDedup"
+      @use-current-dir="onDedupUseCurrentDir"
+      @deleted="onDedupDeleted"
     />
 
     <!-- Main content: two panels with a draggable separator -->
@@ -264,6 +278,7 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import GeneralSettingsDialog from "./components/GeneralSettingsDialog.vue";
 import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import SearchDialog from "./components/SearchDialog.vue";
+import DedupDialog from "./components/DedupDialog.vue";
 import BatchRenameDialog from "./components/BatchRenameDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir, undoTrashPeek, undoTrashDelete } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
@@ -551,6 +566,57 @@ function onSearchSendToPanel({ panel: which, ...payload } = {}) {
       : `${which === "right" ? "右" : "左"}栏已载入 ${payload.hits?.length || 0} 个搜索结果`,
     "success"
   );
+}
+
+// ── Duplicate file finder ──
+// The dialog owns the scan AND the deletion; this side decides which directory
+// it starts from and refreshes both panels afterwards. The panel + focused
+// element are remembered exactly as the search dialog does, so Esc does not
+// strand the keyboard on <body>.
+const dedupVisible = ref(false);
+const dedupRoot = ref("");
+let dedupReturnPanel = "left";
+let dedupReturnFocus = null;
+
+function openDedup() {
+  configMenuOpen.value = false;
+  helpMenuOpen.value = false;
+  if (dedupVisible.value) return;
+  dedupReturnPanel = activePanel.value;
+  dedupReturnFocus = document.activeElement;
+  dedupRoot.value = currentPanelPath();
+  dedupVisible.value = true;
+}
+
+function closeDedup() {
+  dedupVisible.value = false;
+  const target = dedupReturnFocus;
+  const panel = dedupReturnPanel === "left" ? leftPanel.value : rightPanel.value;
+  nextTick(() => {
+    if (target && target !== document.body && target.isConnected) {
+      target.focus();
+      if (document.activeElement === target) return;
+    }
+    panel?.focusList?.();
+  });
+}
+
+function onDedupUseCurrentDir() {
+  dedupRoot.value = currentPanelPath();
+}
+
+// The dialog deleted files it found anywhere under the scan root, which may
+// include the active panel's directory (or, with 包含子目录, a subdirectory of
+// it). Refreshing both panels is the honest response: we cannot know which
+// listing a given row belonged to without re-listing, and a stale row that
+// looks present but is not is exactly the kind of thing that leads to a
+// second, confused delete.
+function onDedupDeleted() {
+  leftPanel.value?.refresh?.();
+  rightPanel.value?.refresh?.();
+  leftPanel.value?.refreshDrives?.();
+  rightPanel.value?.refreshDrives?.();
+  showToast("重复文件清理完成", "success");
 }
 
 // ── Batch rename (Ctrl+M) ──
@@ -2104,6 +2170,12 @@ function onGlobalKeydown(e) {
   // Same for the batch-rename dialog: it owns Esc (capture phase) and its
   // rule inputs. Ctrl+M itself is re-checked below so it isn't swallowed.
   if (batchRenameVisible.value) return;
+
+  // The duplicate-file dialog is modal for the same reason: its checkboxes and
+  // the directory input would otherwise drive the panels underneath — Delete
+  // would remove files behind the overlay while the user is picking which
+  // duplicates to remove.
+  if (dedupVisible.value) return;
 
   // The conflict prompt raised by an undo is modal too. Without this,
   // pressing Ctrl+Z again while it is open would raise a SECOND prompt and
