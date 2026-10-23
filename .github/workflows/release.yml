@@ -132,7 +132,7 @@ jobs:
   # 所有平台更新通道双推到腾讯云 COS：等 release 矩阵（Win/mac）全部完成后，
   # 从 GitHub Release 按 latest.json 实际引用拉取更新包，改写全部平台 URL 为 COS，
   # 再整体上传，使国内用户（无论 Windows/macOS）均走 CDN 更新。
-  # 依赖均为 ubuntu-22.04 runner 预装：gh、jq、aws（CLI v2），无需 pip/额外安装。
+  # gh、jq 为 ubuntu-22.04 runner 预装；上传用官方 coscli（按版本与 sha256 下载）。
   sync-cos:
     needs: release
     permissions:
@@ -171,46 +171,71 @@ jobs:
           echo "Rewrote latest.json URLs to $UPDATER_CDN_BASE"
 
       - name: Sync updater artifacts to Tencent COS
-        # runner 预装 AWS CLI v2，直接用 aws s3 sync 对接腾讯云 COS（S3 兼容），
-        # 无需 pip 安装。
-        # 寻址方式必须用 virtual-hosted-style：COS 对该 bucket 禁用 path-style
-        # （否则报 PathStyleDomainForbidden），请求会落到
-        # https://<bucket>.cos.<region>.myqcloud.com/...。
-        # 关闭 payload 签名：AWS CLI v2 对分片上传默认用 aws-chunked 流式签名，
-        # 不带 Content-Length 头，COS 严格要求该头会报 MissingContentLength。
+        # 官方 coscli，走 COS 原生接口，不再经 AWS CLI 的 S3 兼容层。
+        # 兼容层的两个缺口：分片默认 aws-chunked 且不带 Content-Length
+        # （COS 报 MissingContentLength）；UserNetworkTooSlow 不是标准重试码。
+        # coscli 在文件大于 --part-size 时走 InitiateMultipartUpload/UploadPart，
+        # 每片带 Content-Length，默认断点续传；sync 按 CRC64 跳过已一致对象。
+        # 小于分片阈值的更新包仍是单次 PutObject。
+        # 源目录必须带尾斜杠（cos-assets/），否则对象会落到 cos-assets/ 前缀下，
+        # 和 latest.json 里的 <CDN>/<filename> 对不上。
+        # runner 上没有 ~/.cos.yaml，必须 --init-skip，否则会卡在交互式初始化。
+        # 密钥需含 HeadBucket/GetBucket/HeadObject/PutObject，以及分片：
+        # InitiateMultipartUpload/UploadPart/CompleteMultipartUpload/ListParts/AbortMultipartUpload。
         env:
           COS_BUCKET: ${{ secrets.COS_BUCKET }}
           COS_REGION: ${{ secrets.COS_REGION }}
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
           COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
           UPDATER_CDN_BASE: ${{ secrets.UPDATER_CDN_BASE }}
+          # 与 https://github.com/tencentyun/coscli/releases/download/v1.0.9/sha256sum.log 中 linux-amd64 一致。
+          COSCLI_VERSION: v1.0.9
+          COSCLI_SHA256: a07de5ba2800147a700ed29036b0c76a4229088cee68e1682d0eae19b638a915
         run: |
-          aws configure set aws_access_key_id "$COS_SECRET_ID"
-          aws configure set aws_secret_access_key "$COS_SECRET_KEY"
-          aws configure set region "$COS_REGION"
-          aws configure set s3.addressing_style virtual
-          aws configure set s3.payload_signing_enabled false
-          # GH Actions runner(美西)→ 腾讯云 COS(国内)跨太平洋链路慢，
-          # 更新产物仅 4 个左右且 <8MB（走单次 PutObject，不触发 multipart 分片）。
-          # 并发降到 2 让单个上传拿到更多带宽；再套 shell 重试兜 COS 专有的
-          # UserNetworkTooSlow（非标准码，CLI standard 重试不一定兜得住）。
-          # s3 sync 按大小/etag 跳过已传文件，重试只补传失败项。
-          aws configure set s3.max_concurrent_requests 2
-          aws configure set default.retry_mode standard
-          aws configure set default.max_attempts 8
-          EP="https://cos.$COS_REGION.myqcloud.com"
-          MAX_RETRIES=5
+          set -euo pipefail
+          ASSET="coscli-${COSCLI_VERSION}-linux-amd64"
+          URL="https://github.com/tencentyun/coscli/releases/download/${COSCLI_VERSION}/${ASSET}"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o "/tmp/${ASSET}" "$URL"
+          echo "${COSCLI_SHA256}  /tmp/${ASSET}" | sha256sum --check
+          install -m 0755 "/tmp/${ASSET}" /usr/local/bin/coscli
+          coscli --version
+
+          # 美西 runner → 国内 COS：文件间并发 2，分片 16MB、分片并发 2。
+          # 单连接过慢会触发 UserNetworkTooSlow（4xx，SDK 的 5xx 重试不管它，
+          # 由 --err-retry-num 在应用层重试）。外层再跑整次 sync：
+          # 已完成对象按 CRC64 跳过，未完成分片走断点续传。
+          EP="cos.${COS_REGION}.myqcloud.com"
+          LOG_DIR=/tmp/coscli_output
+          mkdir -p "$LOG_DIR"
+          MAX_RETRIES=3
           for i in $(seq 1 "$MAX_RETRIES"); do
-            if aws s3 sync cos-assets "s3://$COS_BUCKET" --endpoint-url "$EP"; then
+            if coscli sync cos-assets/ "cos://${COS_BUCKET}/" \
+              --recursive \
+              --init-skip \
+              --endpoint "$EP" \
+              --secret-id "$COS_SECRET_ID" \
+              --secret-key "$COS_SECRET_KEY" \
+              --part-size 16 \
+              --thread-num 2 \
+              --routines 2 \
+              --err-retry-num 8 \
+              --err-retry-interval 5 \
+              --disable-checksum=false \
+              --process-log-path "$LOG_DIR" \
+              --fail-output-path "$LOG_DIR" \
+              --log-path "$LOG_DIR"; then
               echo "Sync succeeded on attempt $i."
               break
             fi
             echo "Sync attempt $i failed."
+            if [ -d "$LOG_DIR" ]; then
+              find "$LOG_DIR" -type f -print -exec tail -n 80 {} \;
+            fi
             if [ "$i" -eq "$MAX_RETRIES" ]; then
               echo "ERROR: sync failed after $MAX_RETRIES attempts."
               exit 1
             fi
-            SLEEP=$((i * i * 5))   # 5/20/45/80s 退避
+            SLEEP=$((i * i * 10))
             echo "Retrying in ${SLEEP}s..."
             sleep "$SLEEP"
           done
