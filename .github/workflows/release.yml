@@ -138,6 +138,9 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-22.04
+    # 跨境链路可能让单次 PutObject 陷入无限重传；coscli 没有全局 deadline，
+    # 不设超时就会一直烧到 GitHub 默认的 360 分钟。
+    timeout-minutes: 30
     steps:
       - name: Download release assets from GitHub
         # 按 latest.json 实际引用的文件名逐个下载，而非写死后缀。
@@ -171,6 +174,7 @@ jobs:
           echo "Rewrote latest.json URLs to $UPDATER_CDN_BASE"
 
       - name: Sync updater artifacts to Tencent COS
+        timeout-minutes: 20
         # 官方 coscli，走 COS 原生接口，不再经 AWS CLI 的 S3 兼容层。
         # 兼容层的两个缺口：分片默认 aws-chunked 且不带 Content-Length
         # （COS 报 MissingContentLength）；UserNetworkTooSlow 不是标准重试码。
@@ -188,6 +192,8 @@ jobs:
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
           COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
           UPDATER_CDN_BASE: ${{ secrets.UPDATER_CDN_BASE }}
+          # v1.0.9 是当前最新正式版（2026-08-25，无更新的预发布版），已内置
+          # isSDKHandledError 重试去叠加、--max-thread-num、分块进度优化，勿再按旧版本排查。
           # 与 https://github.com/tencentyun/coscli/releases/download/v1.0.9/sha256sum.log 中 linux-amd64 一致。
           COSCLI_VERSION: v1.0.9
           COSCLI_SHA256: a07de5ba2800147a700ed29036b0c76a4229088cee68e1682d0eae19b638a915
@@ -201,9 +207,11 @@ jobs:
           coscli --version
 
           # 美西 runner → 国内 COS：文件间并发 2，分片 16MB、分片并发 2。
-          # 单连接过慢会触发 UserNetworkTooSlow（4xx，SDK 的 5xx 重试不管它，
-          # 由 --err-retry-num 在应用层重试）。外层再跑整次 sync：
-          # 已完成对象按 CRC64 跳过，未完成分片走断点续传。
+          # 单连接过慢会触发 UserNetworkTooSlow（4xx）：v1.0.9 的 isSDKHandledError
+          # 只对 5xx 去叠加重试，4xx 与网络错误仍由 --err-retry-num 应用层兜底。
+          # 整个文件重传会把字节重复计入 OK size（Progress 可超 100%），
+          # 而 Processed num 始终为 0；超时是唯一的总时限保障。
+          # 外层再跑整次 sync：已完成对象按 CRC64 跳过，未完成分片走断点续传。
           EP="cos.${COS_REGION}.myqcloud.com"
           LOG_DIR=/tmp/coscli_output
           mkdir -p "$LOG_DIR"
