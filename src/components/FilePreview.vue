@@ -148,7 +148,7 @@ const props = defineProps({
 
 defineEmits(["close"]);
 
-const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"];
+const IMAGE_EXTENSIONS = ["jpg", "jpeg", "jfif", "png", "gif", "webp", "bmp", "svg", "avif"];
 // HEIC family. Kept OUT of IMAGE_EXTENSIONS on purpose: WebView2 has no
 // built-in HEIC decoder, so these must go through the wasm decode path
 // instead of being handed straight to <img src>.

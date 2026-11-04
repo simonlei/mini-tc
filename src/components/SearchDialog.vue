@@ -508,7 +508,7 @@ const ICONS = {
   pdf: "📕",
 };
 const EXT_ICON = {
-  image: ["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "heif", "svg", "ico", "tiff"],
+  image: ["png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "heic", "heif", "svg", "ico", "tiff"],
   video: ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "rmvb", "rm", "ts", "mpg", "mpeg"],
   audio: ["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "ape"],
   archive: ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"],

@@ -1095,6 +1095,7 @@ function getFileIcon(name) {
     PNG: "🖼️",
     JPG: "🖼️",
     JPEG: "🖼️",
+    JFIF: "🖼️",
     GIF: "🖼️",
     SVG: "🖼️",
     BMP: "🖼️",
