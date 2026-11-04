@@ -165,6 +165,7 @@ import { entryPath, isSearchPath, entryKey } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
 import { formatBytes as formatSize } from "../format.js";
 import { isImeKeydown, compositionFocusTarget } from "../keyboardText.js";
+import { previewKindOf } from "../previewConfig.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -541,7 +542,9 @@ function selectName(name) {
 // autoplay order always matches what the user sees in the file list. Non-video
 // rows between clips are skipped. Returns null when there is no later video, so
 // playback stops instead of looping.
-const VIDEO_EXTS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
+// Which rows count as "the next video" is decided by the shared preview
+// mapping, so removing/adding a video suffix in 文件预览设置 changes autoplay
+// too. No local copy of the list here.
 
 function getNextVideoEntry(name) {
   const list = displayedEntries.value;
@@ -551,7 +554,7 @@ function getNextVideoEntry(name) {
     const e = list[i];
     if (e.is_dir) continue;
     const ext = e.name.includes(".") ? e.name.split(".").pop().toLowerCase() : "";
-    if (VIDEO_EXTS.includes(ext)) return e;
+    if (previewKindOf(ext) === "video") return e;
   }
   return null;
 }
@@ -1129,6 +1132,15 @@ function getFileIcon(name) {
   // .exe archives are rare, so we don't paint every .exe as a zip — only
   // genuinely archive-like names fall back to 🗜️.
   if (icons[ext]) return icons[ext];
+  // A suffix the user added in 文件预览设置 has no row in the static table.
+  // Ask the shared mapping so its icon follows the same preview type instead
+  // of silently falling back to the generic document glyph.
+  const kind = previewKindOf(ext);
+  if (kind === "image") return "🖼️";
+  if (kind === "video") return "🎬";
+  if (kind === "pdf") return "📕";
+  if (kind === "doc") return "📘";
+  if (kind === "text") return "📝";
   if (isArchiveName(name)) return "🗜️";
   return "📄";
 }

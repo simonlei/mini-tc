@@ -16,7 +16,7 @@ import { loadConfig, saveConfig } from "./api.js";
 // would let the two copies drift):
 //   • panel split ratio  → ~/.minitc/panel-split.json  (App.vue)
 //   • per-tab path/sort  → ~/.minitc/tabs-<id>.json   (FilePanel.vue)
-//   • theme / text-preview extensions / video player prefs → their own files
+//   • theme / preview extension mapping / video player prefs → their own files
 
 /// Config file name → ~/.minitc/view-state.json
 const CONFIG_KEY = "view-state";

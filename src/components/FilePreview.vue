@@ -115,6 +115,8 @@ import { previewLands } from "../previewGate.js";
 import { decodeHeic, decodeHeicFrame, pixelsToBlob } from "../heicDecoder.js";
 import { formatBytes as formatSize } from "../format.js";
 import { sanitizeDocxHtml } from "../docxSanitize.js";
+import { previewKindOf } from "../previewConfig.js";
+import { HEIC_IMAGE_EXTENSIONS, MAMMOTH_DOC_EXTENSIONS } from "../previewExtensions.js";
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
 // Vite web build). The browser build is pure-JS (uses a browser jszip) and
@@ -141,18 +143,17 @@ const props = defineProps({
   filePath: { type: String, required: true },
   fileName: { type: String, required: true },
   fileBytes: { type: Number, default: 0 },
-  // When true, force a plain-text read even for non-built-in extensions
-  // (user-added "preview as text" extensions from ~/.minitc config).
+  // When true, force a plain-text read regardless of the mapping. Used by the
+  // "按文本预览" button on a just-registered suffix (one-shot override).
   asText: { type: Boolean, default: false },
 });
 
 defineEmits(["close"]);
 
-const IMAGE_EXTENSIONS = ["jpg", "jpeg", "jfif", "png", "gif", "webp", "bmp", "svg", "avif"];
-// HEIC family. Kept OUT of IMAGE_EXTENSIONS on purpose: WebView2 has no
-// built-in HEIC decoder, so these must go through the wasm decode path
-// instead of being handed straight to <img src>.
-const HEIC_EXTENSIONS = ["heic", "heif", "hif", "avci"];
+// The suffix lists themselves live in previewExtensions.js / previewConfig.js —
+// no local copy here. HEIC_IMAGE_EXTENSIONS and MAMMOTH_DOC_EXTENSIONS only
+// pick a RENDERING STRATEGY within the image / doc type; they are not a second
+// set of previewable extensions.
 
 const loading = ref(false);
 const error = ref("");
@@ -601,9 +602,32 @@ async function loadPreview() {
   charCount.value = null;
 
   const ext = getExtension(props.fileName);
+  // The shared mapping decides the preview type. `asText` is the one-shot
+  // override used by "按文本预览" on a suffix that was just registered.
+  const kind = props.asText ? "text" : previewKindOf(ext);
 
-  // Image: use convertFileSrc to load directly via asset protocol (bypasses IPC entirely)
-  if (IMAGE_EXTENSIONS.includes(ext)) {
+  if (kind === "image") {
+    // HEIC family: WebView2 can't decode it, so it gets its own wasm transcode
+    // path instead of being handed straight to <img src>.
+    if (HEIC_IMAGE_EXTENSIONS.includes(ext)) {
+      try {
+        await loadHeicPreview(load);
+      } catch (e) {
+        // A decode failure from a file the user already paged away from must not
+        // paint an error over the file they are actually looking at.
+        if (!load.lands()) return;
+        error.value = `无法解码此 HEIC 文件：${String(e?.message || e)}`;
+        loading.value = false;
+        // Flush the partial timeline — "where did it die" is exactly the
+        // question a failed HEIC raises, and without this the table is dropped.
+        if (heicPhaseStart) {
+          heicMark("failed", String(e?.message || e));
+          heicReport();
+        }
+      }
+      return;
+    }
+    // Use convertFileSrc to load directly via asset protocol (bypasses IPC).
     previewType.value = "image";
     previewContent.value = convertFileSrc(props.filePath);
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
@@ -611,30 +635,17 @@ async function loadPreview() {
     return;
   }
 
-  // HEIC family: must NOT fall through to the <img> branch above (WebView2
-  // can't decode it), so it gets its own wasm transcode path.
-  if (HEIC_EXTENSIONS.includes(ext)) {
-    try {
-      await loadHeicPreview(load);
-    } catch (e) {
-      // A decode failure from a file the user already paged away from must not
-      // paint an error over the file they are actually looking at.
-      if (!load.lands()) return;
-      error.value = `无法解码此 HEIC 文件：${String(e?.message || e)}`;
-      loading.value = false;
-      // Flush the partial timeline — "where did it die" is exactly the
-      // question a failed HEIC raises, and without this the table is dropped.
-      if (heicPhaseStart) {
-        heicMark("failed", String(e?.message || e));
-        heicReport();
-      }
-    }
+  if (kind === "video") {
+    // App.vue routes videos to VideoPreview. Reaching here means a stale
+    // preview state; don't try to read a video as text.
+    error.value = "视频请在视频预览中打开";
+    loading.value = false;
     return;
   }
 
   // PDF: 同图片一样用 convertFileSrc 直连本地文件，不经过 IPC 文本读取。
   // 依赖系统 WebView 内置 PDF 查看器（Windows WebView2 支持；macOS WKWebView 不支持，走降级提示）。
-  if (ext === "pdf") {
+  if (kind === "pdf") {
     previewType.value = "pdf";
     previewContent.value = convertFileSrc(props.filePath);
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
@@ -643,26 +654,33 @@ async function loadPreview() {
   }
 
   // Word documents: .docx is OOXML (zip + xml) — convert to HTML in the
-  // frontend via mammoth (reads file bytes through the asset protocol, no
-  // backend change). .doc is the legacy binary format mammoth can't read, so
-  // we show a friendly prompt to re-save as .docx instead of failing silently.
-  if (ext === "docx") {
-    await loadDocxPreview(load);
-    return;
-  }
-  if (ext === "doc") {
+  // frontend via mammoth (reads file bytes through the asset protocol). Any
+  // other suffix the user added to this type gets the "convert to .docx" hint.
+  if (kind === "doc") {
+    if (MAMMOTH_DOC_EXTENSIONS.includes(ext)) {
+      await loadDocxPreview(load);
+      return;
+    }
     previewType.value = "doc";
     docMessage.value =
-      "不支持预览旧版 .doc 格式（二进制 OLE）。请用 Word / WPS 另存为 .docx 后再预览。";
+      ext === "doc"
+        ? "不支持预览旧版 .doc 格式（二进制 OLE）。请用 Word / WPS 另存为 .docx 后再预览。"
+        : `暂不支持预览 .${ext} 格式。请用 Word / WPS 另存为 .docx 后再预览。`;
     fileSize.value = props.fileBytes ? formatSize(props.fileBytes) : "";
     loading.value = false;
     return;
   }
 
-  // Text (incl. JSON): use IPC to read content. `asText` forces a text read
-  // for extensions the user opted into via the "按文本预览" action.
+  if (kind !== "text") {
+    error.value = "暂不支持预览该格式";
+    loading.value = false;
+    return;
+  }
+
+  // Text (incl. JSON): use IPC to read content. Force a text read so user-added
+  // suffixes work even though the backend's built-in TEXT_EXTENSIONS is fixed.
   try {
-    const result = await readFilePreview(props.filePath, props.asText);
+    const result = await readFilePreview(props.filePath, true);
     if (!load.lands()) return;
     previewType.value = result.preview_type;
     previewContent.value = result.content;
@@ -694,8 +712,15 @@ async function loadPreview() {
   }
 }
 
+// Two things can change what should be rendered: a different file, or a save
+// in 文件预览设置 that reclassifies the SAME file (e.g. removing its suffix
+// from 图片). One watch over both avoids the double loadPreview() that two
+// independent watches would fire on every file change.
+// A STRING key, not an array: Vue compares a getter's return value by identity,
+// so returning a fresh array would fire on every tracked dependency change
+// (including unrelated mapping edits). Strings compare by value.
 watch(
-  () => props.filePath,
+  () => `${props.filePath}\u0000${previewKindOf(getExtension(props.fileName))}`,
   () => {
     // A pending HEIC timeline is left hanging when the user pages away before
     // <img> fired `load` (fast arrow-key scrubbing through 48 files). Flush it

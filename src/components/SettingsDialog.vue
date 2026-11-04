@@ -2,62 +2,59 @@
   <div class="settings-overlay" @click.self="$emit('close')">
     <div class="settings-dialog">
       <div class="settings-header">
-        <span>设置</span>
+        <span>文件预览设置</span>
         <button class="close-btn" @click="$emit('close')" title="关闭">✕</button>
       </div>
 
       <div class="settings-body">
-        <!--
-          Settings are organised as independent <section> blocks so future
-          config items (e.g. max preview size, default sort, video autoplay
-          toggle) can be added here without touching the surrounding shell.
-        -->
+        <p class="settings-intro">
+          按预览方式管理后缀：点已启用的后缀移除，点灰色的内置后缀重新启用。
+          同一个后缀只能属于一种预览方式，添加时若已被其它方式占用会给出提示。
+        </p>
 
-        <!-- ── Section: text-preview extensions ── -->
-        <section class="settings-section">
+        <section class="settings-section" v-for="type in types" :key="type.key">
           <div class="section-title">
-            <span>文本预览后缀</span>
-            <span class="section-hint">以内置文本方式预览的文件后缀</span>
+            <span class="section-name">{{ type.label }}</span>
+            <span class="section-count">{{ enabledCount(type.key) }}</span>
+            <span class="section-hint">{{ type.hint }}</span>
+            <button class="btn-reset-mini" @click="resetType(type.key)" title="恢复该类型的默认后缀">重置</button>
           </div>
-          <p class="section-desc">
-            勾选的后缀将以内置文本方式预览（如 <code>.txt</code> / <code>.md</code> /
-            <code>.json</code> / <code>.log</code>）。取消勾选则不再以文本预览；未加入此列表
-            的后缀选中后将显示「暂不支持预览该格式」。
-          </p>
 
           <div class="ext-list">
             <div
-              v-for="item in displayList"
+              v-for="item in displayList(type.key)"
               :key="item.ext"
               class="ext-chip"
-              :class="{ disabled: !isEnabled(item.ext), builtin: item.builtin }"
-              :title="isEnabled(item.ext) ? '点击取消文本预览' : '点击启用文本预览'"
-              @click="toggleExt(item.ext)"
+              :class="{ disabled: !item.enabled, builtin: item.builtin }"
+              :title="item.enabled ? '点击移除该后缀' : '点击启用该后缀'"
+              @click="toggleExt(type.key, item.ext)"
             >
-              <span class="ext-name">{{ item.ext === '' ? '(无后缀)' : '.' + item.ext }}</span>
+              <span class="ext-name">{{ label(item.ext) }}</span>
               <span v-if="item.builtin" class="ext-tag">内置</span>
-              <span class="ext-state">{{ isEnabled(item.ext) ? '✓' : '+' }}</span>
+              <span class="ext-state">{{ item.enabled ? '×' : '+' }}</span>
             </div>
           </div>
 
           <div class="ext-add">
             <input
-              v-model="newExt"
+              v-model="inputs[type.key]"
               class="ext-input"
               type="text"
-              placeholder="添加后缀，如 csv"
-              @keydown.enter.prevent="addExt"
+              placeholder="添加后缀（不带点），如 csv"
+              @input="errors[type.key] = ''"
+              @keydown.enter="onExtInputEnter(type.key, $event)"
             />
-            <button class="btn-add" @click="addExt">添加</button>
-            <button class="btn-reset" @click="resetDefaults">恢复默认</button>
+            <button class="btn-add" @click="addExt(type.key)">添加</button>
           </div>
-          <p class="ext-error" v-if="extError">{{ extError }}</p>
+          <p class="ext-error" v-if="errors[type.key]">{{ errors[type.key] }}</p>
         </section>
-
-        <!-- Future sections go here. -->
       </div>
 
+      <p class="save-error" v-if="saveError">{{ saveError }}</p>
+
       <div class="settings-footer">
+        <button class="btn-secondary" @click="resetAll">全部恢复默认</button>
+        <span class="footer-spacer"></span>
         <button class="btn-secondary" @click="$emit('close')">取消</button>
         <button class="btn-primary" @click="save">确定</button>
       </div>
@@ -66,86 +63,141 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from "vue";
+import { ref, reactive, watch } from "vue";
+import {
+  PREVIEW_TYPES,
+  defaultsFor,
+  defaultMapping,
+  extLabel,
+  findConflicts,
+  normalizeMapping,
+  addExtToType,
+  removeExtFromType,
+} from "../previewExtensions.js";
+import { isImeKeydown } from "../keyboardText.js";
 
 const props = defineProps({
-  // Currently enabled text-preview extensions (array of lowercase ext strings).
-  extensions: { type: Array, default: () => [] },
-  // Built-in text extensions that ship enabled by default.
-  builtins: { type: Array, default: () => [] },
+  // The live mapping: { text: [...], image: [...], video: [...], pdf: [...], doc: [...] }
+  mapping: { type: Object, required: true },
 });
-
 const emit = defineEmits(["close", "save"]);
 
-// Local editable copy so cancelling discards changes.
-const localExts = ref([...props.extensions]);
-const newExt = ref("");
-const extError = ref("");
+const types = PREVIEW_TYPES;
 
-// Reset local state whenever the dialog is (re)opened with fresh props.
-watch(
-  () => props.extensions,
-  (v) => {
-    localExts.value = [...v];
-    newExt.value = "";
-    extError.value = "";
-  },
-  { immediate: true }
-);
+// Local editable copy, so 取消 discards everything. Keyed by preview type.
+const drafts = reactive({});
+const inputs = reactive({});
+const errors = reactive({});
+const saveError = ref("");
 
-// Everything that should be visible: enabled exts plus built-ins (so a
-// disabled built-in can still be re-enabled). Sorted for a stable layout.
-const displayList = computed(() => {
-  const set = new Set([...localExts.value, ...props.builtins]);
-  return [...set]
-    .map((ext) => ({ ext, builtin: props.builtins.includes(ext) }))
+function resetDraft() {
+  const clean = normalizeMapping(props.mapping);
+  for (const t of types) {
+    drafts[t.key] = [...clean[t.key]];
+    inputs[t.key] = "";
+    errors[t.key] = "";
+  }
+  saveError.value = "";
+}
+
+// The dialog is mounted fresh via v-if on each open. Watching the serialised
+// snapshot (rather than the object identity) keeps the draft in sync if the
+// store changes underneath us.
+watch(() => JSON.stringify(props.mapping), resetDraft, { immediate: true });
+
+function enabledCount(key) {
+  return (drafts[key] || []).length;
+}
+
+function label(ext) {
+  return extLabel(ext);
+}
+
+// Visible chips = enabled exts ∪ that type's defaults, so a disabled built-in
+// can still be re-enabled. Sorted for a stable layout.
+function displayList(key) {
+  const enabled = drafts[key] || [];
+  const builtin = defaultsFor(key);
+  return [...new Set([...enabled, ...builtin])]
+    .map((ext) => ({
+      ext,
+      builtin: builtin.includes(ext),
+      enabled: enabled.includes(ext),
+    }))
     .sort((a, b) => a.ext.localeCompare(b.ext));
-});
-
-function isEnabled(ext) {
-  return localExts.value.includes(ext);
 }
 
-function toggleExt(ext) {
-  if (isEnabled(ext)) {
-    localExts.value = localExts.value.filter((e) => e !== ext);
-  } else {
-    localExts.value = [...localExts.value, ext];
-  }
-}
-
-// Normalise user input: lowercase, drop leading dots, keep only [a-z0-9].
-function normalizeExt(raw) {
-  return String(raw)
-    .trim()
-    .toLowerCase()
-    .replace(/^\.+/, "")
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function addExt() {
-  extError.value = "";
-  const ext = normalizeExt(newExt.value);
-  if (!ext) {
-    extError.value = "请输入有效的后缀（字母或数字）";
+function toggleExt(key, ext) {
+  errors[key] = "";
+  saveError.value = "";
+  const enabled = drafts[key] || [];
+  const result = enabled.includes(ext)
+    ? { mapping: removeExtFromType(drafts, key, ext), error: "" }
+    : addExtToType(drafts, key, ext);
+  if (result.error) {
+    errors[key] = result.error;
     return;
   }
-  if (localExts.value.includes(ext)) {
-    extError.value = `后缀 .${ext} 已在列表中`;
-    newExt.value = "";
-    return;
-  }
-  localExts.value = [...localExts.value, ext];
-  newExt.value = "";
+  Object.assign(drafts, result.mapping);
 }
 
-function resetDefaults() {
-  localExts.value = [...props.builtins];
-  extError.value = "";
+function addExt(key) {
+  const result = addExtToType(drafts, key, inputs[key] || "");
+  if (result.error) {
+    errors[key] = result.error;
+    return;
+  }
+  Object.assign(drafts, result.mapping);
+  inputs[key] = "";
+  errors[key] = "";
+  saveError.value = "";
+}
+
+// Restore one type to its defaults. Any of those suffixes assigned to another
+// type are taken back, so a reset can never leave a duplicate behind.
+// Enter inside the suffix box adds the suffix — but NOT while an IME is
+// composing (Enter is the "pick this candidate" key then). Do not use Vue's
+// `.prevent` modifier here: it would preventDefault() unconditionally and
+// swallow the candidate selection.
+function onExtInputEnter(key, e) {
+  if (isImeKeydown(e)) return;
+  e.preventDefault();
+  addExt(key);
+}
+
+function resetType(key) {
+  const wanted = defaultsFor(key);
+  const next = {};
+  for (const t of types) {
+    next[t.key] =
+      t.key === key
+        ? [...wanted]
+        : (drafts[t.key] || []).filter((ext) => !wanted.includes(ext));
+  }
+  Object.assign(drafts, next);
+  inputs[key] = "";
+  errors[key] = "";
+  saveError.value = "";
+}
+
+function resetAll() {
+  Object.assign(drafts, defaultMapping());
+  for (const t of types) {
+    inputs[t.key] = "";
+    errors[t.key] = "";
+  }
+  saveError.value = "";
 }
 
 function save() {
-  emit("save", [...localExts.value]);
+  // Last line of defence: the shared rules already refuse cross-type adds,
+  // but never emit a snapshot that could give one suffix two renderers.
+  const conflicts = findConflicts(drafts);
+  if (conflicts.length) {
+    saveError.value = `后缀 ${extLabel(conflicts[0].ext)} 同时属于多种预览方式，请先移除重复项`;
+    return;
+  }
+  emit("save", normalizeMapping(drafts));
 }
 </script>
 
@@ -164,7 +216,7 @@ function save() {
   background: var(--panel-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
-  width: 460px;
+  width: 560px;
   max-width: 92vw;
   max-height: 86vh;
   display: flex;
@@ -204,52 +256,77 @@ function save() {
   overflow-y: auto;
 }
 
+.settings-intro {
+  margin: 0 0 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
 .settings-section {
-  margin-bottom: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-section:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
 }
 
 .section-title {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  font-size: 14px;
-  font-weight: 600;
+  margin-bottom: 10px;
+  font-size: 13px;
   color: var(--text);
 }
 
-.section-hint {
+.section-name {
+  font-weight: 600;
+}
+
+.section-count {
   font-size: 11px;
-  font-weight: 400;
+  color: var(--accent);
+}
+
+.section-hint {
+  flex: 1;
+  font-size: 11px;
   color: var(--text-dim);
 }
 
-.section-desc {
-  margin: 6px 0 12px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-dim);
-}
-
-.section-desc code {
-  font-family: "Cascadia Code", "Consolas", monospace;
-  background: var(--hover-bg);
-  padding: 0 3px;
+.btn-reset-mini {
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border);
   border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-reset-mini:hover {
+  background: var(--hover-bg);
   color: var(--text);
 }
 
 .ext-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
+  gap: 6px;
+  margin-bottom: 10px;
 }
 
 .ext-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
+  padding: 3px 9px;
   border: 1px solid var(--accent);
   border-radius: 14px;
   background: var(--accent-dim, rgba(80, 130, 200, 0.18));
@@ -314,16 +391,12 @@ function save() {
   border-color: var(--accent);
 }
 
-.btn-add,
-.btn-reset {
+.btn-add {
   padding: 5px 14px;
   font-size: 13px;
   border-radius: 4px;
   cursor: pointer;
   white-space: nowrap;
-}
-
-.btn-add {
   border: none;
   background: var(--accent);
   color: #fff;
@@ -333,28 +406,28 @@ function save() {
   opacity: 0.9;
 }
 
-.btn-reset {
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text);
-}
-
-.btn-reset:hover {
-  background: var(--hover-bg);
-}
-
-.ext-error {
+.ext-error,
+.save-error {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--danger);
 }
 
+.save-error {
+  margin: 0;
+  padding: 0 16px 8px;
+}
+
 .settings-footer {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--border);
+}
+
+.footer-spacer {
+  flex: 1;
 }
 
 .btn-primary {

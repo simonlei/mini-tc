@@ -39,6 +39,14 @@
 
 ## 预览
 
+### 后缀 → 预览方式的映射
+
+`src/previewExtensions.js` 是唯一的数据源（五种类型：text / image / video / pdf / doc，各自一份可编辑后缀数组），`src/previewConfig.js` 是它的 reactive 单例 + 落盘。以前后缀表散在 `App.vue`、`FilePreview.vue`、`FileList.vue`、`SearchDialog.vue` 四处，只有文本那份可配置；加一个后缀要改四个文件，漏一处就是「设置里加了但预览不生效」。现在四个消费点全部调 `previewKindOf()`，没有本地副本。
+
+**硬约束：一个后缀只能属于一种预览方式。** 四处独立兜底：① `addExtToType()` 拒绝跨类型占用并报出占用方；② `applyPreviewMapping()` 拒绝应用有冲突的快照；③ `savePreviewExtConfig()` 拒绝落盘有冲突的映射；④ `normalizeMapping()` 在读配置时按 `PREVIEW_TYPES` 顺序去重，`classifyExt()` 即便拿到脏数据也只返回第一个命中。手改配置文件不会让两个渲染器抢同一个文件。
+
+配置落在 `~/.minitc/preview-extensions.json`（`{ version: 2, types: {...} }`）。旧的 `text-preview-extensions.json` 只作迁移输入：数组是「用户增量」格式要与内置取并集，`{ext:bool}` 是全量格式；新文件存在时旧文件不再生效。`""` 是合法键，代表无后缀文件（「按文本预览」按钮写入的哨兵），序列化与 UI 都要保留它。HEIC / mammoth 只是 image / doc **类型内部**的渲染策略，不是第六、第七种预览类型。
+
 ### HEIC / HEIF
 
 WebView2 没有原生 HEIC 解码器，走 `src/heicDecoder.js` + `src/heicDecode.worker.js`。Worker 里用 libheif 的 WebAssembly 版解码成 RGBA，主线程再 canvas 编成 JPEG 交给 `<img>`，图上标注「已转换为 JPEG」。wasm 约 2 MB，按需加载（`?worker` 导入 + `optimizeDeps.include` 登记），启动不受影响。两道上限：单文件 60 MB、解码后 5000 万像素（12MP 手机照片约需 48.8 MB RGBA 缓冲）。
@@ -290,6 +298,7 @@ npm test
 - `scripts/delete-scope-check.mjs` — `onDelete` 逐项 await，期间 `entries` 已是新目录的列表。`remainingCount` 必须用快照算，不能改成「切走了就不 emit」。判据是目的地还是不是它：A→B→A 折返时迟到的删除应该落地。抽函数体必须先配平圆括号跳过参数列表，`onDelete(targets, opts = {})` 的默认参数里就有花括号。
 - `scripts/ctx-menu-gate-check.mjs` — 右键菜单在 `ensureArchiveTools` / `entryPath` / `isExecutable` 三个 await 之后才提交 `ctxEntry` / `ctxIsExecutable` / `ctxMenu`。慢的右键会接管快的那次菜单，点重命名改的是另一个文件。意图身份用对象 token，不用自增序号。关闭语义（`gate.reset()`）必须和落地判据分开，否则 `handleCtxSelect` 第一行的 `closeCtxMenu()` 会把自己作废。路径快照要透传到六个 action。逐个查 await 的边界要收到下一个 `await` / `catch` / `finally`，收到函数末尾会把 `catch` 里的复核算到前一个 await 头上。
 - `scripts/config-writer-check.mjs` — 同 name 的写入 FIFO。后端 Mutex 解决不了顺序，变异去掉锁后「并发写不产生拼接文件」仍然全绿，因为 `write_atomic` 已经保证每次写完整。乱序测试的延迟若随 body 变长，短的会先完成，反例根本没发生。要先断言「无串行化确实会落地过期值」。
+- `scripts/preview-extensions-check.mjs` / `preview-extensions-mutation.mjs` — 五种预览类型的后缀映射。纯函数表钉住默认值、`""` 无后缀哨兵、旧配置迁移、`serialize → parse` 往返；静态断言钉住四个消费点确实都调 `previewKindOf()` 且没有本地副本（否则纯函数全绿也挡不住「调用点没接上」）。11 个变异分别去掉跨类型冲突守卫、去重、首个命中优先、哨兵等，必须全部被抓。
 - `scripts/format-size-check.mjs` — 体积格式化曾经有 8 份副本。2 TB 在预览里显示 `2.0 undefined`，在列表里显示 `2.0 TB`。索引要双向钳制（小于 1 字节时 `log < 0`）。`Number.isFinite` 与 `<= 0` 要在取对数之前。静态断言要先剥注释，否则文档里的 `Math.log` 会让断言自己判自己过。
 - `scripts/node-pick-check.mjs` — `pick-node.js` 的版本决策。`realIo()` 漏掉 `readFile` 时，`engines` 被空 `catch` 吞掉，测试仍全绿。要故意把 `engines.node` 改成一个违反约束的版本。`console.error` 改成 `console.log` 的变异，在本机没有告警可发时也是恒绿，所以改成真跑 CLI 并检查 stdout 恰好一行。
 - `scripts/docx-sanitize-check.mjs` — 见上文 [docx 与 CSP](#docx-与-csp)。对照臂要求旧黑名单至少漏掉 3 个（实测 17/33）。断言解析回 DOM 查属性，不比对输出字符串。
@@ -336,6 +345,8 @@ mini-tc/
 │   ├── keyboardText.js       # isTypingTarget / classifySelectAll / isImeKeydown
 │   ├── bookmarks.js          # 书签 store
 │   ├── viewState.js          # 视图状态 store
+│   ├── previewExtensions.js  # 五种预览类型的后缀映射（纯函数，唯一数据源）
+│   ├── previewConfig.js      # 该映射的 reactive 单例 + 落盘 / 迁移
 │   ├── alwaysOnTop.js        # 窗口置顶
 │   ├── heicDecoder.js        # HEIC 主线程侧
 │   ├── heicDecode.worker.js  # libheif wasm → RGBA

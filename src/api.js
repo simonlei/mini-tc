@@ -30,8 +30,8 @@ export async function joinPath(parent, child) {
 }
 
 // `asText = true` forces the backend to read the file as plain text even when
-// its extension isn't a built-in text type (used for user-added "preview as
-// text" extensions persisted in ~/.minitc/text-preview-extensions.json).
+// its extension isn't a built-in text type (used for every suffix mapped to
+// the "text" preview type in ~/.minitc/preview-extensions.json).
 export async function readFilePreview(path, asText = false) {
   return invoke("read_file_preview", { path, asText });
 }

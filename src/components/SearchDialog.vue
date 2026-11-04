@@ -163,6 +163,7 @@ import { listen } from "@tauri-apps/api/event";
 import { startSearch, cancelSearch, openFile } from "../api.js";
 import { formatBytes as formatSize } from "../format.js";
 import ContextMenu from "./ContextMenu.vue";
+import { previewKindOf } from "../previewConfig.js";
 
 const props = defineProps({
   // Directory the dialog opens with (the active panel's current path).
@@ -507,21 +508,26 @@ const ICONS = {
   doc: "📘",
   pdf: "📕",
 };
-const EXT_ICON = {
-  image: ["png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "heic", "heif", "svg", "ico", "tiff"],
-  video: ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "rmvb", "rm", "ts", "mpg", "mpeg"],
+// Only suffixes that are NOT one of the five preview types belong here. The
+// preview-typed ones come from the shared mapping in previewConfig.js, so a
+// suffix added or removed in 文件预览设置 immediately changes the icon too.
+const ICON_ONLY_EXTENSIONS = {
+  image: ["ico", "tiff"],
+  video: [],
   audio: ["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "ape"],
   archive: ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"],
-  text: ["txt", "md", "json", "log", "csv", "xml", "yml", "yaml", "ini", "toml"],
-  doc: ["doc", "docx", "xls", "xlsx", "ppt", "pptx"],
-  pdf: ["pdf"],
+  text: ["csv", "xml", "yml", "yaml", "ini", "toml"],
+  doc: ["xls", "xlsx", "ppt", "pptx"],
+  pdf: [],
 };
 
 function iconOf(hit) {
   if (hit.is_dir) return "📁";
   const ext = (hit.extension || "").toLowerCase();
-  for (const kind of Object.keys(EXT_ICON)) {
-    if (EXT_ICON[kind].includes(ext)) return ICONS[kind];
+  const kind = previewKindOf(ext);
+  if (kind) return ICONS[kind];
+  for (const key of Object.keys(ICON_ONLY_EXTENSIONS)) {
+    if (ICON_ONLY_EXTENSIONS[key].includes(ext)) return ICONS[key];
   }
   return "📄";
 }

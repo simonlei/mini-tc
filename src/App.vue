@@ -103,8 +103,7 @@
     <!-- Settings dialog -->
     <SettingsDialog
       v-if="settingsVisible"
-      :extensions="textPreviewExtensions"
-      :builtins="BUILTIN_TEXT_EXTENSIONS"
+      :mapping="previewMapping"
       @close="onSettingsClose"
       @save="onSettingsSave"
     />
@@ -309,6 +308,14 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { mark, track } from "./bootLog.js";
+import {
+  previewMapping,
+  previewKindOf,
+  loadPreviewExtConfig,
+  applyPreviewMapping,
+  savePreviewExtConfig,
+  claimTextPreviewExt,
+} from "./previewConfig.js";
 
 const activePanel = ref("left");
 
@@ -333,12 +340,10 @@ function openSettings() {
   settingsVisible.value = true;
 }
 
-function onSettingsSave(exts) {
-  textPreviewExtensions.value = [
-    ...new Set(exts.map((e) => String(e).toLowerCase()).filter(Boolean)),
-  ];
+function onSettingsSave(mapping) {
+  if (!applyPreviewMapping(mapping)) return;
   settingsVisible.value = false;
-  saveTextPreviewConfig();
+  savePreviewExtConfig();
 }
 
 function onSettingsClose() {
@@ -830,7 +835,7 @@ onMounted(() => {
   // Each of these is an independent IPC round-trip fired in parallel; `track`
   // records how long each one actually took so slow ones are visible.
   track("cfg:theme", initTheme());
-  track("cfg:text-preview", loadTextPreviewConfig());
+  track("cfg:preview-ext", loadPreviewExtConfig());
   track("cfg:app", loadAppConfig());
   // Load ~/.minitc/shortcuts.json before the first keystroke can arrive; until
   // it resolves every command simply falls back to its built-in defaults.
@@ -953,83 +958,27 @@ async function savePanelSplit() {
 }
 
 // ── File Preview (Ctrl+Q) ──
+//
+// Every suffix → preview-type decision comes from the shared mapping in
+// previewConfig.js (loaded once at boot, edited in 文件预览设置). There is
+// deliberately NO local extension list here: a second copy would drift and
+// make a settings change only half-effective.
 
-const PREVIEWABLE_EXTENSIONS = ["pdf", "doc", "docx", "jpg", "jpeg", "jfif", "png", "gif", "webp", "bmp", "svg", "avif", "heic", "heif", "hif", "avci"];
-const VIDEO_EXTENSIONS = ["mp4", "webm", "ogv", "ogg", "mov", "m4v", "3gp", "mkv", "avi", "flv", "wmv", "rm", "rmvb", "asf", "vob", "ts", "m2ts", "m3u8", "mpg", "mpeg", "divx", "f4v"];
-
-// Built-in plain-text formats. These are deliberately NOT part of
-// PREVIEWABLE_EXTENSIONS — whether they are previewed as text is governed
-// entirely by the user-editable `textPreviewExtensions` set below (which
-// defaults to these). That lets the Settings dialog toggle even built-in text
-// types on/off without special-casing them.
-const BUILTIN_TEXT_EXTENSIONS = ["txt", "md", "json", "log"];
-
-// Extensions the user wants previewed as plain text. Defaults to the built-ins
-// above; can be extended (and individual entries disabled) from the Settings
-// dialog, and is persisted to ~/.minitc/text-preview-extensions.json. The
-// "按文本预览" button on an unsupported file also adds to this set.
-const TEXT_PREVIEW_CONFIG = "text-preview-extensions";
-const textPreviewExtensions = ref([...BUILTIN_TEXT_EXTENSIONS]);
 // Whether the current "unsupported" placeholder is for a directory (in which
 // case the "按文本预览" button is hidden — directories can't be text-previewed).
 const previewUnsupportedIsDir = ref(false);
-// Flag passed to FilePreview: force a plain-text read for the current file
-// when its extension is in the user-editable `textPreviewExtensions` set.
+// Force a plain-text read for the current file. Normally redundant with the
+// mapping, but "按文本预览" uses it to override the just-registered suffix on
+// the very first render without waiting for a reload.
 const previewAsText = ref(false);
 
-async function loadTextPreviewConfig() {
-  try {
-    const raw = await loadConfig(TEXT_PREVIEW_CONFIG);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        // Legacy delta format (user-added only) — merge with built-ins so they
-        // stay enabled, then migrate to the object format on next save.
-        textPreviewExtensions.value = [
-          ...new Set([
-            ...BUILTIN_TEXT_EXTENSIONS,
-            ...parsed.map((e) => String(e).toLowerCase()).filter(Boolean),
-          ]),
-        ];
-      } else if (parsed && typeof parsed === "object") {
-        // Current format: { ext: bool }. Respect disabled built-ins.
-        const arr = [];
-        for (const [k, v] of Object.entries(parsed)) {
-          if (v) arr.push(String(k).toLowerCase());
-        }
-        textPreviewExtensions.value = arr;
-      }
-    }
-  } catch (e) {
-    console.error("Failed to load text-preview extensions:", e);
-    // Keep built-in defaults on failure.
-    textPreviewExtensions.value = [...BUILTIN_TEXT_EXTENSIONS];
-  }
-}
-
-async function saveTextPreviewConfig() {
-  // Persist as an object { ext: bool } so a disabled built-in stays disabled
-  // across restarts (a bare array can't represent "off").
-  const obj = {};
-  for (const b of BUILTIN_TEXT_EXTENSIONS) {
-    obj[b] = textPreviewExtensions.value.includes(b);
-  }
-  for (const e of textPreviewExtensions.value) {
-    if (!BUILTIN_TEXT_EXTENSIONS.includes(e)) obj[e] = true;
-  }
-  await saveConfig(TEXT_PREVIEW_CONFIG, JSON.stringify(obj)).catch((e) =>
-    console.error("Failed to persist text-preview extensions:", e)
-  );
-}
-
-// True when the extension can be previewed at all (built-in OR user-added text).
+// True when the extension maps to any of the five preview types.
 function isPreviewableExt(ext) {
-  return PREVIEWABLE_EXTENSIONS.includes(ext) || textPreviewExtensions.value.includes(ext);
+  return previewKindOf(ext) !== null;
 }
 
-// True only for user-added text-preview extensions (forces a text read).
 function isTextPreviewExt(ext) {
-  return textPreviewExtensions.value.includes(ext);
+  return previewKindOf(ext) === "text";
 }
 
 const previewVisible = ref(false);
@@ -1786,16 +1735,16 @@ function showUnsupportedPreview(entry, panelId = activePanel.value) {
   previewVisible.value = true;
 }
 
-// User clicked "按文本预览" on an unsupported file: remember this extension as
-// a text-preview extension (persisted) and immediately show it as text.
+// User clicked "按文本预览" on an unsupported file: register this extension
+// in the shared mapping's text type (persisted) and immediately show it as text.
 async function onPreviewAsText() {
   const name = previewFileName.value;
   // No-extension files yield ""; we store that as a sentinel so ALL
   // extension-less files are later previewed as text.
   const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
-  if (!textPreviewExtensions.value.includes(ext)) {
-    textPreviewExtensions.value = [...textPreviewExtensions.value, ext];
-    await saveTextPreviewConfig();
+  if (previewKindOf(ext) !== "text") {
+    claimTextPreviewExt(ext);
+    await savePreviewExtConfig();
   }
   const panelId = activePanel.value;
   const panel = panelRefById(panelId);
@@ -1825,7 +1774,7 @@ async function togglePreview() {
   if (!path) return;
 
   const ext = entry.extension.toLowerCase();
-  if (VIDEO_EXTENSIONS.includes(ext)) {
+  if (previewKindOf(ext) === "video") {
     const fullPath = await entryPath(entry, path);
     if (!previewStillWanted(request)) return;
     openVideo({ path: fullPath, name: entry.name, bytes: entry.size, sourcePanel: panelId });
@@ -1992,7 +1941,7 @@ watch(
     }
 
     const ext = entry.extension.toLowerCase();
-    if (VIDEO_EXTENSIONS.includes(ext)) {
+    if (previewKindOf(ext) === "video") {
       const panel = panelRefById(panelId);
       const path = panel?.currentPath;
       if (!path) return;
@@ -2046,7 +1995,7 @@ watch(activePanel, async () => {
   }
 
   const ext = entry.extension.toLowerCase();
-  if (VIDEO_EXTENSIONS.includes(ext)) {
+  if (previewKindOf(ext) === "video") {
     const path = panel?.currentPath;
     if (!path) return;
     const fullPath = await entryPath(entry, path);

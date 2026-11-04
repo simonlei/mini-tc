@@ -1620,10 +1620,11 @@ const LOG_TAIL_LIMIT: u64 = 512 * 1024; // 512 KB shown when a .log is oversized
 /// Read a text file for preview (txt/md/json). JSON is returned as raw text;
 /// Images are loaded directly by the frontend via convertFileSrc (asset protocol).
 ///
-/// `as_text` lets the frontend force a text read for extensions the user has
-/// explicitly opted into via the "按文本预览" action (persisted in
-/// `~/.minitc/text-preview-extensions.json`). This is used for file types that
-/// are not in `TEXT_EXTENSIONS` but the user knows are plain text.
+/// `as_text` lets the frontend force a text read for extensions mapped to the
+/// "text" preview type in `~/.minitc/preview-extensions.json`. That mapping is
+/// user-editable (including the "按文本预览" action), so the frontend always
+/// passes `true` for text-typed files; `TEXT_EXTENSIONS` below is only a
+/// built-in fallback for callers that do not consult the mapping.
 #[tauri::command]
 fn read_file_preview(path: String, as_text: bool) -> Result<FilePreview, String> {
     let file_path = Path::new(&path);
