@@ -1,0 +1,9 @@
+# 导航前进 / 后退（Alt+← / Alt+→）
+
+> 来源：`TODO-done.md` 第 69 行 · 章节 已实现功能（想法暂存区） · 第 30 条
+> 2026-11-04 TODO 瘦身整块外迁，以下原文逐字保留；主清单见 `../../TODO-done.md`。
+
+<!-- ORIGINAL-BLOCK-START -->
+
+- [x] **导航前进 / 后退（Alt+← / Alt+→）** — 目前只能 Backspace 退回父目录，进入深层目录后无法原路返回，也没有「前进」。目标：每栏每个 Tab 维护独立的历史栈，`Alt+←` 后退、`Alt+→` 前进（工具栏 / PathBar 也可加 ← → 按钮，无历史时置灰）。需处理：① 历史栈挂在 Tab 上还是 Panel 上（建议挂 Tab，与 `tabs-left`/`tabs-right` 一起持久化到 `~/.minitc`，重启后仍可回跳）；② `navigateTo` / `navigateInto` / `navigateParent`（`FilePanel.vue:421/426/432`）与面包屑跳转、模糊搜索 `/` 进入目录、双击 `..` 等入口都要统一走同一个 `pushHistory` 收口，避免漏记；③ 前进 / 后退是「替换当前项」而非「再入栈」，且新导航要截断前进分支（标准 history 语义），否则来回切会让栈无限增长；④ 目标目录已不存在时提示并回退到一个可访问的祖先；⑤ 与现有「鼠标后退键 = 返回上一级」（`e.button === 3`）的关系需明确：建议也改成走后退栈（更符合直觉），或保持现状但二者语义写清楚；⑥ 快捷键注册到 `src/shortcuts.js`（scope `fileList` 或 `global`），用户可在快捷键设置页自行改绑。
+  - 实现：历史栈挂在 **Tab** 上（`tab.nav = { entries: string[], index: number }`，不变量 `entries[index] === tab.path`，故 `entries[0..index]` 是后退轨、`entries[index+1..]` 是前进轨），随 `tabs-<panelId>.json` 一起持久化（`saveState` 里 `slice(-MAX_HISTORY)` 封顶 100 条），恢复时归一化（旧存档无该字段即用 `path` 播种）。**所有路径写入统一收口到 `FilePanel.setPath()`**——原本散着 6 处直接赋值 `tab.path`（`navigateTo` / `navigateInto` / `navigateParent` / `jumpToLocked` / tab 菜单跳搜索根 / 右键「打开所在目录」），漏一处该入口就不记历史，且极难排查，故全部改走 `setPath`；持久化 watch 的源也补上 `nav` 的深拷贝，否则只回退不换目录时历史变化不落盘。`stepHistory(delta)` 逐档 `pathExists()` 探测：**已删除的目录 / 已拔的盘自动从栈里剔除并继续同向寻找**，不会把面板留在报错页，剔除数量弹 toast。`shortcuts.js` 注册 `nav.back` / `nav.forward`（scope `global`，默认 `Alt+ArrowLeft` / `Alt+ArrowRight`），`App.vue` 在 keydown 里**先查 `canGoBack/canGoForward` 再消费**——无处可走时直接 return 不 `preventDefault`，把按键留给 webview，语义与置灰按钮一致。`PathBar.vue` 加 `←` / `→` 按钮，`canBack`/`canForward` 为假时置灰不隐藏（避免工具栏跳动）。⑤ 采用「改成走后退栈」：XButton1/XButton2 现在发 `navigate-back`/`navigate-forward` 走同一套历史，**返回上一级仍由 `Backspace` / 双击 `..` 负责**，两者语义不再混淆；仅活动面板响应。搜索结果 tab（`minitc://search/{id}`）不参与历史（`isVirtual` 时按钮隐藏、按键不消费），从结果集跳进真实目录时**重起一段历史**，绝不把哨兵记成可回退的一站。vite build exit 0，待用户双击 `dev.bat` 实测。

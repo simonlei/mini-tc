@@ -1,0 +1,9 @@
+# 支持 PDF 预览
+
+> 来源：`TODO-done.md` 第 36 行 · 章节 已实现功能（想法暂存区） · 第 18 条
+> 2026-11-04 TODO 瘦身整块外迁，以下原文逐字保留；主清单见 `../../TODO-done.md`。
+
+<!-- ORIGINAL-BLOCK-START -->
+
+- [x] **支持 PDF 预览** — 当前 `.pdf` 不在预览支持范围，选中会显示「暂不支持预览该格式」占位。目标：在文件预览（Ctrl+Q 对面面板）中内联渲染 PDF。需改动：① 前端 `App.vue` 的 `PREVIEWABLE_EXTENSIONS` 增加 `"pdf"`（豁免 unsupported 占位，逻辑同 log/json）；② 前端 `FilePreview.vue` 新增 `previewType === 'pdf'` 分支——PDF **不走** IPC 文本读取，而是像图片那样用 `convertFileSrc(props.filePath)` 拿到本地文件 URL，再用 `<iframe :src="url">`（或 `<embed>`/`<object>`）内联渲染，依赖系统 webview 的 PDF 查看器（Windows WebView2 内置 PDF 查看器可用；macOS WKWebView 不支持内联 PDF 会触发下载，需降级提示）；③ `FilePreview.vue` 的 `loadPreview` 中 `IMAGE_EXTENSIONS` 判断之外另立 PDF 分支走 `convertFileSrc`，不要误进入 text 分支；④ 需确认 Tauri v2 的 asset scope / CSP 允许 `<iframe>` 加载 `asset://localhost/...` 协议、以及 `convertFileSrc` 对 `.pdf` 是否放行（参考图片的处理）；⑤ 可选更稳方案：引入 pdf.js（`pdfjs-dist` + Canvas/`<canvas>`）做跨平台渲染，需调整 CSP 允许 worker 与本地 blob，体积更大；⑥ header 徽标 `PDF`(图标 📕)、footer 显示页数/大小；⑦ 处理大 PDF 与加载中/加载失败占位，并注意 PDF iframe 聚焦时浏览器原生 Ctrl+C（复制 PDF 内文本）应放行，参考「预览文本文件时支持选中文本复制」里 `hasPreviewTextSelection` 对文本选区复制的放行逻辑。
+  - 实现：后端零改动——PDF 不入 `TEXT_EXTENSIONS`，不走 `read_file_preview` text 分支；`tauri.conf.json` 的 `csp: null` + `assetProtocol.scope: ["**"]` 已放行 `asset://`，无需额外配置。前端 `App.vue`：`PREVIEWABLE_EXTENSIONS` 加 `"pdf"`（豁免 unsupported 占位）；新增 `isPdfIframeFocused()`（class + tagName + src 三重校验），全局 keydown 中 PDF iframe 聚焦时放行原生 Ctrl+C（Ctrl+X 不放行，PDF 只读无剪切语义）。`FilePreview.vue`：`loadPreview` 在图片分支之后、文本分支之前独立新增 PDF 分支，用 `convertFileSrc` 生成 `asset://` URL 交给 `<iframe>` 渲染（依赖 WebView2 内置 PDF 查看器）；`:key="props.filePath"` 强制切换文件时重建 iframe 避免残留；三态占位（iframe / `pdfLoadError` 加载失败 / `pdfSupported` 为 false 的平台降级）；徽标 `PDF`（📕）；footer 只显示文件大小，不显示页数。平台检测用 UA 启发式（含 `Edg/` 判为 WebView2 支持，纯 AppleWebKit 判为不支持走降级），因项目未安装 `@tauri-apps/plugin-os` 且约束零新增依赖；macOS/Linux 走降级提示。`npm run build` exit 0；项目无 type-check/lint/test 脚本故未执行；待用户双击 `dev.bat` 实测。
