@@ -65,6 +65,38 @@ export function isImeKeydown(e) {
 }
 
 /**
+ * Decide where the keyboard focus should go when an IME composition starts.
+ *
+ * An IME composition binds to whatever element holds the focus when it starts,
+ * so if that element cannot hold text the composed characters go nowhere. The
+ * file list's only text sink is the filter input, so the fix is to move focus
+ * there — but ONLY when the composition started on an element that cannot hold
+ * text by itself.
+ *
+ * ⚠️ The condition must be "the composition started on a text sink", NOT "the
+ * focus is not already in the filter input". The inline rename box (F2) is an
+ * `<input>` too, and it holds text perfectly well: stealing the focus from it
+ * mid-composition sends every letter the user is typing into the filter box
+ * (the list then filters instead of renaming) and the rename box closes
+ * because it lost the focus.
+ *
+ * @param {Element|null} target        the element the composition started on
+ * @param {Element|null} searchElement the filter input (may be null)
+ * @param {Element|null} activeElement document.activeElement
+ * @returns {Element|null} the element to focus, or null to leave focus alone
+ */
+export function compositionFocusTarget(target, searchElement, activeElement) {
+  // The composition already started somewhere that can hold text (the rename
+  // box, the filter input, any other input) → leave the focus where it is.
+  if (isTypingTarget(target)) return null;
+  // Nowhere to send it → leave the focus alone.
+  if (!searchElement) return null;
+  // Already there → nothing to do.
+  if (activeElement === searchElement) return null;
+  return searchElement;
+}
+
+/**
  * The preview text surface containing `el`, or null.
  */
 export function previewTextRoot(el) {

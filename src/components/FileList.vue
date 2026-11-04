@@ -164,7 +164,7 @@ import { startNativeDrag } from "../api.js";
 import { entryPath, isSearchPath, entryKey } from "../paths.js";
 import { matches, markHandled } from "../shortcuts.js";
 import { formatBytes as formatSize } from "../format.js";
-import { isImeKeydown } from "../keyboardText.js";
+import { isImeKeydown, compositionFocusTarget } from "../keyboardText.js";
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },
@@ -697,10 +697,17 @@ function onSearchKeydown(e) {
 // Ensure the IME composition continues in the search input. If the composition
 // started on the list div before focus moved, hand focus to the input so the
 // Chinese text composes there and not in the div (which can't hold text).
-function onCompositionStart() {
-  if (searchInput.value && document.activeElement !== searchInput.value) {
-    searchInput.value.focus();
-  }
+//
+// ⚠️ The target of the composition decides where the focus goes — NOT "is the
+// focus already in the search input". The rename box (F2) is an <input> too:
+// it holds text fine, and stealing the focus from it mid-composition sends
+// every letter into the filter box (the list filters instead of renaming) and
+// closes the rename box because it blurred. `compositionFocusTarget` only
+// hands the focus over when the composition started on something that cannot
+// hold text (the list div itself).
+function onCompositionStart(e) {
+  const target = compositionFocusTarget(e && e.target, searchInput.value, document.activeElement);
+  if (target) target.focus();
 }
 
 // Mouse side buttons. XButton1 (e.button === 3) is "back" and XButton2
