@@ -39,6 +39,8 @@
           @pause="onPause"
           @ended="onEnded"
           @error="onError"
+          @enterpictureinpicture="onEnterPip"
+          @leavepictureinpicture="onLeavePip"
           @click="togglePlay"
         ></video>
 
@@ -78,6 +80,15 @@
             <button class="vp-btn" @click="skip(10)" title="快进 10s (→)">⏩</button>
             <button class="vp-btn" @click="skip(-30)" title="快退 30s (Shift+←)">«30</button>
             <button class="vp-btn" @click="skip(30)" title="快进 30s (Shift+→)">30»</button>
+
+            <!-- Same action as the native right-click "画中画" item, but one click away. -->
+            <button
+              class="vp-btn"
+              :class="{ active: inPip }"
+              :disabled="!pipSupported"
+              :title="pipTitle"
+              @click="togglePip"
+            >画中画</button>
 
             <div class="vp-vol">
               <button class="vp-btn" @click="toggleMute" :title="(muted || volume === 0) ? '取消静音 (M)' : '静音 (M)'">{{ (muted || volume === 0) ? "🔇" : "🔊" }}</button>
@@ -638,6 +649,53 @@ function onKey(e) {
     e.preventDefault(); e.stopPropagation(); markHandled(e); toggleMute(); return;
   }
 }
+// ── Picture-in-Picture ──
+// 右键菜单里的原生画中画与按钮行上的按钮走同一个 API；状态由
+// enter/leavepictureinpicture 事件驱动，两条入口始终一致。
+const inPip = ref(false);
+const pipError = ref("");
+// 只把「API 在不在」当硬门槛：某些 WebView 的 pictureInPictureEnabled 取值
+// 不准，直接灰掉按钮会让人连试都没法试，点一下至少能拿到失败原因。
+const pipSupported = computed(() =>
+  typeof videoEl.value?.requestPictureInPicture === "function" &&
+  typeof document.exitPictureInPicture === "function"
+);
+const pipTitle = computed(() => {
+  if (pipError.value) return pipError.value;
+  if (!pipSupported.value) return "当前 WebView 不支持画中画";
+  if (inPip.value) return "退出画中画（返回预览窗口）";
+  return document.pictureInPictureEnabled === false
+    ? "画中画（当前环境可能不支持，可点击尝试）"
+    : "画中画（独立小窗播放）";
+});
+function onEnterPip() { inPip.value = true; }
+function onLeavePip() { inPip.value = false; }
+async function togglePip() {
+  const v = videoEl.value;
+  if (!v || !pipSupported.value || typeof document.exitPictureInPicture !== "function") return;
+  try {
+    if (document.pictureInPictureElement === v) {
+      await document.exitPictureInPicture();
+    } else {
+      // 别的 video 占着小窗时先腾位置，再请求我们自己的。
+      if (document.pictureInPictureElement) await document.exitPictureInPicture();
+      await v.requestPictureInPicture();
+    }
+    pipError.value = "";
+  } catch (err) {
+    pipError.value = "画中画启动失败（视频可能尚未加载完成）：" + String(err?.message || err);
+    console.error("picture-in-picture failed:", err);
+  }
+}
+// 换片或关闭预览时，小窗里还留着上一个视频的画面，必须主动关掉。
+function closePip() {
+  const v = videoEl.value;
+  if (v && document.pictureInPictureElement === v && typeof document.exitPictureInPicture === "function") {
+    document.exitPictureInPicture().catch(() => {});
+  }
+  inPip.value = false;
+  pipError.value = "";
+}
 function toggleFullscreen() {
   const v = videoEl.value;
   if (!v) return;
@@ -682,6 +740,8 @@ function onStageLeave() {
 // handled by the parent via the file list, not here.
 async function loadVideo() {
   cancelFrameWatch();
+  // 小窗绑定的是上一个视频源，换片必须先收回，否则它仍浮在新画面之上。
+  closePip();
   // Snapshot BEFORE any await. Reading props.filePath / props.fileName after an
   // await is the other half of the original bug: `detectSubtitles` used to look
   // up the parent dir with one file's path and compute the name prefix with
@@ -751,6 +811,7 @@ onBeforeUnmount(() => {
   cancelFrameWatch();
   // Nothing still in flight may write into subtitleTracks after this point.
   subtitleGate.reset();
+  closePip();
   if (videoEl.value) videoEl.value.pause();
   clearTimeout(ctrlsTimer);
 });
@@ -818,6 +879,14 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 .vp-btn.primary:hover { opacity: 0.9; }
+.vp-btn.active,
+.vp-btn.active:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.vp-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.vp-btn:disabled:hover { background: var(--panel-bg); }
 
 /* Stage */
 .vp-stage {
