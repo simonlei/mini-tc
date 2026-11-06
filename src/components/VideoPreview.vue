@@ -687,7 +687,9 @@ async function togglePip() {
     console.error("picture-in-picture failed:", err);
   }
 }
-// 换片或关闭预览时，小窗里还留着上一个视频的画面，必须主动关掉。
+// 只在组件卸载（关闭预览 / 切到非视频预览）时调用。
+// 注意：不要在换片时调它 —— PiP 绑定的是 <video> 元素本身，不是某个 src；
+// 只换 src，小窗会自动接着播新片，这正是画中画连播要的行为。
 function closePip() {
   const v = videoEl.value;
   if (v && document.pictureInPictureElement === v && typeof document.exitPictureInPicture === "function") {
@@ -740,8 +742,8 @@ function onStageLeave() {
 // handled by the parent via the file list, not here.
 async function loadVideo() {
   cancelFrameWatch();
-  // 小窗绑定的是上一个视频源，换片必须先收回，否则它仍浮在新画面之上。
-  closePip();
+  // 这里刻意不退出画中画：换片只改 <video> 的 src，元素本身还在 DOM 里，
+  // PiP 小窗会跟着播下一个视频。以前在此调 closePip() 导致连播时小窗消失。
   // Snapshot BEFORE any await. Reading props.filePath / props.fileName after an
   // await is the other half of the original bug: `detectSubtitles` used to look
   // up the parent dir with one file's path and compute the name prefix with
@@ -811,6 +813,7 @@ onBeforeUnmount(() => {
   cancelFrameWatch();
   // Nothing still in flight may write into subtitleTracks after this point.
   subtitleGate.reset();
+  // 元素即将从 DOM 移除，收回小窗；换片不会走到这里。
   closePip();
   if (videoEl.value) videoEl.value.pause();
   clearTimeout(ctrlsTimer);
