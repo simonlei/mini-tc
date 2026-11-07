@@ -84,11 +84,11 @@
             <!-- Same action as the native right-click "画中画" item, but one click away. -->
             <button
               class="vp-btn"
-              :class="{ active: inPip }"
+              :class="{ active: inPip || pipWaiting }"
               :disabled="!pipSupported"
               :title="pipTitle"
               @click="togglePip"
-            >画中画</button>
+            >{{ pipWaiting ? "等待加载…" : "画中画" }}</button>
 
             <div class="vp-vol">
               <button class="vp-btn" @click="toggleMute" :title="(muted || volume === 0) ? '取消静音 (M)' : '静音 (M)'">{{ (muted || volume === 0) ? "🔇" : "🔊" }}</button>
@@ -145,6 +145,7 @@ import { matches, markHandled } from "../shortcuts.js";
 import { autoplayGate } from "../autoplayGate.js";
 import { createSubtitleGate, subtitleCandidates } from "../subtitleGate.js";
 import { formatBytes as fmtSize } from "../format.js";
+import { videoReadyForPip, pipIntentLands, waitForVideoReady } from "../pipReady.js";
 
 const props = defineProps({
   filePath: { type: String, required: true },
@@ -365,6 +366,7 @@ function onEnded() {
 }
 function onError() {
   // Native-capable container but actual codec/stream failed to decode.
+  cancelPipWait(); // 加载失败别让用户等满超时
   autoplayNext.value = false;
   externalFallback.value = true;
   if (canPlayNative.value) loadError.value = "当前编码格式 WebView 无法直接解码，请用系统播放器打开。";
@@ -654,6 +656,8 @@ function onKey(e) {
 // enter/leavepictureinpicture 事件驱动，两条入口始终一致。
 const inPip = ref(false);
 const pipError = ref("");
+const pipWaiting = ref(false);
+let pipWaitCtx = null;
 // 只把「API 在不在」当硬门槛：某些 WebView 的 pictureInPictureEnabled 取值
 // 不准，直接灰掉按钮会让人连试都没法试，点一下至少能拿到失败原因。
 const pipSupported = computed(() =>
@@ -661,6 +665,7 @@ const pipSupported = computed(() =>
   typeof document.exitPictureInPicture === "function"
 );
 const pipTitle = computed(() => {
+  if (pipWaiting.value) return "等待视频加载后自动进入画中画（再点一次取消）";
   if (pipError.value) return pipError.value;
   if (!pipSupported.value) return "当前 WebView 不支持画中画";
   if (inPip.value) return "退出画中画（返回预览窗口）";
@@ -670,22 +675,64 @@ const pipTitle = computed(() => {
 });
 function onEnterPip() { inPip.value = true; }
 function onLeavePip() { inPip.value = false; }
+function cancelPipWait() {
+  if (pipWaitCtx) pipWaitCtx.cancelled = true;
+  pipWaitCtx = null;
+  pipWaiting.value = false;
+}
+// 真正发起请求。调用点必须还落在用户手势的时间窗口内。
+async function requestPip(v) {
+  try {
+    // 别的 video 占着小窗时先腾位置，再请求我们自己的。
+    if (document.pictureInPictureElement) await document.exitPictureInPicture();
+    await v.requestPictureInPicture();
+    pipError.value = "";
+  } catch (err) {
+    pipError.value = "画中画启动失败：" + String(err?.message || err);
+    console.error("picture-in-picture failed:", err);
+  }
+}
 async function togglePip() {
   const v = videoEl.value;
   if (!v || !pipSupported.value || typeof document.exitPictureInPicture !== "function") return;
-  try {
-    if (document.pictureInPictureElement === v) {
+  // 已在小窗 → 退出（同时取消任何等待）。
+  if (document.pictureInPictureElement === v) {
+    cancelPipWait();
+    try {
       await document.exitPictureInPicture();
-    } else {
-      // 别的 video 占着小窗时先腾位置，再请求我们自己的。
-      if (document.pictureInPictureElement) await document.exitPictureInPicture();
-      await v.requestPictureInPicture();
+      pipError.value = "";
+    } catch (err) {
+      console.error("exit picture-in-picture failed:", err);
     }
-    pipError.value = "";
-  } catch (err) {
-    pipError.value = "画中画启动失败（视频可能尚未加载完成）：" + String(err?.message || err);
-    console.error("picture-in-picture failed:", err);
+    return;
   }
+  // 等待加载中再点一次 → 取消，别让用户干等。
+  if (pipWaiting.value) {
+    cancelPipWait();
+    pipError.value = "";
+    return;
+  }
+  const ctx = { path: props.filePath, cancelled: false };
+  pipWaitCtx = ctx;
+  if (!videoReadyForPip(v.readyState, v.videoWidth)) {
+    // 在同一次点击的 await 链里等就绪：transient activation 只有约 5 秒，
+    // 丢给之后的 loadedmetadata 回调会拿 NotAllowedError。
+    pipWaiting.value = true;
+    pipError.value = "";
+    const wait = await waitForVideoReady(v, ctx);
+    pipWaiting.value = false;
+    if (ctx.cancelled) return;
+    // await 前的快照在 await 后不可信 —— 等待期间可能已换片。
+    if (!pipIntentLands(ctx.path, props.filePath)) return;
+    if (!wait.ok) {
+      pipError.value = wait.reason === "timeout"
+        ? "视频加载超时，加载完成后再点一次画中画"
+        : "已取消画中画";
+      return;
+    }
+  }
+  pipWaitCtx = null;
+  await requestPip(v);
 }
 // 只在组件卸载（关闭预览 / 切到非视频预览）时调用。
 // 注意：不要在换片时调它 —— PiP 绑定的是 <video> 元素本身，不是某个 src；
@@ -695,6 +742,7 @@ function closePip() {
   if (v && document.pictureInPictureElement === v && typeof document.exitPictureInPicture === "function") {
     document.exitPictureInPicture().catch(() => {});
   }
+  cancelPipWait();
   inPip.value = false;
   pipError.value = "";
 }
@@ -742,6 +790,8 @@ function onStageLeave() {
 // handled by the parent via the file list, not here.
 async function loadVideo() {
   cancelFrameWatch();
+  // 换片即作废等待中的画中画意图（见 pipReady.js 的 pipIntentLands）。
+  cancelPipWait();
   // 这里刻意不退出画中画：换片只改 <video> 的 src，元素本身还在 DOM 里，
   // PiP 小窗会跟着播下一个视频。以前在此调 closePip() 导致连播时小窗消失。
   // Snapshot BEFORE any await. Reading props.filePath / props.fileName after an

@@ -57,7 +57,7 @@ Windows、macOS、Linux 都能用。左右各一栏，键盘操作优先：复�
 - 文本、Markdown、JSON、日志：可以划选复制，也可以一键复制全文。
 - 常见图片（含 `.jfif`，即 JFIF 封装的 JPEG，与 `.jpg` 字节相同），以及 HEIC / HEIF。超大的 HEIC 会改用文件里自带的缩小图。连拍、序列和 Live Photo 可以逐帧播放。
 - PDF、doc、docx。
-- 视频直接播放 `mp4` / `webm` / `mov` 等，可挂同目录字幕或外挂字幕，可调倍速，并记住音量。进度条一直可见。下方按钮行有「画中画」，一点即可把视频放进独立小窗（和右键菜单里的画中画是同一个功能），再点一次退出。`mkv` / `avi` 等无法解码的格式，以及只有声音没有画面的情况，会改用系统播放器打开。
+- 视频直接播放 `mp4` / `webm` / `mov` 等，可挂同目录字幕或外挂字幕，可调倍速，并记住音量。进度条一直可见。下方按钮行有「画中画」，一点即可把视频放进独立小窗（和右键菜单里的画中画是同一个功能），再点一次退出。视频还没加载完时点它会显示「等待加载…」，加载好自动进入小窗，等待中再点一次可取消。`mkv` / `avi` 等无法解码的格式，以及只有声音没有画面的情况，会改用系统播放器打开。
 - 视频播完可以自动播放下一个。画中画状态下自动连播或手动切到下一个视频，小窗会继续播新视频、不会退出；关闭预览时才收回。
 - 「预览时窗口置顶」在通用设置里，默认关闭。打开后，播放视频时整个窗口保持在最前，关掉预览后恢复。
 - 哪种后缀用哪种预览方式，在「配置 → 文件预览设置」里改，改动立即生效（预览、视频续播、搜索结果图标都跟着变）。
@@ -110,7 +110,7 @@ Windows、macOS、Linux 都能用。左右各一栏，键盘操作优先：复�
 
 安装包在 [GitHub Releases](https://github.com/simonlei/mini-tc/releases)。
 
-Windows 上的 `x64-setup.exe` 没有购买代码签名证书，第一次运行时 Microsoft Defender SmartScreen 可能提示「已保护你的电脑 / 发布者未知」。点击 **更多信息 → 仍要运行** 即可继续。安装包由 [GitHub Actions](https://github.com/simonlei/mini-tc/actions) 公开构建。
+Windows 上的 `x64-setup.exe` 没有代码签名证书，首次运行可能被 Microsoft Defender SmartScreen 拦截，处理方式见 [已知问题与限制](KNOWN-ISSUES.md)。安装包由 [GitHub Actions](https://github.com/simonlei/mini-tc/actions) 公开构建。
 
 ## 从源码运行
 
@@ -156,6 +156,10 @@ npx tauri dev
 4. 已安装的用户在 **帮助 → 检查更新** 里升级。
 
 本地构建与签名密钥的命令见 [INTERNALS.md](INTERNALS.md)。
+
+## 已知问题与限制
+
+画中画小窗标题、Windows 安装包 SmartScreen 提示等平台限制和已结案方案，见 [KNOWN-ISSUES.md](KNOWN-ISSUES.md)。待修 bug 在 [TODO.md](TODO.md)。
 
 ## License
 
