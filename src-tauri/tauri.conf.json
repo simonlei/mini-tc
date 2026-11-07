@@ -111,6 +111,12 @@
     "active": true,
     "targets": ["app", "dmg", "nsis"],
     "createUpdaterArtifacts": true,
+    "publisher": "MiniTC",
+    "copyright": "Copyright (c) 2026 MiniTC",
+    "category": "Utility",
+    "shortDescription": "A lightweight cross-platform file manager",
+    "longDescription": "Dual-pane file manager with file preview, archive handling and cross-platform clipboard support.",
+    "homepage": "https://github.com/simonlei/mini-tc",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

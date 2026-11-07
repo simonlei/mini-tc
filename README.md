@@ -110,7 +110,9 @@ Windows、macOS、Linux 都能用。左右各一栏，键盘操作优先：复�
 
 安装包在 [GitHub Releases](https://github.com/simonlei/mini-tc/releases)。
 
-Windows 上的 `x64-setup.exe` 没有代码签名证书，首次运行可能被 Microsoft Defender SmartScreen 拦截，处理方式见 [已知问题与限制](KNOWN-ISSUES.md)。安装包由 [GitHub Actions](https://github.com/simonlei/mini-tc/actions) 公开构建。
+CI 会为每个 Release 资产生成同名 `.sha256`，并汇总成 `SHA256SUMS.txt`。下载后可用 `Get-FileHash <文件> -Algorithm SHA256`（PowerShell）或 `sha256sum -c SHA256SUMS.txt`（bash）核对字节。
+
+Windows 上的 `x64-setup.exe` 没有代码签名证书，首次运行可能被 Microsoft Defender SmartScreen 拦截；自动更新写入新版本时也可能被 Defender 的机器学习启发式误报为木马。现象、证伪经过与处理方式见 [已知问题与限制](KNOWN-ISSUES.md)。安装包由 [GitHub Actions](https://github.com/simonlei/mini-tc/actions) 公开构建。
 
 ## 从源码运行
 
@@ -159,7 +161,7 @@ npx tauri dev
 
 ## 已知问题与限制
 
-画中画小窗标题、Windows 安装包 SmartScreen 提示等平台限制和已结案方案，见 [KNOWN-ISSUES.md](KNOWN-ISSUES.md)。待修 bug 在 [TODO.md](TODO.md)。
+画中画小窗标题、Windows 安装包 SmartScreen 提示、Defender 误报等平台限制和已结案方案，见 [KNOWN-ISSUES.md](KNOWN-ISSUES.md)。待修 bug 在 [TODO.md](TODO.md)。
 
 ## License
 

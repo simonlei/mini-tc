@@ -1,6 +1,7 @@
 name: Release
 
-# 构建 MiniTC 发布版本：Windows + macOS 安装包 + Tauri 更新器签名 (latest.json)。
+# 构建 MiniTC 发布版本：Windows + macOS 安装包 + Tauri 更新器签名 (latest.json)
+# + 每个 Release 资产的 SHA256 校验和。
 #
 # 触发：
 #   1. 推送 v* 标签 → 自动构建并发布 Release
@@ -243,3 +244,36 @@ jobs:
             sleep "$SLEEP"
           done
           echo "Synced all-platform updater artifacts to S3: $UPDATER_PUBLIC_BASE"
+
+  # 为 Release 上的每个资产生成 .sha256 + 一份汇总，供下载后核对字节。
+  # 必须等 release 矩阵全部完成：三个平台并行发版，提前跑会漏掉尚未上传的资产。
+  checksums:
+    needs: release
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Generate and publish SHA256 checksums for all release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p sums && cd sums
+          # 排除上一次运行留下的校验产物，避免自我递归。
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' \
+            | grep -vE '\.(sha256|sig)$|^SHA256SUMS\.txt$' > asset-names.txt || true
+          if [ ! -s asset-names.txt ]; then
+            echo "ERROR: no release assets found for $TAG"
+            exit 1
+          fi
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --clobber
+            sha256sum "$name" > "${name}.sha256"
+          done < asset-names.txt
+          cat ./*.sha256 > SHA256SUMS.txt
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            ./*.sha256 SHA256SUMS.txt
+          echo "==> Published $(wc -l < SHA256SUMS.txt) checksums for $TAG"
