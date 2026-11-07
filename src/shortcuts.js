@@ -110,6 +110,12 @@ export const COMMANDS = [
   // Meta (Cmd) variant is "Shift+Meta+Backspace", not "Meta+Shift+Backspace".
   { id: "list.deletePermanent", scope: "fileList", label: "永久删除", desc: "不经过回收站，直接抹除（不可恢复）", defaults: ["Shift+Delete", "Ctrl+Shift+Backspace", "Shift+Meta+Backspace"] },
   { id: "list.rename", scope: "fileList", label: "重命名", defaults: ["F2"] },
+  // Alt+F9 / F9: quick extract. Exactly the right-click "用 7-Zip 解压" action
+  // (FilePanel.vue:extractSelected) — same tool, same "extract to a folder
+  // named after the archive" mode, same batch order and toasts. Declared in
+  // the fileList scope because it needs a selected row; the panel owns the
+  // archive-tool discovery and the extraction IPC.
+  { id: "list.extract", scope: "fileList", label: "快速解压", desc: "用本机 7-Zip 图形界面把选中压缩包解压到同名文件夹，与右键「用 7-Zip 解压」相同", defaults: ["Alt+F9", "F9"] },
   // 批量重命名。F2 handles the single-row inline case; Ctrl+M always opens the
   // batch dialog (which also works on one item — it just has nothing to
   // sequence). Kept out of the fileList scope because the dialog is opened from

@@ -191,7 +191,7 @@ const props = defineProps({
   colWidths: { type: Object, default: () => ({}) },
 });
 
-const emit = defineEmits(["sort", "navigate", "navigate-parent", "navigate-back", "navigate-forward", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename", "resize-column", "reset-column-widths"]);
+const emit = defineEmits(["sort", "navigate", "navigate-parent", "navigate-back", "navigate-forward", "select", "calc-dir-size", "delete", "open", "pending-select-resolved", "ctx-menu", "rename", "extract", "resize-column", "reset-column-widths"]);
 
 // ── Multi-selection state ──
 // selectedIndices: indices (into displayedEntries) of every selected row.
@@ -936,6 +936,16 @@ function onKeydown(e) {
     markHandled(e);
     const idx = targetRenameIndex();
     if (idx >= 0) startRename(idx);
+    return;
+  }
+
+  // Alt+F9 / F9: quick extract. The list only signals the intent — the panel
+  // owns archive-tool discovery, the selection and the extraction IPC, so the
+  // shortcut and the right-click "用 7-Zip 解压" item stay the same action.
+  if (matches("list.extract", e)) {
+    e.preventDefault();
+    markHandled(e);
+    emit("extract");
     return;
   }
 

@@ -59,6 +59,7 @@
       @open="onOpen"
       @rename="onRename"
       @ctx-menu="onCtxMenu"
+      @extract="extractSelected"
       @pending-select-resolved="pendingSelectName = null"
     />
 
@@ -103,6 +104,7 @@ import PathBar from "./PathBar.vue";
 import FileList from "./FileList.vue";
 import ContextMenu from "./ContextMenu.vue";
 import { listDirectory, getHomeDir, getParentDir, joinPath, listDrives, getDirSize, deleteToTrash, deletePermanently, deleteWithAdmin, beginTrashDelete, commitTrashDelete, undoTrashDelete, isExecutable, runAsAdmin, renameFile, openFile, createDirectory, loadConfig, saveConfig, getArchiveTools, extractArchive, addToArchive, pathExists } from "../api.js";
+import { guiExtractTools, pickExtractTool } from "../archiveTools.js";
 import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from "../paths.js";
 import { loadLands, createSpinner } from "../loadGate.js";
 import { createCtxGate } from "../ctxMenuGate.js";
@@ -1729,7 +1731,10 @@ function buildMenuItems(entry) {
   const extractSet = extractTargets(entry);
   if (extractSet.length > 0) {
     items.push({ separator: true });
-    if (archiveTools.value.length === 0) {
+    // Same GUI-tool list the quick-extract shortcut uses (see archiveTools.js),
+    // so the menu and the keyboard can never drift apart.
+    const extractTools = guiExtractTools(archiveTools.value);
+    if (extractTools.length === 0) {
       items.push({ label: "未检测到 7-Zip 等压缩工具", disabled: true });
     } else {
       // Extraction goes through each tool's GUI, which prompts for a password
@@ -1739,8 +1744,7 @@ function buildMenuItems(entry) {
       // listing order — the count is shown so it's obvious the action is a
       // batch, not a single file.
       const suffix = extractSet.length > 1 ? `（依次解压 ${extractSet.length} 个）` : "";
-      for (const tool of archiveTools.value) {
-        if (!tool.syntax.endsWith("-gui")) continue;
+      for (const tool of extractTools) {
         items.push({
           label: `用 ${tool.name} 解压${suffix}`,
           action: "extract",
@@ -2119,6 +2123,28 @@ async function doExtract(targets, tool, mode, basePath) {
   // nothing new shows up until they are finished — unless we waited for them,
   // in which case the results are already on disk. CLI tools are synchronous.
   if (done > 0 && (!isGui || wait)) refresh();
+}
+
+// Alt+F9 / F9 quick extract — the keyboard equivalent of right-clicking an
+// archive and choosing its "用 7-Zip 解压" entry. Both paths call doExtract
+// with mode "to_folder", so target, tool, batch order and toasts are identical.
+// The selection and directory are captured BEFORE the tool probe (an await)
+// and then passed down explicitly: navigating during the probe must not
+// redirect this extraction to a different folder.
+async function extractSelected() {
+  const path = activeTab.value?.path || "";
+  const targets = extractTargets(selectedEntry.value);
+  if (targets.length === 0) {
+    showToast("请先选中压缩包再解压", "info");
+    return;
+  }
+  await ensureArchiveTools();
+  const tool = pickExtractTool(archiveTools.value);
+  if (!tool) {
+    showToast("未检测到 7-Zip 等压缩工具", "error");
+    return;
+  }
+  await doExtract(targets, tool, "to_folder", path);
 }
 
 // Copy text to the OS clipboard, falling back to a hidden textarea + execCommand
