@@ -1,7 +1,7 @@
 // 验证「启动器选 Node」不再取字典序第一个，而是取满足 engines 的最新版本。
 // 直接 `node scripts/node-pick-check.mjs` 跑。
 //
-// 背景（TODO.md P2 第一条）：`dev.sh` 与当时的 `dev.bat` 都用
+// 背景（2026-10-16 的一次 review）：`dev.sh` 与当时的 `dev.bat` 都用
 //   for /d %%v in ("...\versions\*")   /   for dir in ".../versions"/*
 // 选 Node，两者都按**字典序**枚举，于是 22.12.0 永远排在 22.22.2 前面、
 // 被选中 —— 选中的恰恰是最旧的那个。症状不是安装报错，而是运行时在

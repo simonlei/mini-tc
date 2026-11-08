@@ -161,7 +161,7 @@ npx tauri dev
 
 ## 已知问题与限制
 
-画中画小窗标题、Windows 安装包 SmartScreen 提示、Defender 误报等平台限制和已结案方案，见 [KNOWN-ISSUES.md](KNOWN-ISSUES.md)。待修 bug 在 [TODO.md](TODO.md)。
+画中画小窗标题、Windows 安装包 SmartScreen 提示、Defender 误报等平台限制和已结案方案，见 [KNOWN-ISSUES.md](KNOWN-ISSUES.md)。
 
 ## License
 

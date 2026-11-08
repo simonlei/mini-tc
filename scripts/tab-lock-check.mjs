@@ -425,6 +425,18 @@ section("4. 静态断言：落地点真的用了生产判据并切了活动标�
     "tabLock.js 是 plain node 可加载的（无 vue / IPC 依赖）",
     !/from\s+["']vue["']/.test(lockSrc) && !/invoke\s*\(/.test(lockSrc)
   );
+
+  // switchTab 的 id 守卫：跳回锁定位置现在会调 switchTab，坏 id 会让
+  // activeTab 变 undefined → 路径 watcher 直接 return → 面板像卡死。
+  const swAt = code.indexOf("function switchTab(");
+  check("找得到 switchTab", swAt !== -1);
+  const swBody = swAt === -1 ? "" : code.slice(swAt, code.indexOf("\nfunction ", swAt + 10));
+  check("switchTab 体内非空", swBody.length > 0);
+  check(
+    "switchTab 校验 id（坏 id 不能让 activeTab 变 undefined）",
+    /tabs\.value\.some\s*\(/.test(swBody) || /tabs\.value\.find\s*\(/.test(swBody)
+  );
+  check("switchTab 切 tab 时清掉 pendingSelectName（别落到别的 tab 的同名行）", /pendingSelectName\.value\s*=\s*null/.test(swBody));
 }
 
 // ══════════════ report ══════════════

@@ -99,6 +99,20 @@ const MUTANTS = [
     from: "  setPath(tab, plan.path);",
     to: "  setPath(tab, tab.path);",
   },
+
+  // ── switchTab 的守卫（跳回锁定位置会调它）────────────────────────
+  {
+    target: PANEL,
+    name: "调用点：switchTab 不校验 id（坏 id 会让面板像卡死）",
+    from: "  if (!tabs.value.some((t) => t.id === id)) return false;",
+    to: "  // 守卫被删掉了",
+  },
+  {
+    target: PANEL,
+    name: "调用点：switchTab 不清 pendingSelectName（待选名会落到别的 tab 的同名行）",
+    from: "  if (activeTabId.value !== id) pendingSelectName.value = null;",
+    to: "  // 不清了",
+  },
 ];
 
 let caught = 0;

@@ -1,9 +1,0 @@
-# 删除失败（需管理员权限）时让用户选择是否提权重试
-
-> 来源：`TODO-done.md` 第 45 行 · 章节 已实现功能（想法暂存区） · 第 20 条
-> 2026-11-04 TODO 瘦身整块外迁，以下原文逐字保留；主清单见 `../../TODO-done.md`。
-
-<!-- ORIGINAL-BLOCK-START -->
-
-- [x] **删除失败（需管理员权限）时让用户选择是否提权重试** — 当前删除链路为 `FilePanel.vue:onDelete` → `deleteToTrash(fullPath)` → 后端 `delete_to_trash`（`src-tauri/src/lib.rs:414`，走 `trash::delete` 进回收站）。删某些受保护目录/文件时会因权限不足（Windows `Access is denied` / `ERROR_ACCESS_DENIED`，需管理员）而失败，当前实现仅 `error.value = e` 并设置 toast，但 `onDelete` 仍会 `entries.value = entries.filter(...)` 把失败项从列表里**就地移除**（视觉上像删成功了，实际没删），属于 bug。目标：当后端返回「权限不足」类错误时，前端**不要**移除该项，而是弹确认框让用户选择「以管理员身份重试」或「取消」。需处理：① 后端 `delete_to_trash` 需区分「权限错误」与「其他错误」（如路径不存在/被占用），可返回结构化错误（含 `kind` 字段，如 `"permission_denied"`），或前端用消息关键字（"denied"/"permission"）粗判；② Windows 提权删除方案——非管理员进程无法原地提权，必须启动**独立提权子进程**：可选 (a) `runas` 调用一个内置的小帮助程序 / 提权版 `powershell -Command "Remove-Item -Force -Recurse '<path>'"`（用 `shell_execute` 的 `runas` 动词弹 UAC），(b) 通过 `schtasks` 注册一次性任务以 SYSTEM/管理员跑 `Remove-Item` 再删除任务；③ 后端新增命令如 `delete_with_admin(path)` / 由前端直接 `Command::new("powershell").arg("Start-Process ...")` 触发 UAC；④ 用户「取消」时保持项不动并提示「未删除」；「重试」成功后 toast + 真正移除列表项；⑤ 提权子进程的路径转义（含空格/特殊字符）与删除进回收站 vs 直接 `Remove-Item`（绕过回收站）的取舍；⑥ 与现有 toast / `error.value` 反馈链路衔接，避免误删假象。
-  - 实现：后端 `delete_to_trash` 改返回 `Result<(), DeleteError>`（结构化错误 `{ kind, message }`，按错误信息关键字区分 `permission_denied`/`not_found`/`other`，修复原 bug——原实现失败时仍无条件 `entries.filter` 把失败项从列表移除造成"假删"假象）；新增 `delete_with_admin(path)` 命令——Windows 用 `ShellExecuteW` + `runas` 动词启动提权 PowerShell 执行 `Remove-Item -LiteralPath '<escaped>' -Recurse -Force`（绕过回收站，异步返回；用户拒 UAC 返回 code 1223 提示），非 Windows 返回错误。前端 `FilePanel.vue` 重写 `onDelete`：逐项删除只移除成功项；权限失败项弹 `window.confirm` 确认，用户选"以管理员身份重试"则调 `deleteWithAdmin` 并延迟 2s 刷新，取消则保留项 + toast。`api.js` 新增 `deleteWithAdmin` 封装。cargo check 因 `target/debug/.cargo-build-lock` access denied（环境限制，非代码问题）+ 独立 target-dir 全量编译耗时过长未能跑通，代码 self-review 通过，待用户双击 `dev.bat` 实测。

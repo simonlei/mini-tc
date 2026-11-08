@@ -643,8 +643,23 @@ function closeTab(id) {
   }
 }
 
+// Switch the panel to tab `id`.
+//
+// ⚠️ The id is validated: an unknown id would make `activeTab` undefined, and
+// the path watcher's `if (!newPath) return` would bail out — leaving the old
+// tab's listing on screen while the path bar and the status bar go empty
+// (it looks like the panel froze). Every caller passes a real tab id, but the
+// guard is one line and this function is reachable from the tab menu's lock
+// jump too.
 function switchTab(id) {
+  if (!tabs.value.some((t) => t.id === id)) return false;
+  // A pending selection belongs to the tab it was armed in — carrying it over
+  // would select the same-named row in a different tab. Only clear it when
+  // actually moving to another tab: `switchTab` is also called for the tab
+  // that is already active (the lock jump's "follow" step).
+  if (activeTabId.value !== id) pendingSelectName.value = null;
   activeTabId.value = id;
+  return true;
 }
 
 // Total Commander 的 Ctrl+Tab / Ctrl+Shift+Tab：在本栏的标签页之间轮换，

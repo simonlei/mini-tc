@@ -287,7 +287,7 @@ npm test
 - `scripts/seq-number-mutation.mjs` — 序号输入的变异测试。清空「步长」会让所有行同一序号，判重不触发，整批照常执行。脚本打印 `anchor found: N` 并断言 `N === 1`，跑完还原源文件。
 - `scripts/selection-remap-check.mjs` — 选中态在排序 / 过滤后的重映射。选中态若按下标存储，重排后按 Delete 删掉的是另一个文件。
 - `scripts/entry-key-check.mjs` — `entryKey()`。文件名只在单个目录内唯一。断言模板确实调用了 `entryKey`，只测纯逻辑时「改实现但模板仍写 `entry.name`」会全绿。
-- `scripts/row-key-identity-check.mjs` — 用真实 `@vue/runtime-core` 跑 keyed diff。key 撞车时 Vue 的 `key -> 下标` map 被后者覆盖，节点复用错位一格，目录大小、缩略图、内联改名状态会贴到错误的行。原先文档称这会让改名输入框挂到错误文件上，实测推翻：输入框位置只由 `renamingIndex` 决定。身份重映射的 watcher 先于 `props.entries` watcher，残留缺口（`found` 排序下同引用 + 就地 `splice`）当前调用方不可达，归档在 `TODO-done.md`。
+- `scripts/row-key-identity-check.mjs` — 用真实 `@vue/runtime-core` 跑 keyed diff。key 撞车时 Vue 的 `key -> 下标` map 被后者覆盖，节点复用错位一格，目录大小、缩略图、内联改名状态会贴到错误的行。原先文档称这会让改名输入框挂到错误文件上，实测推翻：输入框位置只由 `renamingIndex` 决定。身份重映射的 watcher 先于 `props.entries` watcher，残留缺口（`found` 排序下同引用 + 就地 `splice`）当前调用方不可达。
 - `scripts/load-gate.test.mjs` — `loadLands()`。快速导航时先发后到的旧结果曾覆盖当前目录。发号排序（只有最新一次能落地）和 `inFlightLoads` 的同 key 折叠互斥：A→B→A 时回到 A 的请求被折叠，A 的首个请求又被 B 的序号作废，谁都不落地。转圈不能复用落地判据，归属由 `createSpinner()` 单独记。
 - `scripts/preview-gate.test.mjs` — `previewLands()`。HEIC 解码要几百毫秒，按住方向键时先发的文件会后到。守卫要落在每一个 `await` 之后。作废一个已经产出资源的结果时，必须把 blob revoke。`releaseHeicUrl()` 必须在加载入口调用，不能只在 HEIC 分支里。
 - `scripts/autoplay-gate.test.mjs` — `arm()` / `claim()`。`VideoPreview` 曾在 `ended` 时自己把 `pendingAutoplay` 置真，父组件拒绝换曲后标志永远悬着，此后手动点选任何视频都会自动播放。按路径校验拦不住。谁决定，谁置位。消费点必须在所有分支的共同入口，且在 `isExternalOnly` 提前 return 之前。`claim()` 无论命中与否都清空。`await entryPath(...)` 期间用户可能已关掉预览，撤销做在 `closePreview` 里的 `arm(null)`。
