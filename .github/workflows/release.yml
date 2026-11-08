@@ -82,6 +82,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Prefetch NSIS toolchain
+        # tauri-bundler 在「打安装包」这一步才去 GitHub Release 下载 NSIS 工具链，
+        # 且是单次请求、没有重试。GitHub 的资源 CDN 偶发 504（表现为
+        # `failed to bundle project: 'http status: 504'`），会让编译了 6 分半的
+        # 整个发布挂在最后一步，且失败点会在 zip 和 dll 之间漂移。
+        #
+        # 这里提前把工具链下好、按 bundler 自己的 SHA1 校验、放到它期望的位置，
+        # bundler 检测到文件齐全就完全跳过下载。脚本自带重试与镜像回退，
+        # 且失败只告警不中断 —— 不能让这个步骤把本来能过的构建搞挂。
+        shell: bash
+        run: node scripts/ci/prefetch-nsis-toolchain.mjs
+
       - name: Bump version from tag
         # 根据发布标签注入版本号到 package.json / Cargo.toml / tauri.conf.json，
         # 使 latest.json 的 version 字段与标签一致，更新器才能正确判断版本。

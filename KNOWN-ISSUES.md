@@ -5,6 +5,49 @@
 - 功能说明在 [README.md](README.md)，README 只留一个入口，不摊开细节。
 - 新增条目请写清「现象 / 原因 / 验证经过 / 结论 / 变通」，尤其记下**试过且证伪**的方案，避免下次照着现象重做一遍。
 
+## CI 发布时 NSIS 工具链下载偶发 504
+
+**平台**：Windows / macOS（GitHub Actions）
+**状态**：2026-11-08 已定位并绕过（预取步骤），根因在 Tauri 上游
+
+### 现象
+
+打 tag 触发发布，Windows 平台构建到最后一步（打包）失败：
+
+```
+Finished `release` profile [optimized] target(s) in 6m 38s
+Info Verifying NSIS package
+Downloading https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip
+Error failed to bundle project: `http status: 504`
+```
+
+6 分半的 Rust 编译全部作废。重跑一次，失败点会漂移到另一个文件（先 `nsis-3.11.zip`，后 `nsis_tauri_utils.dll`）。
+
+### 原因
+
+`tauri-bundler`（`@tauri-apps/cli` 2.11.4 内置 2.9.4）在**打包这一步**才去 GitHub Release 下载 NSIS 工具链，且是**单次请求、零重试**。GitHub 资源 CDN 偶发 504 时没有任何回退，直接让整个构建失败。
+
+失败点在两个文件之间漂移，说明是链路抖动而不是某个文件缺失或被删 —— 这也是判断依据：若文件真的没了，失败点会稳定在同一个文件上。
+
+### 验证经过
+
+- 本机复现同一 URL，直连连续 5 次全部 504（同一份 92 字节的「504 Gateway Time-out」HTML 响应体），换镜像则 200 且 SHA1 与官方一致 —— 确认是链路问题，不是文件问题。
+- 读了 `tauri-bundler 2.9.4` 的 `bundle/windows/nsis/mod.rs`：下载走 `download_and_verify()`，内部是单次 `ureq` GET，无重试；且下载发生在 `bundle_project()` 里，即编译完成之后。
+- 确认 bundler 有 `TAURI_BUNDLER_TOOLS_GITHUB_MIRROR` 这个换源开关，但它只换源、同样不重试，单独用不能解决。
+- 确认 bundler 的检查逻辑：目录存在 + 必需文件齐全 + 插件 DLL 哈希正确，则完全跳过下载。所以只要提前把工具链放到正确位置即可绕过。
+
+### 结论
+
+**这是 Tauri 上游的问题**（打包期下载无重试），本仓库用预取步骤绕过：`.github/workflows/release.yml` 在 `npm ci` 之后先跑 `scripts/ci/prefetch-nsis-toolchain.mjs`，把工具链下好、按 bundler 自己的 SHA1 校验、放到 bundler 期望的位置。
+
+实现细节见 [INTERNALS.md 的「CI 上的 NSIS 工具链预取」](INTERNALS.md#ci-上的-nsis-工具链预取)。
+
+### 变通
+
+预取脚本自带重试与镜像回退；且**失败只告警不中断** —— 预取失败时 bundler 仍会自己尝试官方源，不会把本来能过的构建搞挂。
+
+若将来上游修好了（bundler 自带重试），可以删掉这个预取步骤；判断依据是 `release.yml` 里不再出现 `Verifying NSIS package`。
+
 ## 画中画小窗标题无法改成文件名
 
 **平台**：Windows / WebView2（Chromium）

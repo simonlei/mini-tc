@@ -18,6 +18,7 @@
 - [前端测试](#前端测试)
 - [后端测试](#后端测试)
 - [本地发布构建](#本地发布构建)
+  - [CI 上的 NSIS 工具链预取](#ci-上的-nsis-工具链预取)
 - [目录结构](#目录结构)
 
 ## 启动
@@ -335,6 +336,28 @@ bash scripts/release/build-release.sh
 ```
 
 产物在 `scripts/release/out/`，包含 `.msi` 和 `latest.json`。打 tag 触发 GitHub Actions 的步骤见 [README](README.md#发布新版本)。
+
+### CI 上的 NSIS 工具链预取
+
+`tauri-bundler` 在「打安装包」这一步才去 GitHub Release 下载 NSIS 工具链，且是**单次请求、没有重试**。GitHub 的资源 CDN 偶发 504 时，整条发布流水线会在编译完 6 分半之后挂在最后一步：
+
+```
+Error failed to bundle project: `http status: 504`
+```
+
+失败点会在 `nsis-3.11.zip` 与 `nsis_tauri_utils.dll` 之间漂移 —— 说明是链路抖动而不是文件缺失，单纯重跑只是碰运气。
+
+所以 `release.yml` 在 `npm ci` 之后、构建之前先跑一步 `scripts/ci/prefetch-nsis-toolchain.mjs`：把工具链下好、按 bundler 自己的 SHA1 校验、放到 bundler 期望的位置，bundler 检测到文件齐全就完全跳过下载。
+
+几个不显然的点：
+
+- **下载地址与 SHA1 从 CLI 二进制里读，不写死。** `@tauri-apps/cli` 的原生二进制里带着 bundler 那份常量（Rust 常量按声明顺序落盘，URL 后面紧跟哈希）。读出来就不用在升级 CLI 时手工同步 NSIS 版本号；读不到才退回脚本内的兜底常量。
+- **两个平台要的文件不一样。** bundler 里 Windows 用 `#[cfg(target_os = "windows")]` 那份必需文件清单（完整 NSIS），非 Windows 只要插件 DLL（NSIS 本体用系统装的 makensis）。Windows 下压缩包约 2.4 MB，非 Windows 只要 34 KB 的 DLL。
+- **工具目录必须和 Rust 侧 `dirs::cache_dir()` 对齐**：Windows 是 `%LOCALAPPDATA%\tauri`，macOS 是 `~/Library/Caches/tauri`，Linux 是 `$XDG_CACHE_HOME/tauri`。算错了 bundler 根本不会去那儿找，预取等于白做。
+- **插件 DLL 要在解压之后单独放。** NSIS 压缩包里没有 `Plugins/x86-unicode/additional/nsis_tauri_utils.dll`（bundler 也是单独下载的）。而 bundler 的检查是「必需文件齐全 **且** 插件哈希正确」，两者缺一不可。
+- **失败不致命。** 预取失败只告警并继续，让 bundler 自己再试一次官方源。这个步骤只能让构建更快更稳，不能把本来能过的构建搞挂。
+
+这个脚本跑在 CI 上，坏了的表现是「发布挂掉」而不是「测试报红」，所以配了成对的 check / mutation 脚本（`scripts/ci/prefetch-nsis-toolchain-{check,mutation}.mjs`），验证解压、目录穿越防护、必需文件清单、路径解析这几处最容易出错的逻辑。
 
 ## 目录结构
 
