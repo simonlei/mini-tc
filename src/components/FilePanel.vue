@@ -109,6 +109,7 @@ import { entryPath, isSearchPath, parentDirOf, makeSearchPath, normDir } from ".
 import { loadLands, createSpinner } from "../loadGate.js";
 import { createCtxGate } from "../ctxMenuGate.js";
 import { makeDeleteScope, deleteScopeLands, remainingAfterDelete } from "../deleteScope.js";
+import { planLockedJump, LOCK_JUMP_NONE, LOCK_JUMP_UNLOCKED, LOCK_JUMP_SAME } from "../tabLock.js";
 import { cancelSearch, startSearch } from "../api.js";
 import { formatBytes } from "../format.js";
 import {
@@ -694,13 +695,34 @@ function relockTabAtCurrentPath(id = activeTabId.value) {
 
 // Jump the tab back to its anchor. Reports why it did nothing so App.vue can
 // surface a toast instead of silently swallowing the keypress.
+//
+// ⚠️ The panel shows ONE tab at a time, so jumping a *background* tab has to
+// bring the panel along: the directory really does change, but the user is
+// looking at another tab and would see nothing at all — the "回到锁定位置
+// 无效" bug (2026-11). Same rule as the tab menu's「重新搜索」: the action
+// lands on a tab, so the panel goes to that tab.
+//
+// The decision itself lives in src/tabLock.js so the component and the tests
+// share one implementation — a copy inside the test would test the copy.
 function jumpToLocked(id = activeTabId.value) {
   const tab = tabs.value.find((t) => t.id === id);
-  if (!tab) return { ok: false, reason: "none" };
-  if (!tab.lockedPath) return { ok: false, reason: "unlocked" };
-  if (tab.lockedPath === tab.path) return { ok: false, reason: "same" };
-  setPath(tab, tab.lockedPath);
-  return { ok: true, path: tab.lockedPath };
+  const plan = planLockedJump({
+    tab,
+    targetTabId: id,
+    activeTabId: activeTabId.value,
+  });
+  if (plan.kind === LOCK_JUMP_NONE) return { ok: false, reason: "none" };
+  if (plan.kind === LOCK_JUMP_UNLOCKED) return { ok: false, reason: "unlocked" };
+  if (plan.kind === LOCK_JUMP_SAME) {
+    // Already sitting on the anchor: the directory doesn't change, but the
+    // panel may still be showing a different tab — then following it is the
+    // only visible difference this click can make.
+    if (plan.follow) switchTab(id);
+    return { ok: false, reason: "same" };
+  }
+  setPath(tab, plan.path);
+  if (plan.follow) switchTab(id);
+  return { ok: true, path: plan.path };
 }
 
 // ── Tab right-click menu ──
@@ -762,6 +784,10 @@ function handleTabMenuSelect(item) {
       if (root) {
         tab.search = null;
         setPath(tab, root);
+        // Same rule as「重新搜索」: the action landed on that tab, so the panel
+        // goes to that tab — otherwise jumping a background search tab looks
+        // like it did nothing (the panel keeps showing the other tab).
+        if (activeTabId.value !== id) activeTabId.value = id;
       }
       break;
     }
