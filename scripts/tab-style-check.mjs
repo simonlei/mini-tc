@@ -11,6 +11,13 @@
 //   ② `.tab.locked` 写在 `.tab.active` 之后且同优先级 → 「既当前又锁定」的
 //      标签页，底色被锁定规则覆盖掉，反而丢了当前页的高亮。
 //
+// ── 最终设计（2026-11-08 二轮：用户要求锁定只留标志）────────────────
+// 锁定与当前是**正交**状态，各走各的通道：
+//   · 当前页 = 强调色底 + 2px 实线强调色底边 + 标题加粗（唯一的高亮）；
+//   · 锁定页 = **不加任何样式**，只有 🔒 图标。图标本身就是完整信号，
+//     染色会被读成「被选中」，加下边框又会破坏标签栏的节奏。
+// 所以「锁定页底色 == 普通页底色」是一条硬判据，不是「差不多就行」。
+//
 // ── 为什么断言要落到「数值」上 ──────────────────────────────────────
 // 只断言「CSS 里存在 .tab.active 规则」是恒真的（谁都写得出来）。
 // 真正的判据是**用户能不能分辨**：当前页底色与锁定页底色的感知差异 ΔE
@@ -19,8 +26,10 @@
 //
 // ── 三层判据 ────────────────────────────────────────────────────────
 //   1. 前提：四套主题的变量都能解析；--tab-active 在每套主题下算出不透明色。
-//   2. 数值：当前页 vs 锁定页的 ΔE ≥ 12；当前页上的文字对比度 ≥ 4.5 (WCAG AA)。
-//   3. 静态：锁定态规则不得声明 background（根因①），且必须排除 .active（根因②）。
+//   2. 数值：当前页 vs 锁定页的 ΔE ≥ 12；当前页上的文字对比度 ≥ 4.5 (WCAG AA)；
+//      锁定页底色必须与普通页底色**完全相同**（锁定不做颜色特殊处理）。
+//   3. 静态：锁定态规则不得声明 background / border-bottom / color；
+//      🔒 图标必须由 tab.lockedPath 驱动（与是否当前无关）。
 //
 // 变异臂在 scripts/tab-style-mutation.mjs。
 
@@ -316,9 +325,9 @@ const lockedRules = tabRules.filter((r) => r.selector.includes(".tab.locked"));
 
 check("存在 .tab 基础规则", !!baseTabBody);
 check("存在 .tab.active 规则", !!activeBody);
-check("存在 .tab.locked 规则", lockedRules.length >= 1, [`实际 ${lockedRules.length} 条`]);
 
-// 锁定态底色：有 background 就用（那是 bug），否则继承 .tab 的底色
+// 锁定态底色：只有当某条 .tab.locked 规则真的声明了 background 才算「染色」。
+// 否则锁定页沿用 .tab 的底色 —— 与普通页完全一致（用户要的：锁定只加标志）。
 function lockedBackground(theme) {
   const td = themeData[theme];
   let bg = null;
@@ -335,6 +344,13 @@ function lockedBackground(theme) {
   return { color: c, tinted: false, from: ".tab" };
 }
 
+// 普通（未锁定）标签的底色
+function normalBackground(theme) {
+  const td = themeData[theme];
+  const v = decl(baseTabBody, "background");
+  return v ? resolveColor(v, td.vars) : null;
+}
+
 // 当前页底色
 function activeBackground(theme) {
   const td = themeData[theme];
@@ -347,6 +363,7 @@ for (const t of THEMES) {
   const td = themeData[t];
   const a = activeBackground(t);
   const l = lockedBackground(t);
+  const n = normalBackground(t);
   check(`${t}：当前页底色可解析`, !!a, [`实际：${JSON.stringify(a)}`]);
   check(`${t}：锁定页底色可解析`, !!l.color, [`实际：${JSON.stringify(l)}`]);
   if (!a || !l.color) continue;
@@ -362,6 +379,12 @@ for (const t of THEMES) {
     `${t}：当前页上的文字对比度 ≥ ${MIN_CONTRAST}`,
     cr >= MIN_CONTRAST,
     [`实际对比度=${cr.toFixed(2)}`]
+  );
+  // 锁定页必须与普通页**完全同色** —— 锁定只由 🔒 图标表达，不做颜色特殊处理。
+  check(
+    `${t}：锁定页底色与普通页底色完全相同（锁定只加标志，不特殊处理颜色）`,
+    n && Math.abs(l.color.r - n.r) < 0.5 && Math.abs(l.color.g - n.g) < 0.5 && Math.abs(l.color.b - n.b) < 0.5,
+    [`锁定页=${JSON.stringify(l.color)} 普通页=${JSON.stringify(n)}`]
   );
 }
 
@@ -382,10 +405,12 @@ for (const t of THEMES) {
   }
 }
 
-// ══════════════ 3. 静态断言：锁定态不得与当前态抢通道 ══════════════
+// ══════════════ 3. 静态断言：锁定态只由图标表达 ══════════════
 
-section("3. 静态断言：根因①（锁定态染底色）与根因②（锁定态盖住当前态）");
+section("3. 静态断言：锁定态不抢视觉通道（只留 🔒 图标）");
 
+// 锁定态可以没有 CSS 规则；如果有，也绝不能画任何东西（染底色＝看起来像被选中，
+// 加下边框＝破坏标签栏节奏）。两种情况都判「没有视觉处理」。
 for (const r of lockedRules) {
   check(
     `锁定态规则「${r.selector}」不声明 background（染底色＝看起来像被选中）`,
@@ -393,22 +418,48 @@ for (const r of lockedRules) {
     [`实际声明：${decl(r.body, "background")}`]
   );
   check(
-    `锁定态规则「${r.selector}」排除 .active（否则会盖掉当前页的高亮）`,
-    r.selector.includes(":not(.active)"),
-    [`实际选择器：${r.selector}`]
+    `锁定态规则「${r.selector}」不声明 border-bottom（锁定页不该有下边框）`,
+    !decl(r.body, "border-bottom"),
+    [`实际声明：${decl(r.body, "border-bottom")}`]
   );
-  const bb = decl(r.body, "border-bottom");
   check(
-    `锁定态规则「${r.selector}」的底边是虚线（与当前页的实线是两条不同通道）`,
-    !!bb && /dashed/i.test(bb),
-    [`实际：${bb}`]
+    `锁定态规则「${r.selector}」不声明 color / border（颜色不特殊处理）`,
+    !decl(r.body, "color") && !decl(r.body, "border"),
+    [`实际：color=${decl(r.body, "color")} border=${decl(r.body, "border")}`]
   );
 }
 
+// 🔒 图标必须在锁定页上出现，且与「当前页」无关（锁定和当前是正交状态）。
+// ⚠️ 断言读的是**剥掉注释后的模板**：否则注释里写一句
+// `v-if="tab.lockedPath"` 就能让断言自己判自己过（METHODOLOGY：静态断言自引用）。
+// ⚠️ stripComments 只认 JS 注释（// 与 /* */），**不认 HTML 注释** ——
+// 模板里的 <!-- --> 必须单独剥，否则注释文本同样会喂饱断言。
+const tmplClean = stripComments(tabbarSrc).replace(/<!--[\s\S]*?-->/g, "");
+const lockSpan = /<span[^>]*class="tab-lock"[^>]*>([^<]*)<\/span>/.exec(tmplClean);
+check("模板里有 🔒 锁图标（.tab-lock）", !!lockSpan, [`实际匹配：${lockSpan ? lockSpan[0] : "无"}`]);
+check("锁图标就是 🔒", !!lockSpan && lockSpan[1].includes("🔒"), [`实际内容：${lockSpan ? lockSpan[1] : "无"}`]);
+check(
+  "锁图标由 tab.lockedPath 驱动（与是否当前无关 —— 两个状态正交）",
+  /v-if="tab\.lockedPath"[^>]*class="tab-lock"|class="tab-lock"[^>]*v-if="tab\.lockedPath"/.test(tmplClean),
+  ["实际模板里 v-if 与 class 的绑定关系不符"]
+);
+check(
+  "锁定页不因「是当前页」而隐藏锁图标（当前页也要看得出锁着）",
+  !/v-if="tab\.lockedPath\s*&&\s*[^"]*active/i.test(tmplClean),
+  ["锁图标的 v-if 里掺进了 active 判断"]
+);
+
+// 当前页：唯一带强调底色 + 实线强调底边 + 加粗标题的状态
 const activeBorder = decl(activeBody, "border-bottom");
 check("当前页底边是实线强调色", !!activeBorder && /solid/i.test(activeBorder) && activeBorder.includes("var(--accent)"), [
   `实际：${activeBorder}`,
 ]);
+const activeNameBody = ruleBody(tabRules, ".tab.active .tab-name");
+check(
+  "当前页标题加粗（浅色主题下底色差异小，字重是第二重信号）",
+  !!activeNameBody && /font-weight\s*:\s*(600|700|bold)/i.test(activeNameBody),
+  [`实际：${activeNameBody}`]
+);
 check(
   "所有标签都预留了同样宽的透明底边（切换当前页时文字不抖 1px）",
   !!decl(baseTabBody, "border-bottom") && /2px\s+solid\s+transparent/i.test(decl(baseTabBody, "border-bottom")),

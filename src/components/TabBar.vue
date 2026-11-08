@@ -1,5 +1,7 @@
 <template>
   <div class="tab-bar">
+    <!-- `locked` is a state marker only: the lock glyph carries the whole
+         signal, so a locked tab gets no special background or underline. -->
     <div
       v-for="tab in tabs"
       :key="tab.id"
@@ -134,17 +136,12 @@ function onAuxClick(e, tabId) {
   font-weight: 600;
 }
 
-/* Locked tab: deliberately NOT a background tint.
-   A tinted background here reads as "selected" — the old mix() landed within
-   dE 9 of the active tab, so locked and current looked identical. The lock
-   glyph already carries the meaning; the underline is the second, quieter
-   channel, and it is dashed so it never reads as the active tab's solid bar.
-   The :not(.active) is load-bearing: without it this rule would also match
-   the locked current tab and the two signals would fight again. */
-.tab.locked:not(.active) {
-  border-bottom: 2px dashed var(--text-dim);
-}
-
+/* Locked tab: no styling at all.
+   "Locked" and "current" are orthogonal states, and the lock glyph already
+   says "locked" — so the tab keeps the normal background and gets no
+   underline. Painting anything here reads as "selected": the old tint was
+   within dE 9 of the active tab, and a dashed underline added a second line
+   that broke the tab strip's rhythm. The glyph is the whole signal. */
 .tab-lock {
   font-size: 10px;
   flex-shrink: 0;

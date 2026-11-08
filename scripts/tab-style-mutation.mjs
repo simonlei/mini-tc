@@ -33,31 +33,60 @@ const MUTANTS = [
   {
     target: TABBAR,
     name: "锁定态重新染底色（旧写法：color-mix 70%+12%，α=0.82）",
-    from: `.tab.locked:not(.active) {
-  border-bottom: 2px dashed var(--text-dim);
-}`,
+    from: `.tab-lock {
+  font-size: 10px;`,
     to: `.tab.locked {
   background: color-mix(in srgb, var(--tab-active) 70%, var(--accent) 12%);
-}`,
+}
+
+.tab-lock {
+  font-size: 10px;`,
   },
   {
     target: TABBAR,
     name: "锁定态染底色，但浓度很低（ΔE 仍然不够 —— 光看「有没有染」不够）",
-    from: `.tab.locked:not(.active) {
-  border-bottom: 2px dashed var(--text-dim);
-}`,
-    to: `.tab.locked:not(.active) {
-  background: color-mix(in srgb, var(--tab-active) 92%, var(--accent) 4%);
-  border-bottom: 2px dashed var(--text-dim);
-}`,
-  },
+    from: `.tab-lock {
+  font-size: 10px;`,
+    to: `.tab.locked {
+  background: color-mix(in srgb, var(--tab-active) 96%, var(--accent) 2%);
+}
 
-  // ── 根因②：锁定态盖住当前态（:not(.active) 去掉）──────────────
+.tab-lock {
+  font-size: 10px;`,
+  },
   {
     target: TABBAR,
-    name: "锁定态不再排除 .active（当前页被锁定态的高亮盖掉）",
-    from: ".tab.locked:not(.active) {",
-    to: ".tab.locked {",
+    name: "锁定态加回虚线下边框（用户明确要求：只留锁标志）",
+    from: `.tab-lock {
+  font-size: 10px;`,
+    to: `.tab.locked:not(.active) {
+  border-bottom: 2px dashed var(--text-dim);
+}
+
+.tab-lock {
+  font-size: 10px;`,
+  },
+
+  // ── 锁定信号本身被改坏 ───────────────────────────────────────────
+  {
+    target: TABBAR,
+    name: "锁图标不再是 🔒（锁定状态就完全没了信号）",
+    from: `<span v-if="tab.lockedPath" class="tab-lock" title="已锁定">🔒</span>`,
+    to: `<span v-if="tab.lockedPath" class="tab-lock" title="已锁定">★</span>`,
+  },
+  {
+    target: TABBAR,
+    name: "锁图标被 active 状态藏起来（当前页看不出锁着）",
+    from: `<span v-if="tab.lockedPath" class="tab-lock" title="已锁定">🔒</span>`,
+    to: `<span v-if="tab.lockedPath && tab.id !== activeTabId" class="tab-lock" title="已锁定">🔒</span>`,
+  },
+  {
+    // 自引用陷阱：断言原本读原始模板文本，注释里写一句就能骗过它。
+    target: TABBAR,
+    name: "把锁图标藏起来、却在注释里写上断言文本（自引用骗过断言）",
+    from: `<span v-if="tab.lockedPath" class="tab-lock" title="已锁定">🔒</span>`,
+    to: `<!-- <span v-if="tab.lockedPath" class="tab-lock" title="已锁定">🔒</span> -->
+      <span v-if="tab.lockedPath && tab.id !== activeTabId" class="tab-lock" title="已锁定">🔒</span>`,
   },
 
   // ── 当前页的高亮被削弱 ────────────────────────────────────────
@@ -81,6 +110,16 @@ const MUTANTS = [
 }`,
     to: `  background: var(--tab-active);
   border-bottom: 2px solid transparent;
+}`,
+  },
+  {
+    target: TABBAR,
+    name: "当前页标题不再加粗（浅色主题下少一重信号）",
+    from: `.tab.active .tab-name {
+  font-weight: 600;
+}`,
+    to: `.tab.active .tab-name {
+  font-weight: 400;
 }`,
   },
 
