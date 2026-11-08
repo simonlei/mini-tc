@@ -115,6 +115,8 @@ docx 预览是本项目唯一的内容注入面，按不可信输入处理（`sr
 
 **锁定。** `Ctrl+Shift+L` 把当前目录记为锁定锚点（再按一次解除），`Ctrl+Y` 跳回锚点。锁定不阻止目录切换。本应用没有实现 TC 的 `Ctrl+Num*` 严格锁定。已锁定的标签显示锁标记。右键菜单：锁定当前位置 / 回到锁定位置 / 以当前目录重新锁定 / 关闭此标签页。锚点随标签页写到 `~/.minitc/tabs-<panelId>.json`。
 
+**标签页的高亮分两条互不抢的通道。** 「当前页」与「已锁定」是两个正交状态，用户必须能一眼分开（2026-11-08 修：此前锁定页染了底色 `color-mix(in srgb, var(--tab-active) 70%, var(--accent) 12%)`，与当前页底色的 ΔE 只有 4.6~9.1，肉眼分不开；且 `.tab.locked` 写在 `.tab.active` 之后同优先级，「既当前又锁定」的标签页反被锁定规则盖掉底色）。现在：**当前页** = 强调色底（`--tab-active`，各主题按自己的 `--accent` 混 `--tab-bg` 30%）+ 2px 实线强调色底边 + 标题加粗；**锁定页** = 只留 2px 虚线 `--text-dim` 底边 + 锁图标，**不染底色**（染了就像被选中），选择器带 `:not(.active)` 以免盖掉当前页。所有标签都预留同样宽的透明底边，切换当前页时文字不会抖 1px。判据见 `scripts/tab-style-check.mjs`（按四套主题实算 ΔE 与对比度）+ `scripts/tab-style-mutation.mjs`。
+
 **跳回锁定位置会切到那个标签页。** 右键菜单里的动作落在**被右击的那个**标签页上，而一个面板一次只显示一个标签页 —— 所以跳一个后台标签页时，面板必须跟着切过去，否则目录变了而屏幕纹丝不动，用户看着就是「无效」（2026-11 修复）。判定在 `src/tabLock.js` 的 `planLockedJump`（纯逻辑，组件与测试共用一份）：它同时回答「跳不跳」和「面板要不要跟」。菜单里的「重新搜索」「跳到搜索根目录」同理。判据只认标签页 id 的身份，不认路径。
 
 **历史。** 每个标签页独立目录历史栈，随标签页持久化，重启后仍能往回走，每档上限 100 条。新导航截断前进分支。后退 / 前进回到某个目录时选中刚离开的那个文件夹。已删除的目录或已拔掉的盘会从栈里剔除并继续找，剔除了几个会弹 toast。地址栏上的前进后退按钮无历史可走时置灰，不隐藏。鼠标 XButton1 / XButton2 走同一套历史栈，仅活动面板响应。
@@ -293,6 +295,7 @@ npm test
 - `scripts/autoplay-gate.test.mjs` — `arm()` / `claim()`。`VideoPreview` 曾在 `ended` 时自己把 `pendingAutoplay` 置真，父组件拒绝换曲后标志永远悬着，此后手动点选任何视频都会自动播放。按路径校验拦不住。谁决定，谁置位。消费点必须在所有分支的共同入口，且在 `isExternalOnly` 提前 return 之前。`claim()` 无论命中与否都清空。`await entryPath(...)` 期间用户可能已关掉预览，撤销做在 `closePreview` 里的 `arm(null)`。
 - `scripts/sfc-check.mjs` — 把 `src/components/*.vue` 过一遍 `@vue/compiler-sfc` 的 `parse` + `compileScript`，挂在 `npm run check` 里、先于 `npm test`。其余套件把 `.vue` 当文本读，抓不到重复声明。`parse()` 不报重复声明，`compileScript` 才报。传给编译器的 `id` 用正斜杠。变异还原只写回内存里的原文，不要 `git checkout -- <file>`，那会把同一轮尚未提交的修复一起回滚。
 - `scripts/subtitle-gate-check.mjs` + `scripts/subtitle-gate-mutation.mjs` — `begin()` / `lands()`。字幕探测要串四次 await，旧链 resolve 时会把旧目录的字幕推进新文件的轨道列表。`detectSubtitles` 若在 `listDirectory` 之后才读文件名，dir 取自旧文件、base 取自新文件。快照必须在 await 之前取。这里可以用「意图身份」，因为字幕探测没有同 key 折叠；`loadGate` 有折叠，所以那边不能用序号。`begin()` 必须无条件调用，包括不探测字幕的分支。共享状态只在全部 await 之后一次性提交。
+- `scripts/tab-style-check.mjs` / `scripts/tab-style-mutation.mjs` — 标签页「当前页 vs 锁定页」的高亮判据。**纯视觉 bug 没有异常、没有报错，测试全绿和 bug 还在可以同时成立** → 判据必须落到「用户能不能分辨」：脚本解析 `style.css` 的四套主题变量 + `TabBar.vue` 的真实规则，把 `color-mix()` 按 CSS Color 5 的规范真算一遍（百分比不足 100% 时 alpha 要乘 `1 - leftover`），再算当前页与锁定页底色的 CIE76 ΔE（阈值 12，≈2.3 才是「刚好可辨」）与当前页上的文字对比度（阈值 4.5，WCAG AA）。静态断言另外钉住：锁定态规则不得声明 `background`（染底色＝看起来像被选中）、必须带 `:not(.active)`（否则盖掉当前页）、底边是虚线（与当前页的实线分属两条通道）。变异臂 7 个全部必须被抓 —— 包括「染了但浓度很低」这种光看「有没有染」抓不到的退化。
 - `scripts/preview-request.test.mjs` — 打开预览的入口守卫。四个入口都要先 `await entryPath(...)`。`showFilePreview` 若在 await 之后才读 `activePanel`，期间按 Tab 会把预览挂到已经离开的那一侧。快照记源面板、活动面板、目录、条目身份，四项全等才落地。空快照必须判为不可落地。纯逻辑断言抓不住「删掉守卫调用」，所以额外数调用点。
 - `scripts/keyboard-text-check.mjs` — `classifySelectAll` 与 `selectAllPreviewText`。带对照臂：旧守卫（只判 `INPUT`）必须露馅。
 - `scripts/ime-guard-check.mjs` — `isImeKeydown`。对照臂钉住去掉守卫后 18 个 `list.*` 绑定会被认领。静态断言守卫早于第一个 `matches()`。jsdom 不实现 `isContentEditable`，脚本显式补种。

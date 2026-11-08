@@ -108,6 +108,9 @@ function onAuxClick(e, tabId) {
   cursor: pointer;
   white-space: nowrap;
   border-right: 1px solid var(--border);
+  /* Every tab reserves the same 2px bottom border, so switching the active
+     tab (which paints that border) never shifts the label by a pixel. */
+  border-bottom: 2px solid transparent;
   background: var(--tab-bg);
   font-size: 12px;
   transition: background 0.15s;
@@ -119,19 +122,27 @@ function onAuxClick(e, tabId) {
   background: var(--tab-hover);
 }
 
+/* Current tab: the one and only "you are here" signal.
+   Background carries the accent tint, the 2px underline doubles it, and the
+   bold label makes it readable even where the tint is subtle (latte theme). */
 .tab.active {
   background: var(--tab-active);
   border-bottom: 2px solid var(--accent);
 }
 
-/* Locked tab: the lock glyph carries the meaning, this only tints the tab so
-   the locked one is findable when several tabs are open. */
-.tab.locked {
-  background: color-mix(in srgb, var(--tab-active) 70%, var(--accent) 12%);
+.tab.active .tab-name {
+  font-weight: 600;
 }
 
-.tab.locked.active {
-  border-bottom-color: var(--accent);
+/* Locked tab: deliberately NOT a background tint.
+   A tinted background here reads as "selected" — the old mix() landed within
+   dE 9 of the active tab, so locked and current looked identical. The lock
+   glyph already carries the meaning; the underline is the second, quieter
+   channel, and it is dashed so it never reads as the active tab's solid bar.
+   The :not(.active) is load-bearing: without it this rule would also match
+   the locked current tab and the two signals would fight again. */
+.tab.locked:not(.active) {
+  border-bottom: 2px dashed var(--text-dim);
 }
 
 .tab-lock {

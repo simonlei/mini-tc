@@ -4,7 +4,10 @@
   --bg: #1a1a1d;
   --panel-bg: #202023;
   --tab-bg: #161618;
-  --tab-active: #2a2a30;
+  /* 当前标签页的底色：跟随本主题的强调色。
+     写在 :root 上、各主题只覆盖 --accent/--tab-bg —— 变量替换发生在
+     html 元素上，所以每个主题拿到的都是自己那份 accent。 */
+  --tab-active: color-mix(in srgb, var(--accent) 30%, var(--tab-bg));
   --tab-hover: #252528;
   --text: #d4d4d8;
   --text-dim: #888;
@@ -26,7 +29,6 @@
   --bg: #0d1117;
   --panel-bg: #161b22;
   --tab-bg: #0d1117;
-  --tab-active: #1c2433;
   --tab-hover: #121820;
   --text: #c9d1d9;
   --text-dim: #8b949e;
@@ -48,7 +50,6 @@
   --bg: #f5f0e8;
   --panel-bg: #fffdf7;
   --tab-bg: #ede6d6;
-  --tab-active: #fffdf7;
   --tab-hover: #f0ebe0;
   --text: #3d3226;
   --text-dim: #8c7b65;
@@ -70,7 +71,6 @@
   --bg: #1a2321;
   --panel-bg: #1f2b27;
   --tab-bg: #141c19;
-  --tab-active: #25332e;
   --tab-hover: #1a2421;
   --text: #d4e0d8;
   --text-dim: #7a9a88;
