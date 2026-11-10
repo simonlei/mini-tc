@@ -2311,9 +2311,48 @@ defineExpose({
   border: 1px solid var(--border);
   overflow: hidden;
   position: relative;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
+/* ── 焦点栏的视觉信号 ────────────────────────────────────────────────
+   用户第一眼要能看出「键盘输入现在落在哪一栏」。旧实现只有
+   `border-color: var(--accent)` —— 1px 蓝边贴在深色底上，四套主题里
+   有三套几乎分辨不出来。现在拆成三条互相独立的通道：
+
+     ① 描边：outline 画在边框内侧（offset: -1px），不占布局，
+        切换焦点时内容不会抖 1px；加上强调色边框共 2px 视觉厚度。
+     ② 底色：面板底色往强调色偏一点 —— 面积最大的通道，
+        整片文件列表区都带着这个色偏。
+     ③ 路径栏：整条染成强调色底 + 实线强调色下边，
+        让「这一栏的身份行」自己发亮。
+
+   配色全部来自 --accent，四套主题自动跟随（浓度在各主题里调过）。 */
 .file-panel.active {
+  border-color: var(--accent);
+  background: var(--panel-active-bg);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* 非焦点栏：边框压暗、底色保持纯净，和焦点栏拉开距离。
+   注意这里**不**用 opacity/filter 去压暗内容 —— 那会连带降低文字
+   对比度，把「一眼看出焦点」换成「另一栏看不清字」。 */
+.file-panel:not(.active) {
+  border-color: var(--panel-idle-border);
+  background: var(--panel-bg);
+}
+
+/* 焦点栏的路径栏：染成强调色底 + 实线强调色下边。 */
+.file-panel.active :deep(.path-bar) {
+  background: var(--panel-active-header-bg);
+  border-bottom-color: var(--accent);
+}
+
+/* 面包屑自己带底色（--bg），所以得单独染 —— 否则整条路径栏只有按钮
+   之间的几条缝发亮，等于没信号。搜索结果页那个占位框同理。 */
+.file-panel.active :deep(.breadcrumb),
+.file-panel.active :deep(.virtual-display) {
+  background: var(--panel-active-header-bg);
   border-color: var(--accent);
 }
 

@@ -18,6 +18,19 @@
   --hover: #2a2a30;
   --selected: #1a3a6e;
   --selected-text: #e0e0e0;
+  /* ── 焦点栏（当前接收键盘输入的那一栏）的视觉信号 ──────────────────
+     旧实现只有 `.file-panel.active { border-color: var(--accent) }`：
+     1px 蓝边贴在深色底上，在石墨/墨竹这类低对比主题里几乎看不出来，
+     用户分不清焦点在左栏还是右栏。现在拆成三条通道，任何一套主题下
+     都不会只剩一个不明显的信号：
+       ① 描边（outline，强调色，2px 视觉厚度）
+       ② 面板底色往强调色偏（面积最大的通道）
+       ③ 路径栏染成强调色底 + 实线强调色下边
+     各主题给各自一份 —— 浅色主题要更浓一点才看得出差别。 */
+  --panel-active-bg: color-mix(in srgb, var(--accent) 12%, var(--panel-bg));
+  --panel-active-header-bg: color-mix(in srgb, var(--accent) 22%, var(--header-bg));
+  /* 未获得焦点的那一栏：边框压暗，和焦点栏拉开距离。 */
+  --panel-idle-border: color-mix(in srgb, var(--border) 55%, var(--bg));
   --header-bg: #121214;
   --row-hover: #26262b;
   --danger: #f44747;
@@ -39,6 +52,9 @@
   --hover: #1c2433;
   --selected: #13233a;
   --selected-text: #e6edf3;
+  --panel-active-bg: color-mix(in srgb, var(--accent) 14%, var(--panel-bg));
+  --panel-active-header-bg: color-mix(in srgb, var(--accent) 26%, var(--header-bg));
+  --panel-idle-border: color-mix(in srgb, var(--border) 55%, var(--bg));
   --header-bg: #0d1117;
   --row-hover: #1a212e;
   --danger: #f85149;
@@ -60,6 +76,9 @@
   --hover: #f0ebe0;
   --selected: #e8d5b0;
   --selected-text: #3d3226;
+  --panel-active-bg: color-mix(in srgb, var(--accent) 14%, var(--panel-bg));
+  --panel-active-header-bg: color-mix(in srgb, var(--accent) 30%, var(--header-bg));
+  --panel-idle-border: color-mix(in srgb, var(--border) 70%, var(--bg));
   --header-bg: #ede6d6;
   --row-hover: #f5efe2;
   --danger: #c0392b;
@@ -81,6 +100,9 @@
   --hover: #26352e;
   --selected: #1a3d2c;
   --selected-text: #e0f0e4;
+  --panel-active-bg: color-mix(in srgb, var(--accent) 14%, var(--panel-bg));
+  --panel-active-header-bg: color-mix(in srgb, var(--accent) 26%, var(--header-bg));
+  --panel-idle-border: color-mix(in srgb, var(--border) 55%, var(--bg));
   --header-bg: #121916;
   --row-hover: #233028;
   --danger: #e0554a;
