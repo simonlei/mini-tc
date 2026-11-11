@@ -8,6 +8,7 @@
       @close-tab="closeTab"
       @add-tab="addTab"
       @tab-menu="onTabMenu"
+      @reorder-tab="reorderTab"
     />
 
     <!-- Path bar. A search-results tab has no real path, so it gets a
@@ -110,6 +111,7 @@ import { loadLands, createSpinner } from "../loadGate.js";
 import { createCtxGate } from "../ctxMenuGate.js";
 import { makeDeleteScope, deleteScopeLands, remainingAfterDelete } from "../deleteScope.js";
 import { planLockedJump, LOCK_JUMP_NONE, LOCK_JUMP_UNLOCKED, LOCK_JUMP_SAME } from "../tabLock.js";
+import { reorderTabs, sameTabOrder } from "../tabDrag.js";
 import { cancelSearch, startSearch } from "../api.js";
 import { formatBytes } from "../format.js";
 import {
@@ -659,6 +661,33 @@ function switchTab(id) {
   // that is already active (the lock jump's "follow" step).
   if (activeTabId.value !== id) pendingSelectName.value = null;
   activeTabId.value = id;
+  return true;
+}
+
+// ── Tab reorder (drag a tab to a new position) ──
+//
+// The decision ("where does this tab go?") lives in src/tabDrag.js so the
+// component and the tests share one implementation — a copy inside the test
+// would test the copy.
+//
+// Three things must NOT change when a tab moves:
+//   · which tab is active (the panel keeps showing the same directory — a
+//     reorder is a rearrangement, not a navigation);
+//   · the tab objects themselves (paths, sort order, lock anchors, history);
+//   · the tab count (a drag that duplicated a tab would be a data bug).
+//
+// The new order persists for free: saveState() writes tabs.value in array
+// order, and the deep watcher below turns the reorder into a scheduleSave().
+function reorderTab({ tabId, toIndex } = {}) {
+  const before = tabs.value;
+  const next = reorderTabs(before, tabId, toIndex);
+  // Dropping a tab back where it came from changes nothing — don't touch the
+  // array (and don't write the config) in that case.
+  if (sameTabOrder(before, next)) return false;
+  // Splice in place instead of `tabs.value = next`: keeps the same reactive
+  // array *and* the same tab objects, so the active tab keeps pointing at the
+  // very same object.
+  tabs.value.splice(0, tabs.value.length, ...next);
   return true;
 }
 

@@ -114,6 +114,16 @@ docx 预览是本项目唯一的内容注入面，按不可信输入处理（`sr
 
 **多标签。** `Ctrl+T` 在当前活动面板按当前目录新开标签，`Ctrl+W` 关闭当前标签（仅剩一个时无操作），`Ctrl+Tab` / `Ctrl+Shift+Tab` 在该面板的标签之间环绕。四者在地址栏和过滤框里同样生效，执行后焦点交回文件列表。轮换成功时 toast 报出落点路径；只有一个标签时静默。左右栏互不影响。
 
+**拖动标签页改顺序。** 顺序以前只能靠「关掉重开」来改，现在按住标签页就能拖。走 **Pointer Events** 而不是 HTML5 拖放：`dragDropEnabled` 为 `true`，应用内文件拖放已经改走 `tauri://drag-*` + `elementFromPoint` + 原生 `startNativeDrag`，HTML5 的 `dragover` / `drop` 通道已被弃用。起手 `pointerdown`（跳过关闭按钮与非左键），横向位移超过 `TAB_DRAG_START_THRESHOLD`（4px）才算拖动 —— 阈值太小会吃掉普通点击；随后 `setPointerCapture` 抓住指针，`pointermove` / `pointerup` / `pointercancel` 挂在 `window` 上。
+
+落点判定在 `src/tabDrag.js`（纯逻辑，plain node 可加载，组件与测试共用一份）。`planDropIndex` 回答「指针该插到哪」：先把被拖的那个自己从候选里剔掉，指针落在某个标签页的**左半边 → 插到它前面**，**右半边（含中线）→ 插到它后面**；下标统一是「去掉被拖的那个之后」的列表下标。中线归右半边，往右多动一点点就已经越过它。`reorderTabs` 负责搬动数组（先移除被拖的，再按目标下标插入），`sameTabOrder` 判「顺序没变就别动数组」。
+
+视图层在 `TabBar.vue`：`draggingId` / `dropIndex` / `dropMarker` 三项进响应式（渲染要用），**DOM 元素和拖动态放普通变量** —— 塞进 `reactive()` 会让 `getBoundingClientRect()` 的 `this` 变成 Proxy，抛 Illegal invocation。指示线用 `box-shadow: inset` 而不是 `border`，不撑宽标签页，切换时文字不抖 1px。
+
+落点在 `FilePanel.vue` 的 `reorderTab`：**重排不是导航** —— 活动标签页不变（不碰 `activeTabId`）、标签页对象是同一批（不复制）、数量不变；用 `tabs.value.splice(...)` 就地改数组而不是替换 `tabs.value`。持久化不用加代码：`saveState()` 按 `tabs.value` 顺序落盘，deep watcher → `scheduleSave()` 会在重排后自动写盘。
+
+拖动结束后浏览器补的那个 `click` 是拖动余波，不能当「切换标签页」，否则松手会顺带跳到别的目录。用 `suppressClick` 标记吃掉它，在**下一次 `pointerdown`** 时作废（新一轮手势不被上一轮连累）。判据见 `scripts/tab-drag-check.mjs`（81 项：纯逻辑真值表 / 退化实现对照臂 / jsdom 端到端真拖 / 静态断言）+ `scripts/tab-drag-mutation.mjs`（14 个变异全部被抓到，含「中线归左」「永远插到最前」「复制标签页而非搬动」「拖完 click 不抑制」等）。
+
 **锁定。** `Ctrl+Shift+L` 把当前目录记为锁定锚点（再按一次解除），`Ctrl+Y` 跳回锚点。锁定不阻止目录切换。本应用没有实现 TC 的 `Ctrl+Num*` 严格锁定。已锁定的标签显示锁标记。右键菜单：锁定当前位置 / 回到锁定位置 / 以当前目录重新锁定 / 关闭此标签页。锚点随标签页写到 `~/.minitc/tabs-<panelId>.json`。
 
 **标签页的高亮只有当前页一条通道。** 「当前页」与「已锁定」是两个正交状态（2026-11-08 修：此前锁定页染了底色 `color-mix(in srgb, var(--tab-active) 70%, var(--accent) 12%)`，与当前页底色的 ΔE 只有 4.6~9.1，肉眼分不开；且 `.tab.locked` 写在 `.tab.active` 之后同优先级，「既当前又锁定」的标签页反被锁定规则盖掉底色）。现在：**当前页** = 强调色底（`--tab-active`，各主题按自己的 `--accent` 混 `--tab-bg` 30%）+ 2px 实线强调色底边 + 标题加粗 —— 全应用只有当前页带高亮。**锁定页不加任何样式**，只有 🔒 图标：染色会被读成「被选中」，加下边框又破坏标签栏的节奏（初版试过虚线底边，不协调，已撤）。锁定与当前正交，所以当前页照样显示锁图标。所有标签都预留同样宽的透明底边，切换当前页时文字不会抖 1px。判据见 `scripts/tab-style-check.mjs`（按四套主题实算 ΔE 与对比度，并断言锁定页底色与普通页**完全相同**）+ `scripts/tab-style-mutation.mjs`。
@@ -297,6 +307,7 @@ npm test
 - `scripts/sfc-check.mjs` — 把 `src/components/*.vue` 过一遍 `@vue/compiler-sfc` 的 `parse` + `compileScript`，挂在 `npm run check` 里、先于 `npm test`。其余套件把 `.vue` 当文本读，抓不到重复声明。`parse()` 不报重复声明，`compileScript` 才报。传给编译器的 `id` 用正斜杠。变异还原只写回内存里的原文，不要 `git checkout -- <file>`，那会把同一轮尚未提交的修复一起回滚。
 - `scripts/subtitle-gate-check.mjs` + `scripts/subtitle-gate-mutation.mjs` — `begin()` / `lands()`。字幕探测要串四次 await，旧链 resolve 时会把旧目录的字幕推进新文件的轨道列表。`detectSubtitles` 若在 `listDirectory` 之后才读文件名，dir 取自旧文件、base 取自新文件。快照必须在 await 之前取。这里可以用「意图身份」，因为字幕探测没有同 key 折叠；`loadGate` 有折叠，所以那边不能用序号。`begin()` 必须无条件调用，包括不探测字幕的分支。共享状态只在全部 await 之后一次性提交。
 - `scripts/tab-style-check.mjs` / `scripts/tab-style-mutation.mjs` — 标签页「当前页 vs 锁定页」的高亮判据。**纯视觉 bug 没有异常、没有报错，测试全绿和 bug 还在可以同时成立** → 判据必须落到「用户能不能分辨」：脚本解析 `style.css` 的四套主题变量 + `TabBar.vue` 的真实规则，把 `color-mix()` 按 CSS Color 5 的规范真算一遍（百分比不足 100% 时 alpha 要乘 `1 - leftover`），再算当前页与锁定页底色的 CIE76 ΔE（阈值 12，≈2.3 才是「刚好可辨」）与当前页上的文字对比度（阈值 4.5，WCAG AA）。静态断言另外钉住：锁定态规则不得声明 `background`（染底色＝看起来像被选中）、必须带 `:not(.active)`（否则盖掉当前页）、底边是虚线（与当前页的实线分属两条通道）。变异臂 7 个全部必须被抓 —— 包括「染了但浓度很低」这种光看「有没有染」抓不到的退化。
+- `scripts/tab-drag-check.mjs` / `scripts/tab-drag-mutation.mjs` — 标签页拖动排序的判据与变异。**落点判定必须与被拖的那个自己无关**：候选矩形里要先剔掉它，否则下标整体错位；中线归左半边会让「刚好拖到中间」插到目标前面。变异臂 14 个（改阈值语义、漏排除被拖者、永远插最前/最后、忘了从原位移除、上界差一、复制标签页而非搬动、拖完 click 不抑制、指示线算错标签页、凭空多复制一个标签页）全部必须被抓。**恒绿陷阱**：断言「路径多重集不变」而不是「路径顺序不变」是恒真的 —— 那样抓不住「复制标签页」；jsdom 建模必须派发完整手势 `pointerdown → pointerup → click`，只派 `click` 会让上一轮拖动留下的 `suppressClick` 把这次点击吞掉，看起来像「点击失灵」。
 - `scripts/preview-request.test.mjs` — 打开预览的入口守卫。四个入口都要先 `await entryPath(...)`。`showFilePreview` 若在 await 之后才读 `activePanel`，期间按 Tab 会把预览挂到已经离开的那一侧。快照记源面板、活动面板、目录、条目身份，四项全等才落地。空快照必须判为不可落地。纯逻辑断言抓不住「删掉守卫调用」，所以额外数调用点。
 - `scripts/keyboard-text-check.mjs` — `classifySelectAll` 与 `selectAllPreviewText`。带对照臂：旧守卫（只判 `INPUT`）必须露馅。
 - `scripts/ime-guard-check.mjs` — `isImeKeydown`。对照臂钉住去掉守卫后 18 个 `list.*` 绑定会被认领。静态断言守卫早于第一个 `matches()`。jsdom 不实现 `isContentEditable`，脚本显式补种。
