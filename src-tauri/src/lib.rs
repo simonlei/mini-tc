@@ -9,6 +9,7 @@ mod atomic_file;
 mod dedup;
 mod imagemeta;
 mod search_log;
+mod videometa;
 mod window_state;
 
 use atomic_file::create_new_file;
@@ -444,9 +445,10 @@ fn get_dir_size(path: String) -> Result<u64, String> {
     dir_size(dir_path).map_err(|e| format!("Failed to calculate directory size: {}", e))
 }
 
-/// 属性窗口要展示的**文件系统**信息 + 图像元数据。
+/// 属性窗口要展示的**文件系统**信息 + 图像 / 视频元数据。
 ///
-/// 图像元数据放在 `image` 里，不是图像（或读不出来）时为 `None` —— 属性窗口
+/// 图像元数据放在 `image` 里，视频元数据放在 `video` 里：不是图像（或读不
+/// 出来）时 `image` 为 `None`，不是视频时 `video` 为 `None` —— 属性窗口
 /// 对任何文件都要能开，不能因为「这不是图片」就报错。
 #[derive(Serialize)]
 pub struct FileProperties {
@@ -463,9 +465,12 @@ pub struct FileProperties {
     pub system: bool,
     pub archive: bool,
     pub image: Option<imagemeta::ImageMeta>,
+    /// 视频元数据（时长 / 分辨率 / 编码 / 标签 / GPS）。
+    pub video: Option<videometa::VideoMeta>,
 }
 
-/// 读取一个文件的属性：大小、时间戳、属性标记，以及图像的尺寸 / EXIF / GPS。
+/// 读取一个文件的属性：大小、时间戳、属性标记，以及图像的尺寸 / EXIF / GPS
+/// 与视频的时长 / 分辨率 / 编码。
 ///
 /// 这条命令刻意**不返回错误**给「解析不出 EXIF」这类情况：解析失败只是少几行
 /// 信息。只有 stat 不到文件才算失败。
@@ -495,6 +500,7 @@ fn read_file_properties(path: String) -> Result<FileProperties, String> {
         system,
         archive,
         image: imagemeta::probe(p),
+        video: videometa::probe(p),
     })
 }
 

@@ -66,3 +66,50 @@ export function formatBytes(bytes, empty = "0 B") {
   const v = i === 0 ? String(bytes) : (bytes / Math.pow(STEP, i)).toFixed(1);
   return v + " " + UNITS[i];
 }
+
+// ── 时长与码率 ──
+//
+// 和 formatBytes 同理：这两件事在项目里**也只有一份实现**。时长原先写在
+// VideoPreview.vue 的 fmtTime 里，属性窗口要显示视频时长时如果再抄一份，
+// 两处迟早会漂（`mm:ss` 还是 `h:mm:ss`、小时位补不补零）。所以把语义原样
+// 搬到这里，让 VideoPreview 也改成从这里取 —— 行为逐字不变，只是搬了家。
+
+/// Format a duration in seconds as `mm:ss`, or `h:mm:ss` past an hour.
+///
+/// The semantics are the ones `VideoPreview.vue`'s `fmtTime` had: anything
+/// that isn't a finite non-negative number is treated as 0, and the hour
+/// field is dropped entirely below one hour (`mm:ss`), so a 90-second clip
+/// reads "01:30" and a two-hour one reads "2:00:00".
+export function formatDuration(seconds) {
+  let s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = String(m).padStart(2, "0");
+  const ss = String(sec).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// Bit rates are decimal (kbps = 1000 bps), not binary — the same convention
+// the containers themselves use, so the number matches what a camera or an
+// encoder reports.
+const BITRATE_UNITS = ["bps", "kbps", "Mbps", "Gbps", "Tbps"];
+
+/// Format a bit rate in bit/s. `empty` is returned for anything that isn't a
+/// finite positive number.
+export function formatBitrate(bitsPerSecond, empty = "—") {
+  if (!Number.isFinite(bitsPerSecond) || bitsPerSecond <= 0) return empty;
+
+  let v = bitsPerSecond;
+  let i = 0;
+  while (v >= 1000 && i < BITRATE_UNITS.length - 1) {
+    v /= 1000;
+    i++;
+  }
+  // Below 1000 bps the value IS the bit rate, so don't dress it up as "8.0 bps".
+  const text = i === 0 ? String(Math.round(v)) : v.toFixed(1);
+  return `${text} ${BITRATE_UNITS[i]}`;
+}
+

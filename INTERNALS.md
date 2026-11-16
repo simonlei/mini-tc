@@ -13,6 +13,7 @@
 - [重复文件](#重复文件)
 - [删除与撤销](#删除与撤销)
 - [批量重命名](#批量重命名)
+- [文件属性与视频元数据](#文件属性与视频元数据)
 - [配置落盘与窗口几何](#配置落盘与窗口几何)
 - [开发环境](#开发环境)
 - [前端测试](#前端测试)
@@ -234,6 +235,30 @@ Windows 上把文件送进回收站是一次跨卷移动。后端每删一个文
 
 后端复用 `rename_file`。规则与执行顺序是纯函数（`src/renameRules.js` / `src/renameRunner.js`）。执行期间规则区是 `<fieldset disabled>`。回传给面板的新旧名对照取自执行时的计划快照。回滚过的批次不回传对照。搜索结果标签页里改完名就地更新那一行。
 
+## 文件属性与视频元数据
+
+「文件属性」窗口（`Ctrl+Enter` / `Alt+Enter` / 右键「属性…」）的元数据在后端一次读完，前端只负责摆出来。后端命令 `read_file_properties` 返回 `FileProperties`，除文件系统信息外还有两块可选元数据：`image`（`Option<ImageMeta>`）与 `video`（`Option<VideoMeta>`）。
+
+**图像**（`src-tauri/src/imagemeta.rs`）按文件头判定格式，逐个解 JPEG / PNG / WebP / GIF / BMP / TIFF / HEIC / AVIF，读出尺寸、色彩类型、位深、方向，以及 EXIF（含 GPS）。
+
+**视频**（`src-tauri/src/videometa.rs`）是同一套思路：不引第三方 crate，按文件头分流到四套解析器 —— ISO BMFF（MP4 / MOV / M4V / 3GP）、Matroska / WebM（EBML）、AVI（RIFF）、FLV（AMF0）。读出容器格式、时长、分辨率、帧率、视频 / 音频编码、声道、采样率、平均码率、创建时间，外加容器自带的标签（iTunes `©xxx`、QuickTime `com.apple.quicktime.*`、`meta/keys` 自定义键）与内嵌的完整 EXIF / XMP。
+
+三个判定是这套东西的骨架：
+
+- **按文件头，不按扩展名。** 扩展名可以随便改，文件头不会骗人。
+- **必须真的有视频轨才认领。** `.m4a` 也是 ISO BMFF，纯音频文件不认 —— 否则属性窗口会给一个音乐文件显示「视频信息」。HEIC / AVIF 走的是同一套 box 结构，但它们是**图像**，brand 命中就直接返回 `None`。
+- **解析失败只少几行，不报错。** 所有字段都是 `Option`，读不出来就是 `None`，窗口里那一行不显示。属性窗口对任何文件都要能打开。
+
+显示尺寸取 `tkhd` 而不是 `stsd`：竖屏视频的 `tkhd` 已经按旋转矩阵交换过宽高，和资源管理器显示的一致；`stsd` 给的是编码尺寸，只作兜底。
+
+平均码率是「文件大小 ÷ 时长」，即整个文件的平均码率（含容器开销与音视频轨之和）—— 容器里通常没有可靠的轨道级码率。
+
+**前端。** `FilePropertiesDialog.vue` 按「基本信息 / 图像信息 / 视频信息 / GPS / EXIF / 视频标签」六个区块渲染。GPS 同时服务图片与视频（`image.gps || video.gps`）：照片的 GPS 来自 EXIF，手机录的视频的 GPS 来自容器的 ISO 6709 位置串或 XMP。
+
+**格式化的唯一实现。** 时长与码率的格式化原本是 `VideoPreview.vue` 里的本地 `fmtTime`。属性窗口也要显示时长，再抄一份就会出现「同一个视频，预览里 01:30、属性里 1:30」这种漂移 —— 与当初 `formatBytes` 有 8 份副本是同一类问题。所以把语义原样搬进 `src/format.js`（`formatDuration` / `formatBitrate`），两个调用点都从那里取。码率按十进制换算（1 kbps = 1000 bps），与容器自己的口径一致。
+
+测试见 `scripts/file-properties-check.mjs`（跨文件接缝 + 18 个变异臂）与 `scripts/format-duration-check.mjs`（纯函数表 + 对照臂 + 8 个变异臂）。
+
 ## 配置落盘与窗口几何
 
 **窗口几何**存在 `~/.minitc/window-state.json`（dev 模式为 `window-state-dev.json`），由 `src-tauri/src/window_state.rs` 在 `setup` 阶段读写，前端不参与。`tauri.conf.json` 里窗口 `visible: false`，几何套用完才 `show()`。最大化 / 全屏 / 最小化时读到的几何不可信（全屏等于整块屏幕，最小化时 Windows 给 `-32000`），这些状态下只更新标志位。外接显示器拔掉后，若整条标题栏不在工作区内，回退到居中。`ScaleFactorChanged` 一并采样。`Moved` / `Resized` 只保留最后一次几何，后台线程每 400ms 落盘，关闭时再强制同步一次。
@@ -317,6 +342,8 @@ npm test
 - `scripts/config-writer-check.mjs` — 同 name 的写入 FIFO。后端 Mutex 解决不了顺序，变异去掉锁后「并发写不产生拼接文件」仍然全绿，因为 `write_atomic` 已经保证每次写完整。乱序测试的延迟若随 body 变长，短的会先完成，反例根本没发生。要先断言「无串行化确实会落地过期值」。
 - `scripts/preview-extensions-check.mjs` / `preview-extensions-mutation.mjs` — 五种预览类型的后缀映射。纯函数表钉住默认值、`""` 无后缀哨兵、旧配置迁移、`serialize → parse` 往返；静态断言钉住四个消费点确实都调 `previewKindOf()` 且没有本地副本（否则纯函数全绿也挡不住「调用点没接上」）。11 个变异分别去掉跨类型冲突守卫、去重、首个命中优先、哨兵等，必须全部被抓。
 - `scripts/format-size-check.mjs` — 体积格式化曾经有 8 份副本。2 TB 在预览里显示 `2.0 undefined`，在列表里显示 `2.0 TB`。索引要双向钳制（小于 1 字节时 `log < 0`）。`Number.isFinite` 与 `<= 0` 要在取对数之前。静态断言要先剥注释，否则文档里的 `Math.log` 会让断言自己判自己过。
+- `scripts/format-duration-check.mjs` — 时长 / 码率的格式化。语义原样从 `VideoPreview.vue` 的本地 `fmtTime` 搬进 `src/format.js`，搬动的风险是**行为悄悄变了**（小时位没了、负数不再归零、码率按 1024 换算），而这类改动编译得过、屏幕上也不报错。所以对照臂把旧 `fmtTime` 逐字复刻下来，23 个输入逐一比对（含 `undefined` / `null` / `NaN` / `Infinity` / 负数 / 字符串）。静态断言盯住两个调用点都从 `format.js` 导入、且没把本地实现粘回来 —— 判据不能是「没有 `padStart`」，属性窗口自己的 `formatDate` 合法地用了它，要抓的是时长那套（自己算 `3600` 小时位、`/ 60` 分钟位）。8 个变异臂（含「把本地 `fmtTime` 粘回来」）必须全部被抓。
+- `scripts/file-properties-check.mjs` — 属性窗口的跨文件接缝。视频元数据那条链有五环（后端探测 → `FileProperties.video` → IPC → 窗口渲染 → 兜底文案），断掉任何一环的症状都是「窗口里看不到视频信息」，用户分不清是接线断了还是真没数据。**恒绿陷阱有三处**：① `mod videometa;` 被注释掉后正则照样匹配 —— `lib.rs` 要剥注释，且断言认行首；② `includes("视频信息")` 会被兜底区块的标题「图像 / 视频信息」满足，模板里的 HTML 注释也要剥 —— 判据得精确到 `<div class="block-title">视频信息</div>`；③ 「文件里出现过 `info.value?.video`」会被 GPS 那行满足，判据必须只看 `video` 的 computed 那一行。18 个变异臂。
 - `scripts/node-pick-check.mjs` — `pick-node.js` 的版本决策。`realIo()` 漏掉 `readFile` 时，`engines` 被空 `catch` 吞掉，测试仍全绿。要故意把 `engines.node` 改成一个违反约束的版本。`console.error` 改成 `console.log` 的变异，在本机没有告警可发时也是恒绿，所以改成真跑 CLI 并检查 stdout 恰好一行。
 - `scripts/docx-sanitize-check.mjs` — 见上文 [docx 与 CSP](#docx-与-csp)。对照臂要求旧黑名单至少漏掉 3 个（实测 17/33）。断言解析回 DOM 查属性，不比对输出字符串。
 
@@ -329,7 +356,13 @@ cargo test --lib
 cargo test --lib overwrite_tests
 ```
 
-覆盖 `glob_match`、`executable_kind` / `has_pe_header` / `script_has_command`、窗口几何 `resolve`、地址栏 `%VAR%` 展开、文件覆盖策略、原子替换、配置落盘、递归守卫。
+覆盖 `glob_match`、`executable_kind` / `has_pe_header` / `script_has_command`、窗口几何 `resolve`、地址栏 `%VAR%` 展开、文件覆盖策略、原子替换、配置落盘、递归守卫，以及视频元数据探测（`videometa::tests`）。
+
+**视频元数据的样例是自己造的。** 没有现成的 MP4 / MKV / AVI / FLV 可用，测试里手拼字节：`box_of()` 造 ISO BMFF 的 box 头，`cat()` 把几个 box 头尾相接。**这里踩过一个坑**：第一版的 `minf` 多套了一层（`minf` 里再放一个 `minf`），结果 `stsd` 根本走不到，测试报「视频编码读不出来」—— 看着像解析器坏了，其实是样例造错了。定位方法是临时加一条测试把 box 树递归打印出来看形状。**造样例的字节序不能猜**：ISO BMFF 是大端、RIFF 是小端，`tkhd` 的宽高是 16.16 定点数（`1920 << 16`），`stsd` 的条目里宽高在偏移 32 / 34。测试期望的分辨率是 1920×1080（`tkhd` 的显示尺寸），不是 `stsd` 的 1280×720 —— 这是有意的：`tkhd` 才是与资源管理器一致的那个。
+
+**`cargo check` 查不出测试代码的编译错误。** 它不编译 `#[cfg(test)]` 模块，`cargo test --lib` 才是唯一能发现测试代码问题的路径 —— 第一版的 `box_of` 参数类型写错（`&[Vec<u8>]` 传给了 `&[u8]`）就只在这一步暴露。
+
+**`meta` 有两种形态，判据不能写死。** ISO BMFF 的 `meta` 可能是 FullBox（前面 4 字节是版本 / 标志），也可能是裸容器。第一版的判据是「读 meta 体前 8 字节，若第 4..8 字节是 `hdlr` 就是 FullBox」—— 这在**两种形态下都会命中**，于是裸容器被当成 FullBox 而白白跳过 4 字节，里面的 `ilst` 全读不到。症状是**静默的**：属性窗口里「视频标签」区块直接空掉，不报错、不崩。两种形态都有真实文件在用（iPhone 录的 MOV 多为 FullBox，老的 QuickTime 文件是裸容器），所以现在改成两种起点都试，谁解出内容用谁。回归测试两种形态各跑一遍 —— 只测一种的话，另一半的文件仍然会静默丢标签。
 
 **地址栏 `%VAR%`。** 手输 `%USERPROF`（漏了收尾 `%`）时，旧实现返回 `%`，后面的字符被吞掉，用户看到的是「路径不存在」。未闭合则原样保留。`%%` 是字面量，展开成空串会让路径凭空消失。未知变量仍展开为空。查找以参数注入（`expand_env_vars_with`）。「wrapper 仍读真实环境」这条，把实现改成硬编码返回值时行为测试仍全绿，因为测试自己 `set_var` 设了值。补了 `include_str!` 静态断言，needle 用 `concat!` 在运行时拼，否则判据文本会被自己读回来。
 
@@ -391,6 +424,7 @@ mini-tc/
 │   ├── heicDecode.worker.js  # libheif wasm → RGBA
 │   ├── dedupRules.js         # 重复文件的保留项 / 待删清单
 │   ├── configWriter.js       # 同名配置写入的顺序
+│   ├── format.js             # 体积 / 时长 / 码率的格式化（唯一实现）
 │   └── components/
 │       ├── FilePanel.vue
 │       ├── TabBar.vue
@@ -404,6 +438,7 @@ mini-tc/
 │       ├── GeneralSettingsDialog.vue
 │       ├── SearchDialog.vue
 │       ├── DedupDialog.vue
+│       ├── FilePropertiesDialog.vue
 │       └── ShortcutsDialog.vue
 ├── src-tauri/
 │   ├── src/
@@ -411,6 +446,8 @@ mini-tc/
 │   │   ├── dedup.rs          # 按内容比较
 │   │   ├── atomic_file.rs    # 原子写
 │   │   ├── search_log.rs     # 搜索诊断日志
+│   │   ├── imagemeta.rs      # 图像元数据（EXIF / GPS）
+│   │   ├── videometa.rs      # 视频元数据（容器 / 编码 / 标签）
 │   │   └── window_state.rs   # 窗口几何
 │   └── tauri.conf.json
 ├── scripts/                  # 前端检查与发布脚本

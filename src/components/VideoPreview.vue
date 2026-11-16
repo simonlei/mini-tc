@@ -144,7 +144,7 @@ import { listDirectory, getParentDir, joinPath, openFile } from "../api.js";
 import { matches, markHandled } from "../shortcuts.js";
 import { autoplayGate } from "../autoplayGate.js";
 import { createSubtitleGate, subtitleCandidates } from "../subtitleGate.js";
-import { formatBytes as fmtSize } from "../format.js";
+import { formatBytes as fmtSize, formatDuration as fmtTime } from "../format.js";
 import { videoReadyForPip, pipIntentLands, waitForVideoReady } from "../pipReady.js";
 
 const props = defineProps({
@@ -261,16 +261,9 @@ function getExt(name) {
 }
 
 // ── Formatting helpers ──
-function fmtTime(s) {
-  if (!isFinite(s) || s < 0) s = 0;
-  s = Math.floor(s);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  const mm = String(m).padStart(2, "0");
-  const ss = String(sec).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
-}
+// `fmtTime` now lives in src/format.js (as `formatDuration`) — the properties
+// window shows video durations too, and two copies of this would drift.
+
 // ── Playback controls ──
 function togglePlay() {
   const v = videoEl.value;

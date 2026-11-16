@@ -2,11 +2,13 @@
   <!--
     File properties (Ctrl+Enter / Alt+Enter, or the context menu's 「属性…」).
 
-    Four blocks, in the order Total Commander shows them:
+    Blocks, in the order Total Commander shows them:
       基本信息 — name / type / size / timestamps / attribute flags
       图像信息 — format, pixel dimensions, colour info (only for images)
+      视频信息 — container, duration, resolution, codecs, bitrate (only for videos)
       GPS     — coordinates, altitude, bearing (only when the file carries them)
       EXIF    — every tag the backend could decode, verbatim
+      视频标签 — container-level tags (title / encoder / device …)
 
     The backend never fails on "can't parse EXIF" — a missing block just means
     the file doesn't carry that information. Only a failed stat is an error.
@@ -100,6 +102,51 @@
             </div>
           </section>
 
+          <!-- ── 视频信息 ── -->
+          <section v-if="video" class="block">
+            <div class="block-title">视频信息</div>
+            <div class="kv">
+              <span class="k">格式</span>
+              <span class="v">{{ video.format || "未知" }}</span>
+            </div>
+            <div class="kv">
+              <span class="k">时长</span>
+              <span class="v">{{ videoDurationText }}</span>
+            </div>
+            <div class="kv">
+              <span class="k">分辨率</span>
+              <span class="v">{{ videoDimensionText }}</span>
+            </div>
+            <div v-if="hasNumber(video.fps)" class="kv">
+              <span class="k">帧率</span>
+              <span class="v">{{ videoFpsText }}</span>
+            </div>
+            <div v-if="video.video_codec" class="kv">
+              <span class="k">视频编码</span>
+              <span class="v">{{ video.video_codec }}</span>
+            </div>
+            <div v-if="video.audio_codec" class="kv">
+              <span class="k">音频编码</span>
+              <span class="v">{{ video.audio_codec }}</span>
+            </div>
+            <div v-if="hasNumber(video.audio_channels)" class="kv">
+              <span class="k">音频声道</span>
+              <span class="v">{{ videoChannelsText }}</span>
+            </div>
+            <div v-if="hasNumber(video.audio_sample_rate)" class="kv">
+              <span class="k">采样率</span>
+              <span class="v">{{ videoSampleRateText }}</span>
+            </div>
+            <div v-if="hasNumber(video.bitrate)" class="kv">
+              <span class="k">码率</span>
+              <span class="v">{{ videoBitrateText }}</span>
+            </div>
+            <div v-if="video.created" class="kv">
+              <span class="k">拍摄时间</span>
+              <span class="v">{{ video.created }}</span>
+            </div>
+          </section>
+
           <!-- ── GPS ── -->
           <section v-if="gps" class="block">
             <div class="block-title">GPS</div>
@@ -136,12 +183,37 @@
             </div>
           </section>
 
-          <!-- Not an image (or the metadata couldn't be read): say so plainly
-               instead of leaving the user wondering whether the file is broken. -->
-          <section v-if="!image" class="block">
-            <div class="block-title">图像信息</div>
+          <!-- ── 视频标签 ── -->
+          <!-- 容器自带的标签（标题 / 编码器 / 拍摄设备 …）。手机录的 MOV
+               会在这里显示设备型号、拍摄软件等。 -->
+          <section v-if="video && video.tags && video.tags.length" class="block">
+            <div class="block-title">视频标签（{{ video.tags.length }} 项）</div>
+            <div class="exif-grid">
+              <div v-for="(f, i) in video.tags" :key="i" class="exif-row">
+                <span class="ek">{{ f.label }}</span>
+                <span class="ev">{{ f.value }}</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- 相机 / 手机录影时，容器里还会塞一份完整 EXIF（拍摄参数）。 -->
+          <section v-if="video && video.exif && video.exif.length" class="block">
+            <div class="block-title">视频 EXIF（{{ video.exif.length }} 项）</div>
+            <div class="exif-grid">
+              <div v-for="(f, i) in video.exif" :key="i" class="exif-row">
+                <span class="ek">{{ f.label }}</span>
+                <span class="ev">{{ f.value }}</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- Not an image or a video (or the metadata couldn't be read): say
+               so plainly instead of leaving the user wondering whether the
+               file is broken. -->
+          <section v-if="!image && !video" class="block">
+            <div class="block-title">图像 / 视频信息</div>
             <div class="state-box inline">
-              {{ info.is_dir ? "文件夹没有图像元数据" : "这不是图像文件（或不含可读元数据）" }}
+              {{ info.is_dir ? "文件夹没有图像或视频元数据" : "这不是图像或视频文件（或不含可读元数据）" }}
             </div>
           </section>
         </template>
@@ -158,7 +230,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
 import { getFileProperties } from "../api.js";
-import { formatBytes } from "../format.js";
+import { formatBytes, formatDuration, formatBitrate } from "../format.js";
 
 const props = defineProps({
   // Absolute path of the file being inspected.
@@ -212,7 +284,11 @@ async function load() {
 watch(() => props.path, load);
 
 const image = computed(() => info.value?.image || null);
-const gps = computed(() => info.value?.image?.gps || null);
+const video = computed(() => info.value?.video || null);
+// GPS can come from either side: a photo's EXIF, or a phone recording's
+// container (ISO 6709 position / XMP). Image wins when a file somehow has
+// both — a photo's own GPS is the more specific one.
+const gps = computed(() => info.value?.image?.gps || info.value?.video?.gps || null);
 
 // The path changes the moment the selection does, so the header follows the
 // NEW file right away — the metadata behind it arrives a tick later.
@@ -253,6 +329,55 @@ const pixelCountText = computed(() => {
   const h = image.value?.height;
   if (!w || !h) return "—";
   return `${(w * h).toLocaleString()} 像素`;
+});
+
+// ── 视频 ──
+
+// The backend hands back `Option`s; a missing one means the container didn't
+// record it, which is different from a recorded zero. `hasNumber` tells the
+// two apart so a genuine 0 fps isn't hidden.
+function hasNumber(v) {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+const videoDurationText = computed(() => {
+  const d = video.value?.duration;
+  if (!hasNumber(d)) return "—";
+  return formatDuration(d);
+});
+
+const videoDimensionText = computed(() => {
+  const w = video.value?.width;
+  const h = video.value?.height;
+  if (!hasNumber(w) || !hasNumber(h)) return "未知";
+  return `${w} × ${h} 像素`;
+});
+
+const videoFpsText = computed(() => {
+  const f = video.value?.fps;
+  if (!hasNumber(f)) return "—";
+  // 29.97 has to stay 29.97 — rounding it to 30 would misreport the file.
+  return `${Number(f.toFixed(3))} fps`;
+});
+
+const videoChannelsText = computed(() => {
+  const c = video.value?.audio_channels;
+  if (!hasNumber(c)) return "—";
+  if (c === 1) return "单声道";
+  if (c === 2) return "立体声（2 声道）";
+  return `${c} 声道`;
+});
+
+const videoSampleRateText = computed(() => {
+  const r = video.value?.audio_sample_rate;
+  if (!hasNumber(r)) return "—";
+  return `${r.toLocaleString()} Hz`;
+});
+
+const videoBitrateText = computed(() => {
+  const b = video.value?.bitrate;
+  if (!hasNumber(b)) return "—";
+  return formatBitrate(b);
 });
 
 function formatDate(ms) {

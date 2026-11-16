@@ -27,6 +27,7 @@ const API = path.join(ROOT, "src", "api.js");
 const FORMAT = path.join(ROOT, "src", "format.js");
 const LIB = path.join(ROOT, "src-tauri", "src", "lib.rs");
 const IMAGEMETA = path.join(ROOT, "src-tauri", "src", "imagemeta.rs");
+const VIDEOMETA = path.join(ROOT, "src-tauri", "src", "videometa.rs");
 
 let passed = 0;
 const failures = [];
@@ -91,9 +92,16 @@ check("Ctrl+Shift+Enter 不命中", !matches("file.properties", ev({ ...enter, c
 
 const appSrc = stripComments(fs.readFileSync(APP, "utf8"));
 const panelSrc = stripComments(fs.readFileSync(PANEL, "utf8"));
-const dialogSrc = stripComments(fs.readFileSync(DIALOG, "utf8"));
+// 模板里的 HTML 注释（`<!-- ... -->`）也要剥掉：属性窗口顶部的说明文字里
+// 就写着「视频信息」「视频标签」这几个词，不剥的话断言会被文档自己满足 ——
+// 变异臂「删掉视频信息区块」就是这么漏过去的。
+const stripHtmlComments = (s) => s.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "));
+const dialogSrc = stripHtmlComments(stripComments(fs.readFileSync(DIALOG, "utf8")));
 const apiSrc = stripComments(fs.readFileSync(API, "utf8"));
 const libSrc = fs.readFileSync(LIB, "utf8");
+// lib.rs 也要剥注释：`mod videometa;` 被改成 `// mod videometa;` 时，模块
+// 其实已经没了，但正则照样能匹配到那行注释里的字面量。
+const libCode = stripComments(libSrc);
 
 section("2. App.vue：命令 → 窗口");
 
@@ -254,6 +262,84 @@ check("后端引入了 imagemeta 模块", /mod\s+imagemeta\s*;/.test(libSrc));
 check("imagemeta.rs 文件存在", fs.existsSync(IMAGEMETA));
 check("imagemeta.rs 导出了 probe 入口", /pub\s+fn\s+probe\s*\(/.test(fs.readFileSync(IMAGEMETA, "utf8")));
 
+section("5b. 视频元数据：后端探测 → IPC → 属性窗口");
+
+// 视频元数据是「后端探测 → 塞进 FileProperties → 前端渲染」的完整链路。
+// 少接一环的症状很隐蔽：后端探测出来了但 IPC 没带过去，前端就会显示
+// 「这不是图像或视频文件」—— 用户完全看不出是接线断了还是真的没数据。
+const videoSrc = fs.existsSync(VIDEOMETA) ? fs.readFileSync(VIDEOMETA, "utf8") : "";
+
+check("后端引入了 videometa 模块", /^\s*mod\s+videometa\s*;/m.test(libCode));
+check("videometa.rs 文件存在", fs.existsSync(VIDEOMETA));
+check("videometa.rs 导出了 probe 入口", /pub\s+fn\s+probe\s*\(/.test(videoSrc));
+check(
+  "FileProperties 有 video 字段",
+  /pub\s+video\s*:\s*Option\s*<\s*videometa::VideoMeta\s*>/.test(libSrc)
+);
+check(
+  "read_file_properties 填了 video（探测结果真的被带过 IPC）",
+  /video\s*:\s*videometa::probe\s*\(/.test(libSrc)
+);
+check(
+  "VideoMeta 至少带时长 / 分辨率 / 编码（不然窗口里能显示什么？）",
+  /pub\s+duration\s*:\s*Option\s*</.test(videoSrc) &&
+    /pub\s+width\s*:\s*Option\s*</.test(videoSrc) &&
+    /pub\s+height\s*:\s*Option\s*</.test(videoSrc) &&
+    /pub\s+video_codec\s*:\s*Option\s*</.test(videoSrc)
+);
+check(
+  "VideoMeta 带容器标签与内嵌 EXIF（手机录的 MOV 里才有）",
+  /pub\s+tags\s*:\s*Vec\s*</.test(videoSrc) && /pub\s+exif\s*:\s*Vec\s*</.test(videoSrc)
+);
+check(
+  "VideoMeta 带 GPS（录影时写进容器的位置）",
+  /pub\s+gps\s*:\s*Option\s*</.test(videoSrc)
+);
+
+// 前端：窗口里要有「视频信息」区块，并且真的读了 video 上的字段。
+// 判据必须精确到区块标题本身：`includes("视频信息")` 会被兜底区块的标题
+// 「图像 / 视频信息」满足 —— 变异臂 ⑯ 删掉真正的「视频信息」区块时，
+// 粗判据依然全绿。这里认的是 `<div class="block-title">视频信息</div>`。
+check(
+  "窗口里有「视频信息」区块",
+  /<div class="block-title">视频信息<\/div>/.test(dialogSrc)
+);
+check(
+  "窗口里有「视频标签」区块",
+  /<div class="block-title">视频标签（/.test(dialogSrc)
+);
+// 字段可以由模板直接读（`video.duration`），也可以由 computed 读
+// （`video.value?.duration`）—— 两种写法都算接上了。
+const readsVideoField = (name) =>
+  new RegExp(`video(?:\\.value\\?\\.|\\.)${name}\\b`).test(dialogSrc);
+check("窗口渲染了 video.duration", readsVideoField("duration"));
+check("窗口渲染了 video.width / video.height", readsVideoField("width") && readsVideoField("height"));
+check("窗口渲染了 video.video_codec", readsVideoField("video_codec"));
+check("窗口渲染了 video.audio_codec", readsVideoField("audio_codec"));
+check("窗口渲染了 video.bitrate", readsVideoField("bitrate"));
+check("窗口渲染了 video.tags（容器标签）", readsVideoField("tags"));
+check("窗口渲染了 video.exif（容器内嵌的 EXIF）", readsVideoField("exif"));
+check(
+  "窗口把 video 接到了 info 上（computed 读 info.value?.video）",
+  /info\.value\?\.video/.test(dialogSrc)
+);
+// 「接上了」必须是**那一行**接上了：只断言文件里出现过 info.value?.video
+// 是不够的 —— GPS 那行也写着它，把 video 的 computed 改成返回 null 时断言
+// 依然全绿。变异臂 ⑮ 就是这么漏过去的。这里只看 video 的 computed 那一行。
+const videoComputedLine = /const\s+video\s*=\s*computed\(.*\)\s*;/.exec(dialogSrc);
+check(
+  "video 的 computed 确实读 info.value?.video（不是恒为 null）",
+  !!videoComputedLine && /info\.value\?\.video/.test(videoComputedLine[0])
+);
+check(
+  "GPS 同时服务图片与视频（image.gps 取不到时用 video.gps）",
+  /image\?\.gps\s*\|\|\s*info\.value\?\.video\?\.gps/.test(dialogSrc)
+);
+check(
+  "兜底区块在图片与视频都没有时才出现（视频不该被说成「这不是图像」）",
+  /v-if="!image && !video"/.test(dialogSrc)
+);
+
 section("6. 对话框组件");
 
 check("组件声明了 path prop", /defineProps\([\s\S]{0,200}path\s*:\s*\{\s*type:\s*String/.test(dialogSrc));
@@ -345,8 +431,8 @@ if (process.argv.includes("--mutate")) {
       from: "const data = await getFileProperties(props.path);",
       to: "const data = { name: '', path: props.path, is_dir: false, size: 0, created: 0, modified: 0, accessed: 0, readonly: false, hidden: false, system: false, archive: false, image: null };" },
     { name: "⑨ 组件自造字节格式化（与 format.js 漂移）", file: DIALOG,
-      from: 'import { formatBytes } from "../format.js";',
-      to: 'import { formatBytes } from "../format.js";\nconst KB = 1024;\nvoid KB;' },
+      from: 'import { formatBytes, formatDuration, formatBitrate } from "../format.js";',
+      to: 'import { formatBytes, formatDuration, formatBitrate } from "../format.js";\nconst KB = 1024;\nvoid KB;' },
     { name: "⑩ 不跟随选中项（窗口永远显示打开时那一个文件）", file: APP,
       from: "  () => [leftPanel.value?.selectedEntry || null, rightPanel.value?.selectedEntry || null],",
       to: "  () => [null, null]," },
@@ -356,6 +442,21 @@ if (process.argv.includes("--mutate")) {
     { name: "⑫ 对话框的方向键不接 App.vue（焦点不在列表上时按 ↑/↓ 没反应）", file: DIALOG,
       from: "  props.onNavigate(e.key === \"ArrowDown\" ? 1 : -1);",
       to: "  // props.onNavigate(e.key === \"ArrowDown\" ? 1 : -1);" },
+    { name: "⑬ 后端探测了视频但不把结果送过 IPC（窗口里看不到视频信息）", file: LIB,
+      from: "video: videometa::probe(p),", to: "video: None," },
+    { name: "⑭ 后端不探测视频（视频文件被说成「这不是图像或视频」）", file: LIB,
+      from: "mod videometa;", to: "// mod videometa;" },
+    { name: "⑮ 前端不读 video 字段（后端送了数据，窗口照样空白）", file: DIALOG,
+      from: "const video = computed(() => info.value?.video || null);",
+      to: "const video = computed(() => null);" },
+    { name: "⑯ 删掉「视频信息」区块（探测到了但没有展示的地方）", file: DIALOG,
+      from: '<div class="block-title">视频信息</div>',
+      to: '<div class="block-title">视频</div>' },
+    { name: "⑰ 兜底区块不再排除视频（视频文件被显示成「这不是图像或视频文件」）", file: DIALOG,
+      from: 'v-if="!image && !video"', to: 'v-if="!image"' },
+    { name: "⑱ GPS 只看图片（视频里的位置不显示了）", file: DIALOG,
+      from: "const gps = computed(() => info.value?.image?.gps || info.value?.video?.gps || null);",
+      to: "const gps = computed(() => info.value?.image?.gps || null);" },
   ];
 
   for (const mu of mutations) {

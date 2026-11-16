@@ -179,6 +179,20 @@ pub fn probe(path: &Path) -> Option<ImageMeta> {
     None
 }
 
+/// 解析一段 EXIF 数据（可带 `Exif\0\0` 前缀），返回字段与 GPS。
+///
+/// 给 [`crate::videometa`] 用：部分视频容器里也塞了一份完整的 EXIF（相机 /
+/// 手机录影时写下的拍摄参数）。解析不出就返回 `None`，调用方少显示几行。
+pub fn parse_exif_payload(data: &[u8]) -> Option<(Vec<ExifField>, Option<GpsInfo>)> {
+    let body = if data.len() >= 6 && &data[0..6] == b"Exif\0\0" {
+        &data[6..]
+    } else {
+        data
+    };
+    let exif = parse_tiff(body)?;
+    Some((exif.fields, exif.gps))
+}
+
 // ── JPEG ──
 
 /// JPEG 的 SOF（Start Of Frame）段。`C4`(DHT) / `C8`(JPG) / `CC`(DAC) 不是帧头。
