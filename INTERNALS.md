@@ -30,6 +30,8 @@
 
 埋点里 `splash:fade-start` 的 note 是 `shown=…ms panels=N after-ready=…ms`。`after-ready` 才是调参依据：它表示数据全就绪后，用户还得盯着一个已完成的动画多久，应当恒为 0。`shown` 只是 splash 总显示时长。
 
+**启动焦点。** 冷启动时窗口本来就拿着系统焦点，「窗口重新获得焦点」的处理器不会触发，曾导致 `document.activeElement` 一直停在 `<body>`：界面正常、目录也列好了，但 `↑` / `↓` / Enter / Tab 全无反应，直到用户手动点一行。现在 `main.js` 在 splash 真正移除时派发 `minitc:splash-removed`（`transitionend`，另有 `SPLASH_FADE_MS + 100ms` 兜底；`finishSplash` 幂等）。splash 的淡出门槛本来就是「两栏首次列目录都完成」，所以这一条信号同时代表恢复出来的活动 tab 已经上屏，不需要再维护第二套计数器。`App.vue` 的一次性 rAF 循环等这条信号 + `view-state.json` 读完，然后调用活动面板的 `focusList()`；判据在 `src/startupFocus.js`：窗口还没拿到系统焦点时 `focus()` 会被 WebView2 静默丢弃，所以要等而不是白试一次；焦点已在文件列表、正在输入、或焦点在预览区时立即收手；3200ms 超时、240 帧、8 次尝试是三道上界。哪一栏是「上次在用的」存在 `view-state.json` 的 `activePanel` 字段（每栏自己的活动 tab 早已在 `tabs-<id>.json` 里），读写都过 `normalizeActivePanel`，损坏的配置不会指向不存在的面板。退出时开着预览的场景仍以预览源面板为准 —— `restorePreview()` 后执行，会覆盖已恢复的活动面板，那才是用户当时在看的列表。
+
 **启动耗时埋点。** `src/bootLog.js` + 后端 `boot_mark` / `boot_timings`。开发模式下 devtools 控制台打印两张 `console.table`（JS 阶段 / Rust 阶段，共用同一时钟）。Rust 侧另有 `[boot] ... ms` 逐行输出。`localStorage.setItem("minitc-boot-log", "off")` 可关闭。
 
 **启动路径上的两处瘦身。** 实测大头是 Tauri 固有的 WebView2 `setup`。JS 侧能砍的主要是重复探测与无谓排序。
@@ -95,7 +97,7 @@ docx 预览是本项目唯一的内容注入面，按不可信输入处理（`sr
 
 ## 视图、选中与键盘
 
-**视图状态**在 `~/.minitc/view-state.json`，模块级单例 `src/viewState.js`，150ms 防抖写盘。
+**视图状态**在 `~/.minitc/view-state.json`，模块级单例 `src/viewState.js`，150ms 防抖写盘。除显示偏好与预览恢复外，还存 `activePanel`（上次活动的左/右栏，供启动焦点使用）；每栏的活动标签页另存各自的 `tabs-<id>.json`，两者分工，不重复存同一份状态。
 
 - **隐藏文件。** 后端始终全量返回，过滤在前端做，所以上万项的目录切换也是瞬时的。左右栏独立。过滤会整体平移行号，选中集合按条目对象身份迁移到新列表，按下标迁移会把选中静默变成另一个文件。
 - **列宽。** Name / Size / Type / Modified 四列表头可拖，双击手柄恢复默认。列宽左右栏共用。四列都是字面宽度，面板多出来的空间留成右侧空白。窗口缩小时 Size / Type / Modified 优先完整显示，文件名栏承担让步（缩窄 → 省略号 → 归零）；面板连三栏都放不下时，三栏才等比缩小（可读下限：Size 60 / Type 48 / Modified 96），并且 Name 先归零。这些是渲染时的临时调整，存储值不动。拖拽起始宽度取存储值，取实测宽度会让窗口缩小后的 Name 被永久卡在挤扁后的尺寸。
@@ -137,7 +139,7 @@ docx 预览是本项目唯一的内容注入面，按不可信输入处理（`sr
 
 **搜索结果标签页没有历史。** `minitc://search/{id}` 不是真实目录。从结果集跳进真实目录时重新起一段历史。
 
-**窗口切回。** 从外部程序切回时重新列目录、恢复选中并滚动到可见、把键盘焦点交还文件列表。正在输入或焦点在预览区内时不抢焦点。
+**窗口切回。** 从外部程序切回时重新列目录、恢复选中并滚动到可见、把键盘焦点交还文件列表。正在输入或焦点在预览区内时不抢焦点。这是与「启动焦点」互相独立的一条路径：前者靠 `tauri://focus` / window focus 事件，后者靠 splash 移除信号；两条都收敛到同一个 `focusList()`，守卫条件一致。
 
 **目录大小缓存**按标签页分桶。`setPath()` 是所有目录切换的唯一收口（面包屑、返回上级、前进后退、书签、锁定跳转、搜索结果下钻），在这里丢弃缓存。重新列当前目录不经过 `setPath`，所以切窗回来数字还在。一旦切换目录就清空，即使切回来也不恢复。大目录统计期间若用户已经导航走，晚到的结果丢弃。删掉文件夹时同步清掉它的大小条目。计算中的 `...` 占位曾经因为判断顺序永远走不到，会显示成 `NaN undefined`。
 
@@ -418,8 +420,9 @@ mini-tc/
 │   ├── style.css             # 全局样式与 4 套主题变量
 │   ├── shortcuts.js          # 快捷键注册表
 │   ├── keyboardText.js       # isTypingTarget / classifySelectAll / isImeKeydown
+│   ├── startupFocus.js       # 启动焦点判据 + 活动面板名校验（纯函数）
 │   ├── bookmarks.js          # 书签 store
-│   ├── viewState.js          # 视图状态 store
+│   ├── viewState.js          # 视图状态 store（含活动面板 / 预览恢复）
 │   ├── previewExtensions.js  # 五种预览类型的后缀映射（纯函数，唯一数据源）
 │   ├── previewConfig.js      # 该映射的 reactive 单例 + 落盘 / 迁移
 │   ├── alwaysOnTop.js        # 窗口置顶

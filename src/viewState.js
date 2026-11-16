@@ -1,5 +1,6 @@
 import { ref } from "vue";
 import { loadConfig, saveConfig } from "./api.js";
+import { normalizeActivePanel } from "./startupFocus.js";
 
 // ── View state (show-hidden / column widths / default sort) ──
 //
@@ -81,6 +82,13 @@ export const defaultSortDirection = ref("asc");
 // `kind` mirrors App.vue's previewKind ('file' | 'video' | 'unsupported').
 export const previewRestore = ref(null);
 
+// Which panel was active on exit. The per-panel tabs files already remember
+// each panel's *active tab*; without this one the app would always come back to
+// the left panel, so "focus the list of the tab I was last using" would be the
+// wrong list whenever the user had been working on the right.
+// `null` = no saved value (first launch / older config), caller defaults left.
+export const savedActivePanel = ref(null);
+
 /// Guards against the two panels racing to load at startup (both panels mount
 /// before App.vue's onMounted in some orders).
 let loadPromise = null;
@@ -116,6 +124,11 @@ function sanitize(raw) {
     if (SORT_COLUMNS.some((c) => c.key === col)) out.defaultSortColumn = col;
     const dir = String(raw.defaultSortDirection || "").toLowerCase();
     if (dir === "asc" || dir === "desc") out.defaultSortDirection = dir;
+    // A hand-edited config must not be able to name a panel that doesn't
+    // exist — that would make the active-panel outline and startup focus
+    // land on nothing at all.
+    const activePanel = normalizeActivePanel(raw.activePanel);
+    if (activePanel) out.activePanel = activePanel;
     // Only a preview we can actually re-open is worth restoring: it needs a
     // panel, a path and a kind. Anything else is dropped rather than restored
     // into a broken preview surface. `unsupported` is deliberately excluded —
@@ -152,6 +165,7 @@ export async function loadViewState() {
         if (s.defaultSortColumn) defaultSortColumn.value = s.defaultSortColumn;
         if (s.defaultSortDirection) defaultSortDirection.value = s.defaultSortDirection;
         if (s.preview) previewRestore.value = s.preview;
+        if (s.activePanel) savedActivePanel.value = s.activePanel;
       }
     } catch (e) {
       // A corrupt view-state must never block startup — defaults are fine.
@@ -172,6 +186,7 @@ function persist() {
       // `null` (preview closed) is written explicitly so a stale preview from
       // a previous session can never be resurrected by omission.
       preview: previewRestore.value,
+      activePanel: savedActivePanel.value,
     })
   ).catch((e) => console.error("Failed to persist view state:", e));
 }
@@ -246,6 +261,18 @@ export function resetColumnWidth(key) {
 export function setDefaultSort(column, direction) {
   if (column) defaultSortColumn.value = column;
   if (direction) defaultSortDirection.value = direction;
+  scheduleSave();
+}
+
+// ── Active panel persistence ──
+
+/// Called from App.vue's `watch(activePanel)`. Panel switches are user-driven
+/// and fairly bursty (Tab toggles, preview restore, dialog close), so writes go
+/// through the same 150ms debounce as the other view-state fields.
+export function setSavedActivePanel(panelId) {
+  const id = normalizeActivePanel(panelId);
+  if (!id || savedActivePanel.value === id) return;
+  savedActivePanel.value = id;
   scheduleSave();
 }
 

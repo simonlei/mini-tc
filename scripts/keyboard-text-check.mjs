@@ -267,15 +267,16 @@ check(
 // 6c. 三个落地点都调了唯一入口。数出全部调用点逐个检查，而不是"某处存在"。
 {
   const sites = appSrc.match(/\bisTypingTarget\s*\(/g) || [];
-  // 文件当前有 7 处调用，逐个核对（行号会随编辑漂移，判据是数量+语义）：
+  // 文件当前有 8 处调用，逐个核对（行号会随编辑漂移，判据是数量+语义）：
   //   restoreActiveListFocus / Esc 守卫 / Ctrl+C·X·V 守卫 / Ctrl+Z 撤销 /
-  //   bookmark.toggle / view.toggleHidden / bare-Tab 守卫
+  //   bookmark.toggle / view.toggleHidden / bare-Tab 守卫 /
+  //   startupFocusTick（启动焦点：冷启动也不许抢正在输入的焦点）
   // 另有三处 `t.tagName === "INPUT" && classList.contains("rename-input")`
   // 是**有意**的窄语义（F5 / Ctrl+M / Ctrl+Enter 只避让改名框，不避让其它
   // 输入框），不走 isTypingTarget，也不该被这里的断言当成副本。
   check(
-    `isTypingTarget 调用点共 ${sites.length} 处（期望 7，逐个核对）`,
-    sites.length === 7
+    `isTypingTarget 调用点共 ${sites.length} 处（期望 8，逐个核对）`,
+    sites.length === 8
   );
   // 每个落地点都真的判了 —— 不只看数量。
   for (const [label, needle] of [
@@ -284,6 +285,7 @@ check(
     ["Ctrl+C/X/V 守卫", "if (isTypingTarget(e.target)) {"],
     ["bookmark.toggle", "if (isTypingTarget(e.target)) {"],
     ["bare-Tab 守卫", "if (isTypingTarget(t)) return;"],
+    ["startupFocusTick", "typingTarget: isTypingTarget(el),"],
   ]) {
     check(`落地点存在：${label}`, appSrc.includes(needle));
   }

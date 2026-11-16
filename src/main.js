@@ -74,11 +74,22 @@ function dismissSplash() {
   // Applied here so SPLASH_FADE_MS is authoritative: the CSS duration and this
   // constant had drifted apart (0.6s vs 300ms) and the CSS silently won.
   splash.style.transitionDuration = `${SPLASH_FADE_MS}ms`;
-  splash.classList.add("hide");
-  splash.addEventListener("transitionend", () => {
+  let splashDone = false;
+  function finishSplash() {
+    if (splashDone) return;
+    splashDone = true;
     if (splash.parentNode) splash.parentNode.removeChild(splash);
     mark("splash:removed", "first unobstructed frame");
-  }, { once: true });
+    // App.vue's startup-focus loop waits for this: it is the signal that both
+    // panels have listed and the restored tabs are actually on screen.
+    window.dispatchEvent(new CustomEvent("minitc:splash-removed"));
+  }
+  splash.classList.add("hide");
+  splash.addEventListener("transitionend", finishSplash, { once: true });
+  // `transitionend` is not guaranteed (reduced motion, no compositor frame,
+  // splash hidden before the fade starts). Without a fallback the focus loop
+  // would wait out its whole timeout on every such launch.
+  setTimeout(finishSplash, SPLASH_FADE_MS + 100);
 }
 
 requestAnimationFrame(() => requestAnimationFrame(dismissSplash));

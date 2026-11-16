@@ -311,7 +311,14 @@ import {
   setPreviewRestore,
   consumePreviewRestore,
   snapshot as viewStateSnapshot,
+  savedActivePanel,
+  setSavedActivePanel,
 } from "./viewState.js";
+import {
+  startupFocusDecision,
+  isListFocusedInPanel,
+  STARTUP_FOCUS_TIMEOUT_MS,
+} from "./startupFocus.js";
 import * as alwaysOnTop from "./alwaysOnTop.js";
 import { autoplayGate } from "./autoplayGate.js";
 import { listen } from "@tauri-apps/api/event";
@@ -329,6 +336,12 @@ import {
 } from "./previewConfig.js";
 
 const activePanel = ref("left");
+
+// Remember which panel was active, so a restart puts the keyboard back in the
+// file list of the tab the user was last working in (each panel restores its
+// own active tab from tabs-<panelId>.json). The saved value is applied once
+// ~/.minitc/view-state.json has loaded — see onMounted below.
+watch(activePanel, (id) => setSavedActivePanel(id));
 
 const themes = [
   { key: "graphite", name: "石墨工业", label: "石墨" },
@@ -957,7 +970,17 @@ onMounted(() => {
   // ~/.minitc/view-state.json — hidden-file visibility, column widths, default
   // sort. Module singleton, so the panels read the same live values once this
   // resolves; until then they fall back to the built-in defaults.
-  track("cfg:view-state", loadViewState());
+  // Apply the saved active panel as soon as the config resolves. This
+  // `.then` is registered before restorePreview() awaits the SAME promise, so
+  // the preview restore (which knows better: focus belongs to its source
+  // panel) still wins when a preview is being re-opened.
+  track(
+    "cfg:view-state",
+    loadViewState().then(() => {
+      if (savedActivePanel.value) activePanel.value = savedActivePanel.value;
+      startupStateReady = true;
+    })
+  );
   // Restore the previous session's preview once both panels have content.
   track("app:restorePreview", restorePreview());
   // Only needed by the About dialog — measured to confirm it's free.
@@ -2209,6 +2232,55 @@ function onVisibilityRegain() {
   if (!document.hidden) onWindowFocusRegain();
 }
 
+// ── Startup focus ──
+// The focus-regain handlers above only fire when the window *comes back* from
+// somewhere else. On a cold launch the window already owns focus, so nothing
+// ever calls focusList() and the caret stays on <body> — arrow keys, Enter and
+// Tab do nothing until the user clicks a row. This one-shot loop closes that
+// gap: once the splash is gone (main.js holds it until both panels have
+// listed, i.e. the restored tabs are on screen) it hands the keyboard to the
+// saved active panel's file list.
+//
+// It never steals focus from a live interaction (address bar / filter /
+// inline rename / preview surface) and gives up after a bounded number of
+// frames, so a launch that never gains system focus can't spin forever.
+let startupStateReady = false;
+let startupSplashGone = false;
+let startupFrames = 0;
+let startupAttempts = 0;
+let startupStopped = false;
+const startupStartedAt = performance.now();
+
+function onStartupSplashRemoved() {
+  startupSplashGone = true;
+}
+
+function startupFocusTick() {
+  if (startupStopped) return;
+  const el = document.activeElement;
+  const action = startupFocusDecision({
+    stateReady: startupStateReady,
+    splashGone: startupSplashGone,
+    timedOut: performance.now() - startupStartedAt >= STARTUP_FOCUS_TIMEOUT_MS,
+    frames: startupFrames++,
+    attempts: startupAttempts,
+    hasSystemFocus: document.hasFocus(),
+    typingTarget: isTypingTarget(el),
+    inPreviewSurface: !!(el && el.closest && el.closest(".file-preview, iframe, video")),
+    listFocused: isListFocusedInPanel(el, activePanel.value),
+  });
+  if (action === "stop") {
+    startupStopped = true;
+    return;
+  }
+  if (action === "focus") {
+    startupAttempts += 1;
+    const panel = activePanel.value === "left" ? leftPanel.value : rightPanel.value;
+    panel?.focusList?.();
+  }
+  requestAnimationFrame(startupFocusTick);
+}
+
 // Keyboard shortcuts
 onMounted(() => {
   // Native OS drag-and-drop listeners (dragDropEnabled: true makes Tauri own
@@ -2216,6 +2288,14 @@ onMounted(() => {
   // of cursor positions while a drag is in flight; we resolve each to a
   // highlight target via elementFromPoint.
   setupNativeDragListeners();
+
+  // Startup focus: seed the splash flag from the DOM as well as listening for
+  // the removal event — on a fast launch the splash can already be gone by
+  // the time this runs. main.js dispatches "minitc:splash-removed" from the
+  // fade's transitionend handler.
+  startupSplashGone = !document.getElementById("splash");
+  window.addEventListener("minitc:splash-removed", onStartupSplashRemoved);
+  requestAnimationFrame(startupFocusTick);
 
   // Window regained focus (the handler above owns the refresh + focus restore).
   listen("tauri://focus", onWindowFocusRegain).then((fn) => {
@@ -2627,6 +2707,8 @@ function onGlobalKeydown(e) {
 
 onUnmounted(() => {
   appUnmounted = true;
+  startupStopped = true;
+  window.removeEventListener("minitc:splash-removed", onStartupSplashRemoved);
   if (unlistenTauriFocus) unlistenTauriFocus();
   if (unlistenDragEnter) unlistenDragEnter();
   if (unlistenDragOver) unlistenDragOver();
