@@ -7,6 +7,7 @@ use tauri::Emitter;
 
 mod atomic_file;
 mod dedup;
+mod imagemeta;
 mod search_log;
 mod window_state;
 
@@ -441,6 +442,85 @@ fn get_dir_size(path: String) -> Result<u64, String> {
         return Err(format!("Not a directory: {}", path));
     }
     dir_size(dir_path).map_err(|e| format!("Failed to calculate directory size: {}", e))
+}
+
+/// 属性窗口要展示的**文件系统**信息 + 图像元数据。
+///
+/// 图像元数据放在 `image` 里，不是图像（或读不出来）时为 `None` —— 属性窗口
+/// 对任何文件都要能开，不能因为「这不是图片」就报错。
+#[derive(Serialize)]
+pub struct FileProperties {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// 创建 / 修改 / 访问时间，毫秒（UNIX 纪元）。拿不到时为 0。
+    pub created: i64,
+    pub modified: i64,
+    pub accessed: i64,
+    pub readonly: bool,
+    pub hidden: bool,
+    pub system: bool,
+    pub archive: bool,
+    pub image: Option<imagemeta::ImageMeta>,
+}
+
+/// 读取一个文件的属性：大小、时间戳、属性标记，以及图像的尺寸 / EXIF / GPS。
+///
+/// 这条命令刻意**不返回错误**给「解析不出 EXIF」这类情况：解析失败只是少几行
+/// 信息。只有 stat 不到文件才算失败。
+#[tauri::command]
+fn read_file_properties(path: String) -> Result<FileProperties, String> {
+    let p = Path::new(&path);
+    let meta = fs::metadata(p).map_err(|e| format!("无法读取文件属性: {}", e))?;
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+
+    let (system, archive, readonly) = file_attribute_flags(&meta);
+    // `is_hidden` 借用 name，所以先算出来再把它 move 进结构体。
+    let hidden = is_hidden(&name, &meta);
+
+    Ok(FileProperties {
+        path: path.clone(),
+        name,
+        is_dir: meta.is_dir(),
+        size: if meta.is_dir() { 0 } else { meta.len() },
+        created: system_time_to_millis(meta.created()),
+        modified: system_time_to_millis(meta.modified()),
+        accessed: system_time_to_millis(meta.accessed()),
+        readonly,
+        hidden,
+        system,
+        archive,
+        image: imagemeta::probe(p),
+    })
+}
+
+/// 只读 / 系统 / 归档三个标记。
+///
+/// Windows 上从文件属性位里取；其它平台只有「只读」有意义（权限位），
+/// 系统 / 归档一律为 false —— 宁可少显示，也不要编造。
+fn file_attribute_flags(meta: &fs::Metadata) -> (bool, bool, bool) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+        const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+        let attrs = meta.file_attributes();
+        (
+            attrs & FILE_ATTRIBUTE_READONLY != 0,
+            attrs & FILE_ATTRIBUTE_SYSTEM != 0,
+            attrs & FILE_ATTRIBUTE_ARCHIVE != 0,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        (meta.permissions().readonly(), false, false)
+    }
 }
 
 fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
@@ -5143,6 +5223,7 @@ pub fn run() {
             join_path,
             read_file_preview,
             get_dir_size,
+            read_file_properties,
             start_search,
             cancel_search,
             start_dedup,

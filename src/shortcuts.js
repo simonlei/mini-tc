@@ -122,6 +122,13 @@ export const COMMANDS = [
   // App.vue (it needs the panel's absolute paths, not list indices) and, like
   // F5 / Ctrl+T, has no webview-native meaning of its own.
   { id: "list.batchRename", scope: "global", label: "批量重命名", desc: "对选中的多项套用查找替换 / 序号 / 前后缀 / 大小写规则后统一改名", defaults: ["Ctrl+M"] },
+  // 文件属性（属性窗口）。Ctrl+Enter 是用户要的主键位；Alt+Enter 是
+  // Total Commander 的习惯键，一并给上。两者都没有 webview 原生含义
+  // （Ctrl+Enter 在网页里通常无动作），所以放 global 作用域。
+  // 声明为 global 而不是 fileList：属性窗口要能盖在**两侧面板之上**，
+  // 打开后由 App.vue 接管键盘（见 App.vue 的模态闸门），所以它不能是
+  // 「焦点在文件列表时才生效」的那一类。
+  { id: "file.properties", scope: "global", label: "文件属性", desc: "查看选中文件的属性：大小、时间、图像尺寸、GPS 与 EXIF", defaults: ["Ctrl+Enter", "Alt+Enter"] },
 
   // ── 视频播放 ──
   { id: "video.playPause", scope: "video", label: "播放 / 暂停", defaults: ["Space", "K"] },

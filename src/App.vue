@@ -135,6 +135,14 @@
       @applied="onBatchRenameApplied"
     />
 
+    <!-- File properties (Ctrl+Enter / Alt+Enter, or the context menu's 「属性…」) -->
+    <FilePropertiesDialog
+      v-if="propertiesVisible"
+      :path="propertiesPath"
+      :on-navigate="onPropertiesNavigate"
+      @close="closeProperties"
+    />
+
     <!-- Duplicate file finder. Deletes nothing until the user confirms inside
          the dialog, and the backend re-checks every file's size/mtime before
          trashing it. -->
@@ -181,6 +189,7 @@
           @open-video="openVideo"
           @deleted="onPanelDeleted"
           @batch-rename="onPanelBatchRename"
+          @properties="onPanelProperties"
         />
       </div>
 
@@ -221,6 +230,7 @@
           @open-video="openVideo"
           @deleted="onPanelDeleted"
           @batch-rename="onPanelBatchRename"
+          @properties="onPanelProperties"
         />
       </div>
     </div>
@@ -279,6 +289,7 @@ import ShortcutsDialog from "./components/ShortcutsDialog.vue";
 import SearchDialog from "./components/SearchDialog.vue";
 import DedupDialog from "./components/DedupDialog.vue";
 import BatchRenameDialog from "./components/BatchRenameDialog.vue";
+import FilePropertiesDialog from "./components/FilePropertiesDialog.vue";
 import { joinPath, pathExists, copyItems, moveItems, loadConfig, saveConfig, setClipboardFiles, getClipboardFiles, clearClipboard, getParentDir, undoTrashPeek, undoTrashDelete } from "./api.js";
 import { entryPath, parentDirOf, normDir, isSearchPath } from "./paths.js";
 import { makePreviewRequest, previewRequestLands } from "./previewRequest.js";
@@ -704,6 +715,104 @@ function onBatchRenameApplied({ count, pairs } = {}) {
   panel?.applyRenames?.(pairs);
   nextTick(() => panel?.focusList?.());
   showToast(`已重命名 ${count || 0} 项`, "success");
+}
+
+// ── File properties (Ctrl+Enter / Alt+Enter) ──
+// The dialog lives here, not in the panel: it has to sit above BOTH columns
+// and own the keyboard while it's open (App.vue's global handler gates every
+// other command once it is up).
+const propertiesVisible = ref(false);
+const propertiesPath = ref("");
+// Panel + focused element to hand the keyboard back to on close, mirroring the
+// batch-rename dialog — otherwise Esc leaves focus stranded on <body>.
+let propertiesReturnPanel = "left";
+let propertiesReturnFocus = null;
+// Token for the "follow the selection" watcher below: only the newest read may
+// write the path, so a slow earlier one cannot land after a newer one.
+let propertiesFollowToken = 0;
+
+// Which panel a DOM element belongs to. The panel root carries `data-panel-id`,
+// so `closest()` tells us which side the keyboard is on — the properties window
+// needs that to hand the arrow keys (and the focus) to the right panel.
+function ownerPanelId(el) {
+  const host = el && el.closest ? el.closest("[data-panel-id]") : null;
+  return host ? host.dataset.panelId : "";
+}
+
+// Open the dialog for `panelId`'s selected row. The panel id is a parameter
+// rather than a read of `activePanel` because the context-menu entry fires
+// from a panel that may not be the active one — the user right-clicked there,
+// and that row is what they mean to inspect.
+async function openProperties(panelIdArg) {
+  configMenuOpen.value = false;
+  helpMenuOpen.value = false;
+  if (propertiesVisible.value) return;
+
+  const panelId = panelIdArg || activePanel.value;
+  const panel = panelId === "left" ? leftPanel.value : rightPanel.value;
+  const entry = panel?.selectedEntry;
+  const dir = panel?.currentPath;
+  if (!entry || !dir) {
+    showToast("请先选中一个文件", "error");
+    return;
+  }
+
+  // Resolve the absolute path ONCE — the list underneath may re-sort or
+  // filter while the dialog is open.
+  const full = await entryPath(entry, dir);
+  if (!full) {
+    showToast("无法解析文件路径", "error");
+    return;
+  }
+
+  propertiesReturnPanel = panelId;
+  propertiesReturnFocus = document.activeElement;
+  propertiesPath.value = full;
+  propertiesVisible.value = true;
+
+  // Make sure the keyboard is on the panel being inspected. The context-menu
+  // entry can come from the panel that did NOT have the focus, and then ↑/↓
+  // would move the other panel's highlight while the window shows this
+  // panel's file. If the focus is already inside this panel (the list itself,
+  // or its filter box) it is left alone.
+  if (ownerPanelId(document.activeElement) !== panelId) {
+    nextTick(() => panel?.focusList?.());
+  }
+}
+
+// Context-menu 「属性…」 on a panel. Make that panel the active one first so
+// the dialog, the restored keyboard focus and any later Ctrl+Enter all agree
+// on which side is being worked on.
+function onPanelProperties({ panelId } = {}) {
+  if (previewVisible.value && previewPanel.value === panelId) return;
+  activePanel.value = panelId;
+  openProperties(panelId);
+}
+
+function closeProperties() {
+  propertiesVisible.value = false;
+  const target = propertiesReturnFocus;
+  const panel = propertiesReturnPanel === "left" ? leftPanel.value : rightPanel.value;
+  nextTick(() => {
+    // Give the keyboard back to the panel we inspected — that is the side
+    // whose ↑/↓ were driving the window. `target` is only used when it
+    // belongs to that same panel (the common case: the list had the focus
+    // already); otherwise it is the list that gets the focus.
+    const samePanel = ownerPanelId(target) === propertiesReturnPanel;
+    if (target && target !== document.body && target.isConnected && samePanel) {
+      target.focus();
+      if (document.activeElement === target) return;
+    }
+    panel?.focusList?.();
+  });
+}
+
+// ↑/↓ inside the properties window move the list selection; the window then
+// follows the new selection (see the watcher below). The panel owns the
+// selection, so it also owns the move.
+function onPropertiesNavigate(delta) {
+  const panel = propertiesReturnPanel === "left" ? leftPanel.value : rightPanel.value;
+  panel?.moveSelection?.(delta);
 }
 
 const updateDialog = ref({
@@ -2023,6 +2132,37 @@ watch(activePanel, async () => {
   await showFilePreview(entry, path, isTextPreviewExt(ext), panelId);
 });
 
+// ── The properties window follows the selection ──
+// While the window is open, ↑/↓ still move the highlight in the list
+// underneath: the file list owns those keys (it handles them on the element,
+// before the gated global handler ever sees them). So the window has to show
+// the file that is NOW selected instead of the one it was opened on.
+//
+// Both panels' selections are watched and the inspected one is picked at fire
+// time — `propertiesReturnPanel` is not reactive, so it must not be part of
+// the tracked state.
+watch(
+  () => [leftPanel.value?.selectedEntry || null, rightPanel.value?.selectedEntry || null],
+  async ([leftEntry, rightEntry]) => {
+    if (!propertiesVisible.value) return;
+    const panelId = propertiesReturnPanel;
+    const entry = panelId === "left" ? leftEntry : rightEntry;
+    // Nothing selected (the list was cleared, the directory changed) → keep
+    // showing the file the window is about.
+    if (!entry) return;
+    const dir = panelRefById(panelId)?.currentPath;
+    if (!dir) return;
+    // Snapshot before the await: the user can keep arrowing while the path
+    // resolves, and the slow earlier read must not land last.
+    const token = ++propertiesFollowToken;
+    const full = await entryPath(entry, dir);
+    if (token !== propertiesFollowToken) return;
+    if (!propertiesVisible.value) return;
+    if (!full || full === propertiesPath.value) return;
+    propertiesPath.value = full;
+  }
+);
+
 // ── Window focus regain ──
 // Typical case: right-click an archive → extract with 7-Zip → the external
 // window opens, does its work and closes → the user comes back to mini-tc.
@@ -2119,6 +2259,11 @@ function onGlobalKeydown(e) {
   // Same for the batch-rename dialog: it owns Esc (capture phase) and its
   // rule inputs. Ctrl+M itself is re-checked below so it isn't swallowed.
   if (batchRenameVisible.value) return;
+
+  // The file-properties dialog is modal as well: it shows a scrollable list of
+  // EXIF fields, and the arrow keys / Delete would otherwise drive the panels
+  // underneath while the user scrolls the metadata.
+  if (propertiesVisible.value) return;
 
   // The duplicate-file dialog is modal for the same reason: its checkboxes and
   // the directory input would otherwise drive the panels underneath — Delete
@@ -2279,6 +2424,23 @@ function onGlobalKeydown(e) {
     e.preventDefault();
     markHandled(e);
     openBatchRename();
+    return;
+  }
+
+  // Ctrl+Enter / Alt+Enter: file properties of the active panel's selection.
+  // Both combos have no webview-native meaning, so they are consumed even
+  // while the filename filter or the address bar has focus — the property
+  // window reads the SELECTED row, not whatever the user is typing. The one
+  // exception is a rename box, where the key clearly belongs to the text.
+  if (matches("file.properties", e)) {
+    const t = e.target;
+    if (t && t.tagName === "INPUT" && t.classList.contains("rename-input")) return;
+    // Already open: let the key reach the dialog instead of reopening (and
+    // re-reading) it.
+    if (propertiesVisible.value) return;
+    e.preventDefault();
+    markHandled(e);
+    openProperties();
     return;
   }
 

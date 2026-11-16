@@ -168,7 +168,7 @@ const props = defineProps({
   panelId: { type: String, required: true },
 });
 
-const emit = defineEmits(["activate", "open-video", "deleted", "drop-move", "batch-rename"]);
+const emit = defineEmits(["activate", "open-video", "deleted", "drop-move", "batch-rename", "properties"]);
 
 // Config name → ~/.minitc/tabs-<panelId>.json (unified cross-run store).
 const STORAGE_KEY = `tabs-${props.panelId}`;
@@ -1792,6 +1792,9 @@ function buildMenuItems(entry) {
     items.push({ label: "打开所在目录", action: "open-container" });
   }
   items.push({ label: "重命名", action: "rename" });
+  // 属性窗口（Ctrl+Enter / Alt+Enter 的右键等价物）。对文件与目录都有意义
+  // —— 目录也能看大小与时间戳。
+  items.push({ label: "属性…", action: "properties" });
   // Batch rename works off the whole selection (the right-clicked row when it
   // is the only one selected), so it's most useful with several rows picked.
   // Enabled even for a single row — one item is a legitimate batch of one.
@@ -1968,6 +1971,12 @@ async function handleCtxSelect(item) {
       // The right-click already selected the row, so Ctrl+M afterwards would
       // do the same thing — this is the discoverable equivalent.
       emit("batch-rename", { panelId: props.panelId });
+      break;
+    case "properties":
+      // Same idea: the properties dialog lives in App.vue (it must cover both
+      // panels and own the keyboard). The right-click already selected the
+      // row, so the panel only needs to say WHICH panel it came from.
+      emit("properties", { panelId: props.panelId });
       break;
     case "extract": {
       // Batch case: the menu item carries the full set of selected archives

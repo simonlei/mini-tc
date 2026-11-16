@@ -245,9 +245,9 @@ check(
 );
 
 // 6b. 内联的 INPUT/TEXTAREA/contenteditable 副本已全部消失。
-//     ⚠️ 反面也成立：rename-input 那两处（F5 / Ctrl+M）**必须还是窄守卫** —— 它们
-//     只避让改名框，让F5 继续在地址栏/筛选框里生效。把它改成 isTypingTarget 是
-//     行为变更而非收敛，两条都要钉住。
+//     ⚠️ 反面也成立：rename-input 那几处（F5 / Ctrl+M / Ctrl+Enter）**必须还是
+//     窄守卫** —— 它们只避让改名框，让 F5 继续在地址栏/筛选框里生效。把它改成
+//     isTypingTarget 是行为变更而非收敛，几条都要钉住。
 check(
   "App.vue 不再有裸的 INPUT/TEXTAREA/contenteditable 内联副本",
   !/tagName\s*===\s*["']INPUT["'][\s\S]{0,120}tagName\s*===\s*["']TEXTAREA["']/.test(appSrc)
@@ -259,8 +259,8 @@ check(
 {
   const narrow = appSrc.match(/tagName\s*===\s*["']INPUT["']\s*&&\s*\w+\.classList\.contains\(["']rename-input["']\)/g) || [];
   check(
-    `rename-input 窄守卫仍是 ${narrow.length} 处（期望 2：F5 与 Ctrl+M，未被误改为 isTypingTarget）`,
-    narrow.length === 2
+    `rename-input 窄守卫仍是 ${narrow.length} 处（期望 3：F5 / Ctrl+M / Ctrl+Enter，未被误改为 isTypingTarget）`,
+    narrow.length === 3
   );
 }
 
@@ -270,9 +270,9 @@ check(
   // 文件当前有 7 处调用，逐个核对（行号会随编辑漂移，判据是数量+语义）：
   //   restoreActiveListFocus / Esc 守卫 / Ctrl+C·X·V 守卫 / Ctrl+Z 撤销 /
   //   bookmark.toggle / view.toggleHidden / bare-Tab 守卫
-  // 另有两处 `t.tagName === "INPUT" && classList.contains("rename-input")`
-  // 是**有意**的窄语义（F5 / Ctrl+M 只避让改名框，不避让其它输入框），
-  // 不走 isTypingTarget，也不该被这里的断言当成副本。
+  // 另有三处 `t.tagName === "INPUT" && classList.contains("rename-input")`
+  // 是**有意**的窄语义（F5 / Ctrl+M / Ctrl+Enter 只避让改名框，不避让其它
+  // 输入框），不走 isTypingTarget，也不该被这里的断言当成副本。
   check(
     `isTypingTarget 调用点共 ${sites.length} 处（期望 7，逐个核对）`,
     sites.length === 7

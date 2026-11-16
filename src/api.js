@@ -40,6 +40,15 @@ export async function getDirSize(path) {
   return invoke("get_dir_size", { path });
 }
 
+/// 读取一个文件的属性：大小、时间戳、属性标记，以及图像的尺寸 / EXIF / GPS。
+///
+/// `image` 为 null 表示「不是图像（或读不出元数据）」—— 属性窗口对任何文件
+/// 都必须能开，所以「没有图像信息」不是错误。图像元数据由后端逐字节解析
+/// （见 src-tauri/src/imagemeta.rs），不引第三方 crate。
+export async function getFileProperties(path) {
+  return invoke("read_file_properties", { path });
+}
+
 export async function deleteToTrash(path) {
   return invoke("delete_to_trash", { path });
 }
