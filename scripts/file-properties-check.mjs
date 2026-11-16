@@ -340,6 +340,55 @@ check(
   /v-if="!image && !video"/.test(dialogSrc)
 );
 
+section("5c. 视频优先：看视频属性时不显示图像信息");
+
+// 根因在后端：MP4 / MOV / M4V / 3GP 的文件头也是 ISO BMFF，与 HEIC 同源。
+// 早先 imagemeta 只看「有没有 ftyp」，于是 MP4 被认成一个「格式 HEIF」的
+// 图像 —— 属性窗口里就多出一块空的图像信息。判据现在是 brand 清单。
+const imageSrc = stripComments(fs.readFileSync(IMAGEMETA, "utf8"));
+const videoCode = stripComments(videoSrc);
+
+check(
+  "imagemeta 的 BMFF 分支认不出图像 brand 时放弃（不返回图像元数据）",
+  /let\s+format\s*=\s*bmff_image_brand\(&buf\)\?/.test(imageSrc)
+);
+
+const brandHelper = bodyOf(imageSrc, "fn bmff_image_brand(buf: &[u8]) -> Option<&'static str> {");
+check("抽到 bmff_image_brand 函数体", !!brandHelper);
+check(
+  "bmff_image_brand 的兜底是 None（MP4 / MOV 落到这里）",
+  !!brandHelper && /\n\s*None\s*\}$/.test(brandHelper)
+);
+
+check(
+  "imagemeta 有一份共享的图像 brand 清单（pub const IMAGE_BRANDS）",
+  /pub\s+const\s+IMAGE_BRANDS\s*:\s*&\[&str\]/.test(imageSrc)
+);
+check(
+  "videometa 用的是同一份清单（不再自带一份 —— 两份会漂）",
+  /use\s+crate::imagemeta::\{[^}]*IMAGE_BRANDS[^}]*\}/.test(videoCode) &&
+    !/const\s+IMAGE_BRANDS\s*:\s*&\[&str\]/.test(videoCode)
+);
+check(
+  "Rust 里有回归测试：MP4 / MOV 不被认成图像，HEIC 仍被认成图像",
+  /fn\s+iso_bmff_video_is_not_claimed_as_image\s*\(/.test(imageSrc) &&
+    /fn\s+heic_is_still_claimed_as_image\s*\(/.test(imageSrc)
+);
+
+// 前端：视频优先 —— 有 video 时 image 一律为空，图像区块整块不渲染。
+const imageComputed = /const\s+image\s*=\s*computed\(([\s\S]{0,400}?)\)\s*;/.exec(dialogSrc);
+check("抽到 image 的 computed", !!imageComputed);
+check(
+  "image 的 computed 在有 video 时返回 null（视频优先）",
+  !!imageComputed &&
+    /info\.value\?\.video/.test(imageComputed[0]) &&
+    /return\s+null/.test(imageComputed[0])
+);
+check(
+  "图像区块仍然由 image 驱动（图片照常显示这一块）",
+  /<section\s+v-if="image"\s+class="block">/.test(dialogSrc)
+);
+
 section("6. 对话框组件");
 
 check("组件声明了 path prop", /defineProps\([\s\S]{0,200}path\s*:\s*\{\s*type:\s*String/.test(dialogSrc));
@@ -457,6 +506,18 @@ if (process.argv.includes("--mutate")) {
     { name: "⑱ GPS 只看图片（视频里的位置不显示了）", file: DIALOG,
       from: "const gps = computed(() => info.value?.image?.gps || info.value?.video?.gps || null);",
       to: "const gps = computed(() => info.value?.image?.gps || null);" },
+    { name: "⑲ 后端把 MP4 也认成图像（视频属性窗口多出一块图像信息）", file: IMAGEMETA,
+      from: "    // 主 brand 与兼容列表都没有图像 brand → 视频容器，不认领成图像。\n    None\n",
+      to: "    // 主 brand 与兼容列表都没有图像 brand → 视频容器，不认领成图像。\n    Some(\"HEIF\")\n" },
+    { name: "⑳ 前端不再让视频优先（视频属性窗口又显示图像信息）", file: DIALOG,
+      from: "  if (info.value?.video) return null;",
+      to: "  // 视频优先被去掉了" },
+    { name: "㉑ videometa 自带一份 brand 清单（与 imagemeta 漂移）", file: VIDEOMETA,
+      from: "use crate::imagemeta::{ExifField, GpsInfo, IMAGE_BRANDS};",
+      to: "use crate::imagemeta::{ExifField, GpsInfo};\nconst IMAGE_BRANDS: &[&str] = &[\"heic\", \"heix\"];" },
+    { name: "㉒ 后端认不出 brand 时硬编一个 HEIF（MP4 又被当成图像）", file: IMAGEMETA,
+      from: "        let format = bmff_image_brand(&buf)?;",
+      to: "        let format = bmff_image_brand(&buf).unwrap_or(\"HEIF\");" },
   ];
 
   for (const mu of mutations) {

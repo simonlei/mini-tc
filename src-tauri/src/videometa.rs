@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::imagemeta::{ExifField, GpsInfo};
+use crate::imagemeta::{ExifField, GpsInfo, IMAGE_BRANDS};
 
 /// 探测到的视频元数据。
 #[derive(Serialize, Clone, Default, Debug)]
@@ -279,9 +279,9 @@ fn parse_bmff(f: &mut File, file_len: u64) -> Option<VideoMeta> {
 
     // HEIC / AVIF 这些也走 ISO BMFF，但它们是**图像**：不认领，否则属性
     // 窗口会给一张 HEIC 图显示「视频信息」。
-    const IMAGE_BRANDS: &[&str] = &[
-        "heic", "heix", "hevc", "hevx", "mif1", "msf1", "avif", "avis", "crx", "jxl",
-    ];
+    //
+    // 判据用的是 `imagemeta` 里那同一份清单（那边拿它把视频从图像里排除），
+    // 两边互为补集 —— 各写一份必然会漂。
     let is_image = IMAGE_BRANDS.contains(&brand.as_str())
         || compatible
             .iter()

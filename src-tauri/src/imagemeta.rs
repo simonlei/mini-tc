@@ -26,6 +26,15 @@ use std::path::Path;
 /// 属性就把一张 30 MB 的原片整个读进内存。
 const PROBE_LIMIT: usize = 4 * 1024 * 1024;
 
+/// ISO BMFF 里代表**图像**的 brand（HEIC / HEIF / AVIF …）。
+///
+/// 同一份清单也用在 [`crate::videometa`] 里把图像从视频里排除：两边必须
+/// 一致，否则会出现「视频被当图像」（属性窗口里多出一块空的图像信息）或
+/// 「图像被当视频」（给一张 HEIC 显示视频信息）的洞。
+pub const IMAGE_BRANDS: &[&str] = &[
+    "heic", "heix", "hevc", "hevx", "mif1", "msf1", "avif", "avis", "crx", "jxl",
+];
+
 /// 一条 EXIF 字段（标签 + 已格式化好的值）。
 #[derive(Serialize, Clone, Debug)]
 pub struct ExifField {
@@ -144,14 +153,13 @@ pub fn probe(path: &Path) -> Option<ImageMeta> {
     }
 
     // ISO BMFF（HEIC / HEIF / AVIF）：第 4..8 字节是 "ftyp"
+    //
+    // 但 MP4 / MOV / M4V / 3GP 也是 ISO BMFF，文件头与 HEIC 一模一样 ——
+    // 只有 brand 能分开。brand 不认领成图像：否则属性窗口会给一个视频同时
+    // 显示「图像信息（格式 HEIF）」和「视频信息」。判据用的是与 `videometa`
+    // 同一份 [`IMAGE_BRANDS`]，两边互为补集。
     if buf.len() >= 12 && &buf[4..8] == b"ftyp" {
-        let brand = &buf[8..12];
-        let format = match brand {
-            b"heic" | b"heix" | b"hevc" | b"hevx" => "HEIC",
-            b"mif1" | b"msf1" => "HEIF",
-            b"avif" | b"avis" => "AVIF",
-            _ => "HEIF",
-        };
+        let format = bmff_image_brand(&buf)?;
         let mut meta = ImageMeta {
             format: format.to_string(),
             ..Default::default()
@@ -452,7 +460,55 @@ fn parse_webp(buf: &[u8], meta: &mut ImageMeta) {
     }
 }
 
-// ── ISO BMFF（HEIC / AVIF）──
+// ── ISO BMFF（HEIC / HEIF / AVIF）──
+
+/// brand → 图像格式名。不是图像 brand 返回 `None`。
+fn image_brand_format(brand: &[u8]) -> Option<&'static str> {
+    match brand {
+        b"heic" | b"heix" | b"hevc" | b"hevx" => Some("HEIC"),
+        b"mif1" | b"msf1" => Some("HEIF"),
+        b"avif" | b"avis" => Some("AVIF"),
+        b"crx" => Some("CR3"),
+        b"jxl" => Some("JPEG XL"),
+        _ => None,
+    }
+}
+
+/// 从 `ftyp` box 里读 brand，判断这是不是图像容器；是则给出格式名。
+///
+/// `ftyp` 的布局是：`size`(4) + `"ftyp"`(4) + 主 brand(4) + minor version(4)，
+/// 之后是兼容 brand 列表（每个 4 字节，直到 box 结束）。主 brand 认不出来时
+/// 还要看兼容列表：有些 HEIC 把主 brand 写成 `mif1`，兼容列表里才写 `heic`。
+///
+/// 认不出图像 brand 就返回 `None` —— `isom` / `mp42` / `qt  ` 这些是视频
+/// 容器（MP4 / MOV / M4V / 3GP），文件头与 HEIC 完全一样，只有 brand 能分开。
+fn bmff_image_brand(buf: &[u8]) -> Option<&'static str> {
+    // 主 brand。
+    if let Some(fmt) = image_brand_format(&buf[8..12]) {
+        return Some(fmt);
+    }
+    // 兼容 brand 列表：从 minor version 之后开始，每 4 字节一个。
+    let end = bmff_ftyp_end(buf);
+    let mut p = 16usize;
+    while p + 4 <= end {
+        if let Some(fmt) = image_brand_format(&buf[p..p + 4]) {
+            return Some(fmt);
+        }
+        p += 4;
+    }
+    // 主 brand 与兼容列表都没有图像 brand → 视频容器，不认领成图像。
+    None
+}
+
+/// `ftyp` box 的结束偏移。size 为 0 表示「一直到文件尾」；小于 16 说明这个
+/// box 不可信（连主 brand 都放不下），按文件尾兜底。
+fn bmff_ftyp_end(buf: &[u8]) -> usize {
+    let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if size == 0 || size < 16 {
+        return buf.len();
+    }
+    size.min(buf.len())
+}
 
 fn parse_bmff(buf: &[u8], meta: &mut ImageMeta) {
     // `ispe`（图像空间尺寸）可能埋在 meta/ipr/ipco 里的任意一层，扫描比逐层
@@ -1665,5 +1721,66 @@ mod tests {
         assert_eq!(gps.altitude, Some(123.0));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 造一个只有 `ftyp` box 的 ISO BMFF 文件：主 brand + 兼容 brand 列表。
+    fn bmff_with_brands(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let size = 16 + compatible.len() * 4;
+        out.extend_from_slice(&(size as u32).to_be_bytes());
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(major);
+        out.extend_from_slice(&0u32.to_be_bytes()); // minor version
+        for c in compatible {
+            out.extend_from_slice(*c);
+        }
+        out
+    }
+
+    /// MP4 / MOV 的文件头也是 ISO BMFF —— 不能被认成图像。
+    ///
+    /// 这是「视频属性窗口里多出一块空的图像信息」的根因：早先这里只看
+    /// `ftyp` 在不在，MP4 于是被当成一个「格式 HEIF」的图像认领了。
+    #[test]
+    fn iso_bmff_video_is_not_claimed_as_image() {
+        let dir = std::env::temp_dir().join("mini-tc-imagemeta-test");
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+
+        // 主 brand "isom"（MP4），兼容 brand "isom" / "iso2"。
+        let mp4_path = dir.join("clip.mp4");
+        std::fs::write(&mp4_path, bmff_with_brands(b"isom", &[b"isom", b"iso2"]))
+            .expect("应能写临时文件");
+        assert!(probe(&mp4_path).is_none(), "MP4 不该被认成图像");
+
+        // QuickTime：主 brand "qt  "。
+        let mov_path = dir.join("clip.mov");
+        std::fs::write(&mov_path, bmff_with_brands(b"qt  ", &[b"qt  "])).expect("应能写临时文件");
+        assert!(probe(&mov_path).is_none(), "MOV 不该被认成图像");
+
+        let _ = std::fs::remove_file(&mp4_path);
+        let _ = std::fs::remove_file(&mov_path);
+    }
+
+    /// HEIC 走的是同一个 ftyp 结构 —— 必须仍然被认成图像。
+    #[test]
+    fn heic_is_still_claimed_as_image() {
+        let dir = std::env::temp_dir().join("mini-tc-imagemeta-test");
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+
+        let heic_path = dir.join("photo.heic");
+        std::fs::write(&heic_path, bmff_with_brands(b"heic", &[b"mif1", b"heic"]))
+            .expect("应能写临时文件");
+        let meta = probe(&heic_path).expect("HEIC 应被认成图像");
+        assert_eq!(meta.format, "HEIC");
+
+        // 主 brand 是 "mif1"、图像 brand 只出现在兼容列表里 —— 也要认出来。
+        let heif_path = dir.join("photo2.heif");
+        std::fs::write(&heif_path, bmff_with_brands(b"mif1", &[b"mif1", b"heic"]))
+            .expect("应能写临时文件");
+        let meta = probe(&heif_path).expect("兼容列表里有 heic 就该被认成图像");
+        assert_eq!(meta.format, "HEIF");
+
+        let _ = std::fs::remove_file(&heic_path);
+        let _ = std::fs::remove_file(&heif_path);
     }
 }

@@ -4,7 +4,8 @@
 
     Blocks, in the order Total Commander shows them:
       基本信息 — name / type / size / timestamps / attribute flags
-      图像信息 — format, pixel dimensions, colour info (only for images)
+      图像信息 — format, pixel dimensions, colour info (images only: a file
+                  recognised as a video never shows this block)
       视频信息 — container, duration, resolution, codecs, bitrate (only for videos)
       GPS     — coordinates, altitude, bearing (only when the file carries them)
       EXIF    — every tag the backend could decode, verbatim
@@ -283,7 +284,13 @@ async function load() {
 // the new one. `path` is the single source of truth for "which file".
 watch(() => props.path, load);
 
-const image = computed(() => info.value?.image || null);
+// 视频优先：被认领为视频的文件不再显示「图像信息」。
+// MP4 / MOV 的文件头是 ISO BMFF，与 HEIC 同源 —— 两边都探到过同一个文件，
+// 视频属性窗口里那个「格式 HEIF」的图像区块只是噪音。
+const image = computed(() => {
+  if (info.value?.video) return null;
+  return info.value?.image || null;
+});
 const video = computed(() => info.value?.video || null);
 // GPS can come from either side: a photo's EXIF, or a phone recording's
 // container (ISO 6709 position / XMP). Image wins when a file somehow has

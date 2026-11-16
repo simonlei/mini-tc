@@ -241,23 +241,26 @@ Windows 上把文件送进回收站是一次跨卷移动。后端每删一个文
 
 **图像**（`src-tauri/src/imagemeta.rs`）按文件头判定格式，逐个解 JPEG / PNG / WebP / GIF / BMP / TIFF / HEIC / AVIF，读出尺寸、色彩类型、位深、方向，以及 EXIF（含 GPS）。
 
+ISO BMFF 这一支只认**图像 brand**（`imagemeta::IMAGE_BRANDS`：heic / heix / hevc / hevx / mif1 / msf1 / avif / avis / crx / jxl）。MP4 / MOV / M4V / 3GP 的文件头与 HEIC 完全一样，只有 brand 能分开；把它们认成图像，属性窗口就会给一个视频同时显示「图像信息（格式 HEIF）」和「视频信息」。这份清单与 `videometa` 排除图像时用的是**同一份**（`use crate::imagemeta::IMAGE_BRANDS`），两边互为补集 —— 各写一份必然漂。
+
 **视频**（`src-tauri/src/videometa.rs`）是同一套思路：不引第三方 crate，按文件头分流到四套解析器 —— ISO BMFF（MP4 / MOV / M4V / 3GP）、Matroska / WebM（EBML）、AVI（RIFF）、FLV（AMF0）。读出容器格式、时长、分辨率、帧率、视频 / 音频编码、声道、采样率、平均码率、创建时间，外加容器自带的标签（iTunes `©xxx`、QuickTime `com.apple.quicktime.*`、`meta/keys` 自定义键）与内嵌的完整 EXIF / XMP。
 
-三个判定是这套东西的骨架：
+四个判定是这套东西的骨架：
 
 - **按文件头，不按扩展名。** 扩展名可以随便改，文件头不会骗人。
 - **必须真的有视频轨才认领。** `.m4a` 也是 ISO BMFF，纯音频文件不认 —— 否则属性窗口会给一个音乐文件显示「视频信息」。HEIC / AVIF 走的是同一套 box 结构，但它们是**图像**，brand 命中就直接返回 `None`。
+- **图像与视频互斥。** 一个文件要么被认成图像，要么被认成视频，要么都不是 —— 不能既显示「图像信息」又显示「视频信息」。ISO BMFF 里能同时满足两边的只有 brand 清单，所以两边共用一份（`imagemeta::IMAGE_BRANDS`）。前端再补一道闸：`FilePropertiesDialog.vue` 的 `image` computed 在 `video` 存在时直接返回 `null`。
 - **解析失败只少几行，不报错。** 所有字段都是 `Option`，读不出来就是 `None`，窗口里那一行不显示。属性窗口对任何文件都要能打开。
 
 显示尺寸取 `tkhd` 而不是 `stsd`：竖屏视频的 `tkhd` 已经按旋转矩阵交换过宽高，和资源管理器显示的一致；`stsd` 给的是编码尺寸，只作兜底。
 
 平均码率是「文件大小 ÷ 时长」，即整个文件的平均码率（含容器开销与音视频轨之和）—— 容器里通常没有可靠的轨道级码率。
 
-**前端。** `FilePropertiesDialog.vue` 按「基本信息 / 图像信息 / 视频信息 / GPS / EXIF / 视频标签」六个区块渲染。GPS 同时服务图片与视频（`image.gps || video.gps`）：照片的 GPS 来自 EXIF，手机录的视频的 GPS 来自容器的 ISO 6709 位置串或 XMP。
+**前端。** `FilePropertiesDialog.vue` 按「基本信息 / 图像信息 / 视频信息 / GPS / EXIF / 视频标签」六个区块渲染。GPS 同时服务图片与视频（`image.gps || video.gps`）：照片的 GPS 来自 EXIF，手机录的视频的 GPS 来自容器的 ISO 6709 位置串或 XMP。「图像信息」区块在文件被认成视频时不渲染 —— 后端已经不认视频为图像，前端这道闸是兜底（MP4 / MOV 的文件头与 HEIC 同源，两边都探到过同一个文件，属性窗口里那个「格式 HEIF」的图像区块只是噪音）。
 
 **格式化的唯一实现。** 时长与码率的格式化原本是 `VideoPreview.vue` 里的本地 `fmtTime`。属性窗口也要显示时长，再抄一份就会出现「同一个视频，预览里 01:30、属性里 1:30」这种漂移 —— 与当初 `formatBytes` 有 8 份副本是同一类问题。所以把语义原样搬进 `src/format.js`（`formatDuration` / `formatBitrate`），两个调用点都从那里取。码率按十进制换算（1 kbps = 1000 bps），与容器自己的口径一致。
 
-测试见 `scripts/file-properties-check.mjs`（跨文件接缝 + 18 个变异臂）与 `scripts/format-duration-check.mjs`（纯函数表 + 对照臂 + 8 个变异臂）。
+测试见 `scripts/file-properties-check.mjs`（跨文件接缝 + 21 个变异臂）与 `scripts/format-duration-check.mjs`（纯函数表 + 对照臂 + 8 个变异臂）。
 
 ## 配置落盘与窗口几何
 
