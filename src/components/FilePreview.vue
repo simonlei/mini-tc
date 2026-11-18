@@ -395,7 +395,12 @@ function getExtension(name) {
 // 缩放比例一律相对**原始像素**：1 = 100% = 原始大小（上限，见 imageZoom.js
 // 的 MAX_SCALE）。超过 100% 只是插值放大，看不到新信息，只有糊 —— 所以封顶。
 
-const imgScrollRef = ref(null);
+// ⚠️ 这个变量名**必须**和模板里的 `ref="imageScrollRef"` 完全一致。
+// Vue 3 的 <script setup> 是按变量名绑定模板 ref 的：名字对不上时
+// ref 会一直是 null，而且**不报任何错** —— 后果是 measureView() 量不到
+// 容器、fitScale 退化成 1、居中与缩放全部静默失效。
+// scripts/template-ref-check.mjs 会守住这条。
+const imageScrollRef = ref(null);
 const imageRef = ref(null);
 // <img> 的原始像素尺寸（onImageLoad 拿到 naturalWidth/Height）。
 const imgNatural = ref({ w: 0, h: 0 });
@@ -476,7 +481,7 @@ const zoomLevelTitle = computed(() =>
 // ⚠️ 用 clientWidth/clientHeight：它**不含滚动条占位**，正是图片实际能看到的
 // 那块。「适应窗口」按它算，图片才不会比可视区大出一截（多出一条滚动条）。
 function measureView() {
-  const el = imgScrollRef.value;
+  const el = imageScrollRef.value;
   if (!el) return;
   const cs = getComputedStyle(el);
   const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
@@ -495,7 +500,7 @@ function observeView() {
     viewObserver.disconnect();
     viewObserver = null;
   }
-  const el = imgScrollRef.value;
+  const el = imageScrollRef.value;
   if (!el) return;
   measureView();
   if (typeof ResizeObserver === "undefined") return;
@@ -518,7 +523,7 @@ function currentMediaEl() {
 // 缩放到指定比例，并把 cursor（视口坐标）下的那一点内容留在原地。
 // cursor 为 null 时以视口中心为锚。
 async function applyZoom(nextScale, cursor) {
-  const el = imgScrollRef.value;
+  const el = imageScrollRef.value;
   const media = currentMediaEl();
   if (!el || !media) return;
   const before = media.getBoundingClientRect();
@@ -564,7 +569,7 @@ function zoomOut() {
 
 function zoomFit() {
   zoomMode.value = "fit";
-  const el = imgScrollRef.value;
+  const el = imageScrollRef.value;
   if (el) {
     el.scrollLeft = 0;
     el.scrollTop = 0;
@@ -580,7 +585,7 @@ function zoomActual() {
 // 不按 Ctrl 的滚轮留给浏览器自己滚动 —— 图片放大后要能上下左右看。
 // Shift+滚轮 = 左右滚动（各平台的原生行为不一致，这里自己做）。
 function onImageWheel(e) {
-  const el = imgScrollRef.value;
+  const el = imageScrollRef.value;
   if (!el) return;
   if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();

@@ -69,6 +69,10 @@
 
 ⚠️ 这个组件同时渲染文本 / PDF / Word，`image.*` 的命令**只在图片预览时**认领（`previewType !== "image"` 直接返回），否则按 `Ctrl+=` 会误伤别的预览。
 
+⚠️ **模板的 `ref="X"` 必须和 `<script setup>` 里声明的变量名完全一致。** Vue 3 的 `<script setup>` 是按**变量名**绑定模板 ref 的：名字对不上时 ref 恒为 `null`，**不报任何错**（没 warning、没异常、控制台干净）。踩过的坑：模板写 `ref="imageScrollRef"`、脚本声明 `imgScrollRef` —— 于是一个 `null` 引出三个用户可见症状：`measureView()` 量不到容器 → `viewSize` 永远 `{0,0}` → 图片没有显式宽高也没有居中 margin（贴左上角）；`fitScale` 退化成 `1` →「1:1」按钮永远处于已激活态、点击无反应；滚轮里 `if (!el) return` → `Ctrl+滚轮` 完全没反应。**编译能过、类型检查能过、单测能过，只有真机点一下才发现不对。**
+
+这类失效靠人眼看不住，所以有两条判据守着：`scripts/template-ref-check.mjs`（全项目 `.vue` 扫描：每个静态 `ref="X"` 都要有同名 `ref()` 声明；`:ref="fn"` 是函数 ref，不校验）+ `scripts/image-zoom-behavior-check.mjs`（把组件里那段缩放代码**原样抽出来**塞进 jsdom 的真 DOM 里跑，验证「量尺寸 → 居中 → 缩放 → 滚轮」整条链真的通）。静态断言防「写错」，行为断言防「接不上」；后者还带一条**对照臂**（把 ref 置 null 复现事故现场），确认前面那些断言不是恒真。
+
 ### HEIC / HEIF
 
 WebView2 没有原生 HEIC 解码器，走 `src/heicDecoder.js` + `src/heicDecode.worker.js`。Worker 里用 libheif 的 WebAssembly 版解码成 RGBA，主线程再 canvas 编成 JPEG 交给 `<img>`，图上标注「已转换为 JPEG」。wasm 约 2 MB，按需加载（`?worker` 导入 + `optimizeDeps.include` 登记），启动不受影响。两道上限：单文件 60 MB、解码后 5000 万像素（12MP 手机照片约需 48.8 MB RGBA 缓冲）。
