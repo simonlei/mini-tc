@@ -38,6 +38,7 @@ const { stripComments } = mod;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FILELIST = path.join(ROOT, "src", "components", "FileList.vue");
 const DIALOG = path.join(ROOT, "src", "components", "ShortcutsDialog.vue");
+const PREVIEW = path.join(ROOT, "src", "components", "FilePreview.vue");
 
 let passed = 0;
 const failures = [];
@@ -189,6 +190,7 @@ section("4. 反向：非 composition 的普通按键仍然正常命中（守卫�
 
 const listSrc = stripComments(fs.readFileSync(FILELIST, "utf8"));
 const dialogSrc = stripComments(fs.readFileSync(DIALOG, "utf8"));
+const previewSrc = stripComments(fs.readFileSync(PREVIEW, "utf8"));
 
 // 从 `function <name>(` 起配平花括号抽函数体。
 // ⚠️ 方法论记着：起点必须先跳过参数列表再找 `{`，否则默认参数里的花括号
@@ -216,6 +218,10 @@ const HANDLERS = [
   { file: "FileList.vue", src: listSrc, decl: "function onSearchKeydown(e) {", claims: false },
   { file: "FileList.vue", src: listSrc, decl: "function onRenameKeydown(e) {", claims: false },
   { file: "ShortcutsDialog.vue", src: dialogSrc, decl: "function onRecordKeydown(e) {", claims: false },
+  // 图片预览的缩放快捷键（Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+1）。
+  // 它认领命令（matches），所以守卫的顺序同样要紧 —— 中文选词时按 Ctrl+=
+  // 不该把图片放大。
+  { file: "FilePreview.vue", src: previewSrc, decl: "function onPreviewKey(e) {", claims: true },
 ];
 
 for (const h of HANDLERS) {

@@ -51,6 +51,24 @@
 
 配置落在 `~/.minitc/preview-extensions.json`（`{ version: 2, types: {...} }`）。旧的 `text-preview-extensions.json` 只作迁移输入：数组是「用户增量」格式要与内置取并集，`{ext:bool}` 是全量格式；新文件存在时旧文件不再生效。`""` 是合法键，代表无后缀文件（「按文本预览」按钮写入的哨兵），序列化与 UI 都要保留它。HEIC / mammoth 只是 image / doc **类型内部**的渲染策略，不是第六、第七种预览类型。
 
+### 图片缩放
+
+长图（微信截图动辄 572×7191）在旧的 `max-width/max-height:100%` 下被压到几像素宽 —— 整张图只剩一条线。缩放的比例一律相对**原始像素**，`1` = 100% = 原始大小，**封顶**（`imageZoom.js` 的 `MAX_SCALE`）：再往上只是插值放大，看不到新信息，只有糊。
+
+**算术全在 `src/imageZoom.js`**（纯函数，node 可直接 import），组件只负责「量尺寸」和「写样式」。同一语义的实现不许出现第二份。
+
+**档位是固定的（25% / 50% / 75% / 100%），不是连续倍率。** 长图在窄面板里「适应窗口」只有 8%，从那里按倍率爬到 100% 要按十几次；固定档位四步就到，且每一档都能预期。需要更细的粒度用 `Ctrl+滚轮`（连续缩放）。
+
+**缩放锚点要补偿，否则长图一放大，光标附近的内容就跳走了。** `anchorScroll()` 的推导：光标压在图片的哪个相对位置上 `f = (cursor.x - before.left) / before.width`；缩放后这个源像素落在 `after.left + f * after.width`；要它仍停在光标处，新的滚动量 = `(after.left + scroll) + f * after.width - cursor.x`。⚠️ `scroll` 必须是**测量 after 那一刻**的值 —— 内容尺寸变了，浏览器可能已把滚动量夹到新范围内。
+
+**居中不用 flex 的 `margin:auto` / `justify-content:center`。** 那套在内容溢出容器时会让溢出的**起始侧**滚不到（长图的顶部/左侧够不着，这是 flex 居中的经典坑）。这里自己算：显示尺寸比可视区小就居中，大了就贴边（0 偏移），两头都够得着。同理，滚动容器 `.image-scroll` 也不能是 flex 容器。
+
+**「适应窗口」与「放大」共用同一套 px 几何**（`imageStyle` 统一算 width/height/margin），否则两档之间的衔接处会差一截、锚点补偿也就对不上。适应档额外保留 `max-width/max-height:100%` 兜底：万一测量晚了一帧，也不会溢出长出一条多余的滚动条。
+
+**键盘快捷键登记在 `src/shortcuts.js`**（`image.*` 作用域），组件用 `matches()` + `markHandled()` 认领 —— 与视频预览同一套做法（window 捕获阶段）。⚠️ 键名必须与 `eventKeyName` 的产出**完全一致**：`CODE_KEYS` 把 `Equal` 映成 `"="`、`Minus` 映成 `"-"`、数字键落到 `e.key`（`"0"` / `"1"`）。写成 `"Ctrl+Equal"` 这种物理键名会永远匹配不上，**而且不报错** —— 快捷键静默失效，最难查的一类 bug。
+
+⚠️ 这个组件同时渲染文本 / PDF / Word，`image.*` 的命令**只在图片预览时**认领（`previewType !== "image"` 直接返回），否则按 `Ctrl+=` 会误伤别的预览。
+
 ### HEIC / HEIF
 
 WebView2 没有原生 HEIC 解码器，走 `src/heicDecoder.js` + `src/heicDecode.worker.js`。Worker 里用 libheif 的 WebAssembly 版解码成 RGBA，主线程再 canvas 编成 JPEG 交给 `<img>`，图上标注「已转换为 JPEG」。wasm 约 2 MB，按需加载（`?worker` 导入 + `optimizeDeps.include` 登记），启动不受影响。两道上限：单文件 60 MB、解码后 5000 万像素（12MP 手机照片约需 48.8 MB RGBA 缓冲）。

@@ -30,6 +30,7 @@ export const SCOPES = [
   { key: "global", label: "全局", hint: "应用窗口任意位置生效" },
   { key: "fileList", label: "文件列表", hint: "焦点在文件列表时生效" },
   { key: "video", label: "视频播放", hint: "视频预览打开时生效" },
+  { key: "image", label: "图片预览", hint: "图片预览打开时生效" },
 ];
 
 /// Every configurable shortcut in the app.
@@ -141,6 +142,18 @@ export const COMMANDS = [
   { id: "video.fullscreen", scope: "video", label: "全屏", defaults: ["F"] },
   { id: "video.subtitle", scope: "video", label: "切换字幕", desc: "在已加载的字幕轨之间开关", defaults: ["C"] },
   { id: "video.mute", scope: "video", label: "静音", defaults: ["M"] },
+
+  // ── 图片预览 ──
+  // 长图（微信截图动辄 572×7191）在「适应窗口」下只有几个像素宽，
+  // 必须能放大到原始大小再上下左右翻着看。
+  //
+  // ⚠️ 键名要用 eventKeyName 产出的规范名：CODE_KEYS 把 Equal 映成 "="、
+  // Minus 映成 "-"、数字键落到 e.key（"0"/"1"）。写成 "Ctrl+Equal" 之类
+  // 的物理键名会永远匹配不上（见 shortcuts.js 的 CODE_KEYS 表）。
+  { id: "image.zoomIn", scope: "image", label: "放大图片", desc: "放大预览中的图片，最多到原始大小", defaults: ["Ctrl+="] },
+  { id: "image.zoomOut", scope: "image", label: "缩小图片", desc: "缩小预览中的图片", defaults: ["Ctrl+-"] },
+  { id: "image.zoomFit", scope: "image", label: "图片适应窗口", desc: "缩回整图可见", defaults: ["Ctrl+0"] },
+  { id: "image.zoomActual", scope: "image", label: "图片原始大小", desc: "按 1:1 显示原始像素", defaults: ["Ctrl+1"] },
 ];
 
 export const COMMAND_MAP = Object.fromEntries(COMMANDS.map((c) => [c.id, c]));

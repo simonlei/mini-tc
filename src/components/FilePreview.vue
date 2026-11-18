@@ -27,18 +27,42 @@
     <!-- Image preview -->
     <div class="preview-body image-body" v-else-if="previewType === 'image'">
       <div class="heic-note" v-if="heicNote">{{ heicNote }}</div>
-      <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
-           flashes (and leaks an objectURL per frame); a canvas just gets a
-           drawImage per frame, which is also cheaper than a JPEG round-trip
-           through an <img>. -->
-      <canvas
-        v-if="frameState.count > 1"
-        ref="frameCanvasRef"
-        class="preview-image"
-        :width="frameState.width"
-        :height="frameState.height"
-      ></canvas>
-      <img v-else :src="previewContent" class="preview-image" @load="onImageLoad" @error="onImageError" />
+      <!-- The scroller is a separate element so the zoom toolbar (and the
+           HEIC transport controls) stay put while the picture scrolls under
+           them. The picture's own size is set by `imageStyle`: in 适应窗口 mode
+           the CSS (max-width/height:100%) keeps it inside the panel, once
+           zoomed it gets an explicit px size — otherwise max-height:100%
+           would squeeze a 572×7191 long image back down to a few pixels wide. -->
+      <div class="image-scroll" ref="imageScrollRef" @wheel="onImageWheel">
+        <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
+             flashes (and leaks an objectURL per frame); a canvas just gets a
+             drawImage per frame, which is also cheaper than a JPEG round-trip
+             through an <img>. -->
+        <canvas
+          v-if="frameState.count > 1"
+          ref="frameCanvasRef"
+          class="preview-image"
+          :style="imageStyle"
+          :width="frameState.width"
+          :height="frameState.height"
+        ></canvas>
+        <img
+          v-else
+          ref="imageRef"
+          :src="previewContent"
+          class="preview-image"
+          :style="imageStyle"
+          @load="onImageLoad"
+          @error="onImageError"
+        />
+      </div>
+      <div class="zoom-bar" v-if="naturalSize.w > 0">
+        <button class="zoom-btn" :disabled="!canZoomOut" title="缩小 (Ctrl+-)" @click="zoomOut">−</button>
+        <span class="zoom-level" :title="zoomLevelTitle">{{ zoomLevelText }}</span>
+        <button class="zoom-btn" :disabled="!canZoomIn" title="放大 (Ctrl+=)" @click="zoomIn">＋</button>
+        <button class="zoom-btn wide" :class="{ active: isFit }" title="适应窗口，整图可见 (Ctrl+0)" @click="zoomFit">适应</button>
+        <button class="zoom-btn wide" :class="{ active: isActual }" title="原始大小 1:1 (Ctrl+1)" @click="zoomActual">1:1</button>
+      </div>
       <button
         v-if="frameState.count > 1"
         class="anim-toggle"
@@ -108,7 +132,7 @@
 </template>
 
 <script setup>
-import { ref, watch, computed, onBeforeUnmount, nextTick } from "vue";
+import { ref, watch, computed, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFilePreview } from "../api.js";
 import { previewLands } from "../previewGate.js";
@@ -117,6 +141,17 @@ import { formatBytes as formatSize } from "../format.js";
 import { sanitizeDocxHtml } from "../docxSanitize.js";
 import { previewKindOf } from "../previewConfig.js";
 import { HEIC_IMAGE_EXTENSIONS, MAMMOTH_DOC_EXTENSIONS } from "../previewExtensions.js";
+import { matches, markHandled } from "../shortcuts.js";
+import { isImeKeydown, isTypingTarget } from "../keyboardText.js";
+import {
+  fitScale as computeFitScale,
+  zoomStep,
+  wheelScale,
+  zoomPercent,
+  anchorScroll,
+  MAX_SCALE,
+} from "../imageZoom.js";
+
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
 // Vite web build). The browser build is pure-JS (uses a browser jszip) and
@@ -191,6 +226,22 @@ function releaseHeicUrl() {
 onBeforeUnmount(() => {
   releaseHeicUrl();
   stopAnimation();
+  // The zoom observer watches a DOM node; leaving it attached after unmount
+  // keeps the whole component closure alive (same leak class as the timer).
+  if (viewObserver) {
+    viewObserver.disconnect();
+    viewObserver = null;
+  }
+  // Symmetric with the addEventListener below — a leaked listener would keep
+  // this whole component scope (and its preview state) alive forever.
+  window.removeEventListener("keydown", onPreviewKey, true);
+});
+
+// The image-zoom shortcuts are claimed on the capture phase, so they win over
+// App.vue's global handler (which runs on the bubble phase at the document).
+// Same pattern as the video preview's own key handling.
+onMounted(() => {
+  window.addEventListener("keydown", onPreviewKey, true);
 });
 
 // Concurrency guard for the async preview loaders. Every entry point snapshots
@@ -336,9 +387,267 @@ function getExtension(name) {
   return parts.length > 1 ? parts.pop().toLowerCase() : "";
 }
 
+// ───────────────────────── 图片缩放 ─────────────────────────
+// 长图（微信截图动辄 572×7191）在「适应窗口」下只有几个像素宽，根本看不清。
+// 这里给它一套完整的缩放：适应窗口 → 25% → 50% → 75% → 1:1 原始大小，
+// 放大后容器可上下左右滚动，Ctrl+滚轮以光标为锚点连续缩放。
+//
+// 缩放比例一律相对**原始像素**：1 = 100% = 原始大小（上限，见 imageZoom.js
+// 的 MAX_SCALE）。超过 100% 只是插值放大，看不到新信息，只有糊 —— 所以封顶。
+
+const imgScrollRef = ref(null);
+const imageRef = ref(null);
+// <img> 的原始像素尺寸（onImageLoad 拿到 naturalWidth/Height）。
+const imgNatural = ref({ w: 0, h: 0 });
+// 缩放档：'fit' 跟随窗口，'manual' 由用户定（绝对比例，不随窗口变化）。
+const zoomMode = ref("fit");
+const zoomScale = ref(1);
+// 滚动容器的可用尺寸（去掉内边距），用于算「适应窗口」与居中偏移。
+const viewSize = ref({ w: 0, h: 0 });
+
+// 多帧 HEIC 走 <canvas>，它的原始尺寸就是帧尺寸。
+const naturalSize = computed(() =>
+  frameState.value.count > 1
+    ? { w: frameState.value.width, h: frameState.value.height }
+    : imgNatural.value
+);
+
+// 「适应窗口」的比例。
+const fitScale = computed(() =>
+  computeFitScale(naturalSize.value.w, naturalSize.value.h, viewSize.value.w, viewSize.value.h)
+);
+
+// 当前生效的比例。
+//
+// ⚠️ 这里**不再**按 fitScale 动态夹一次：手动档是绝对比例（相对原始像素），
+// 窗口一变，fitScale 会跟着动，若在这里夹，缩放档位就会在用户没操作时
+// 自己跳一下。夹制只发生在「用户按下放大/缩小」的那一刻（见 zoomIn/zoomOut）。
+const activeScale = computed(() =>
+  zoomMode.value === "fit" ? fitScale.value : zoomScale.value
+);
+
+// 显示尺寸 + 居中偏移。
+//
+// ⚠️ 居中**不用** flex 的 margin:auto —— 那套在内容溢出容器时会让溢出的
+// 那一侧滚不到（长图的顶部/左侧够不着，这是 flex 居中的经典坑）。
+// 这里自己算：显示尺寸比可视区小就居中，大了就贴边（0 偏移），两头都够得着。
+const imageStyle = computed(() => {
+  const nat = naturalSize.value;
+  const avail = viewSize.value;
+  if (!nat.w || !nat.h || !avail.w || !avail.h) return {};
+  const s = activeScale.value;
+  const w = Math.max(1, Math.floor(nat.w * s));
+  const h = Math.max(1, Math.floor(nat.h * s));
+  const mx = Math.max(0, Math.floor((avail.w - w) / 2));
+  const my = Math.max(0, Math.floor((avail.h - h) / 2));
+  const fit = zoomMode.value === "fit";
+  return {
+    width: `${w}px`,
+    height: `${h}px`,
+    // 适应窗口档：保留 max-* 兜底 —— 万一测量晚了一帧，也不会溢出长出
+    // 一条多余的滚动条（object-fit:contain 保证同时不会变形）。
+    // 放大档：必须解除约束，否则 max-height:100% 会把 7191px 高的长图重新
+    // 压回容器高度，缩放等于没做。
+    maxWidth: fit ? "100%" : "none",
+    maxHeight: fit ? "100%" : "none",
+    marginLeft: `${mx}px`,
+    marginRight: `${mx}px`,
+    marginTop: `${my}px`,
+    marginBottom: `${my}px`,
+  };
+});
+
+const isFit = computed(() => zoomMode.value === "fit");
+const isActual = computed(() => activeScale.value >= MAX_SCALE - 1e-9);
+const canZoomIn = computed(() => activeScale.value < MAX_SCALE - 1e-9);
+// 「适应窗口」已经是最小可用比例（再小就没有意义了），所以那一档不能缩。
+const canZoomOut = computed(
+  () => !isFit.value && activeScale.value > fitScale.value + 1e-9
+);
+const zoomLevelText = computed(() => zoomPercent(activeScale.value));
+const zoomLevelTitle = computed(() =>
+  isFit.value
+    ? `适应窗口（原始大小的 ${zoomPercent(fitScale.value)}）`
+    : `原始大小的 ${zoomPercent(activeScale.value)}`
+);
+
+// 测量滚动容器的可用尺寸（去掉内边距）。
+//
+// ⚠️ 用 clientWidth/clientHeight：它**不含滚动条占位**，正是图片实际能看到的
+// 那块。「适应窗口」按它算，图片才不会比可视区大出一截（多出一条滚动条）。
+function measureView() {
+  const el = imgScrollRef.value;
+  if (!el) return;
+  const cs = getComputedStyle(el);
+  const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+  viewSize.value = {
+    w: Math.max(0, el.clientWidth - padX),
+    h: Math.max(0, el.clientHeight - padY),
+  };
+}
+
+let viewObserver = null;
+// .image-scroll 只在预览类型是图片时才存在（模板里是 v-else-if），
+// 所以观察器跟着它出生和销毁。
+function observeView() {
+  if (viewObserver) {
+    viewObserver.disconnect();
+    viewObserver = null;
+  }
+  const el = imgScrollRef.value;
+  if (!el) return;
+  measureView();
+  if (typeof ResizeObserver === "undefined") return;
+  viewObserver = new ResizeObserver(measureView);
+  viewObserver.observe(el);
+}
+
+// 换文件后重置缩放（长图 ↔ 短图的比例完全不同）。
+function resetZoom() {
+  zoomMode.value = "fit";
+  zoomScale.value = 1;
+  imgNatural.value = { w: 0, h: 0 };
+}
+
+// 取当前的图片元素（<img> 或 HEIC 画布）——缩放锚点计算要量它的矩形。
+function currentMediaEl() {
+  return imageRef.value || frameCanvasRef.value;
+}
+
+// 缩放到指定比例，并把 cursor（视口坐标）下的那一点内容留在原地。
+// cursor 为 null 时以视口中心为锚。
+async function applyZoom(nextScale, cursor) {
+  const el = imgScrollRef.value;
+  const media = currentMediaEl();
+  if (!el || !media) return;
+  const before = media.getBoundingClientRect();
+  const anchor =
+    cursor || {
+      x: el.getBoundingClientRect().left + el.clientWidth / 2,
+      y: el.getBoundingClientRect().top + el.clientHeight / 2,
+    };
+
+  zoomMode.value = "manual";
+  zoomScale.value = nextScale;
+  // 等 DOM 真的按新尺寸重排完，才能量到「之后」的矩形与滚动量
+  // （内容尺寸变了，浏览器可能已把滚动量夹到新范围内 —— 必须用那一刻的值）。
+  await nextTick();
+  const after = media.getBoundingClientRect();
+  const next = anchorScroll({
+    before: { left: before.left, top: before.top, width: before.width, height: before.height },
+    after: { left: after.left, top: after.top, width: after.width, height: after.height },
+    cursor: anchor,
+    scroll: { left: el.scrollLeft, top: el.scrollTop },
+  });
+  el.scrollLeft = next.left;
+  el.scrollTop = next.top;
+}
+
+function zoomIn() {
+  if (!canZoomIn.value) return;
+  const next = zoomStep(activeScale.value, 1, fitScale.value);
+  if (next <= activeScale.value + 1e-9) return;
+  applyZoom(next, null);
+}
+
+function zoomOut() {
+  if (!canZoomOut.value) return;
+  const next = zoomStep(activeScale.value, -1, fitScale.value);
+  // 缩到「适应窗口」以下没有意义 —— 直接回到适应窗口档。
+  if (next <= fitScale.value + 1e-9) {
+    zoomFit();
+    return;
+  }
+  applyZoom(next, null);
+}
+
+function zoomFit() {
+  zoomMode.value = "fit";
+  const el = imgScrollRef.value;
+  if (el) {
+    el.scrollLeft = 0;
+    el.scrollTop = 0;
+  }
+}
+
+function zoomActual() {
+  if (isActual.value) return;
+  applyZoom(MAX_SCALE, null);
+}
+
+// Ctrl+滚轮：以光标为锚点连续缩放（Windows 照片查看器的习惯）。
+// 不按 Ctrl 的滚轮留给浏览器自己滚动 —— 图片放大后要能上下左右看。
+// Shift+滚轮 = 左右滚动（各平台的原生行为不一致，这里自己做）。
+function onImageWheel(e) {
+  const el = imgScrollRef.value;
+  if (!el) return;
+  if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    el.scrollLeft += e.deltaY;
+    return;
+  }
+  if (!e.ctrlKey && !e.metaKey) return;
+  e.preventDefault();
+  if (!naturalSize.value.w) return;
+  const base = activeScale.value;
+  const next = wheelScale(base, e.deltaY, fitScale.value, MAX_SCALE);
+  if (Math.abs(next - base) < 1e-9) return;
+  applyZoom(next, { x: e.clientX, y: e.clientY });
+}
+
+// ── 图片缩放的键盘快捷键 ──
+// 与视频预览同一套做法：window 捕获阶段监听 + markHandled()，
+// 这样全局 handler（App.vue）不会在同一个按键上再动作一次。
+//
+// ⚠️ 只在**图片**预览时认领：这个组件同时渲染文本 / PDF / Word，
+// 那些预览打开时按 Ctrl+= 不该有任何反应。
+//
+// ⚠️ IME 守卫必须在 matches() 之前（与 FileList / ShortcutsDialog 同一规矩）：
+// matches() 用 e.code 拼组合键、完全不看合成状态，忘了守卫就会在
+// 中文选词时误触发缩放。
+function onPreviewKey(e) {
+  if (previewType.value !== "image") return;
+  if (isImeKeydown(e)) return;
+  // 焦点在输入框里（比如过滤框）时不抢按键。
+  if (isTypingTarget(e.target)) return;
+  if (matches("image.zoomIn", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    zoomIn();
+    return;
+  }
+  if (matches("image.zoomOut", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    zoomOut();
+    return;
+  }
+  if (matches("image.zoomFit", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    zoomFit();
+    return;
+  }
+  if (matches("image.zoomActual", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    zoomActual();
+  }
+}
+
 function onImageLoad(e) {
   const img = e.target;
   imageInfo.value = `${img.naturalWidth}x${img.naturalHeight}`;
+  imgNatural.value = { w: img.naturalWidth, h: img.naturalHeight };
+  // The container may not have been measured yet (or the window may have
+  // been resized while this image was decoding) — re-measure now that the
+  // natural size is known, so 「适应窗口」 has a real basis.
+  nextTick(measureView);
   // Close the HEIC timeline: everything before this point was producing the
   // blob, this row is the webview's own JPEG decode + first paint. If the
   // "ready -> painted" gap is large, the blob is the wrong size.
@@ -600,6 +909,9 @@ async function loadPreview() {
   pdfLoadError.value = false;
   docMessage.value = "";
   charCount.value = null;
+  // 每换一个文件，缩放档位回到「适应窗口」——上一张图的手动比例对下一张
+  // （可能尺寸完全不同）没有意义。
+  resetZoom();
 
   const ext = getExtension(props.fileName);
   // The shared mapping decides the preview type. `asText` is the one-shot
@@ -746,6 +1058,25 @@ watch(
   },
   { immediate: true }
 );
+
+// The zoom toolbar needs the scroll container's size, and that element only
+// exists while an IMAGE preview is on screen (the template renders it under
+// `v-else-if="previewType === 'image'"`). So the observer is attached when
+// the preview type turns into "image" and dropped again when it doesn't —
+// a watcher on the type, not on mount (at mount the element may not exist
+// yet, and the HEIC path sets the type a tick later).
+watch(previewType, async (t) => {
+  if (t !== "image") {
+    if (viewObserver) {
+      viewObserver.disconnect();
+      viewObserver = null;
+    }
+    return;
+  }
+  // The element is created by this very change — wait a tick for it.
+  await nextTick();
+  observeView();
+});
 </script>
 
 <style scoped>
@@ -856,9 +1187,81 @@ watch(
 
 /* Image preview */
 .image-body {
-  overflow: auto;
+  overflow: hidden;
   background: var(--bg);
+}
+
+/* The scroll container. It is a separate element (not .image-body itself)
+   so the zoom toolbar and the HEIC transport controls stay put while the
+   picture scrolls underneath them.
+
+   ⚠️ NOT a flex container: a flex/grid item that overflows its container
+   gets clipped on the start side (the classic "can't scroll to the top of
+   an oversized centered image" bug) — for a 572×7191 long image that means
+   the top of the picture would be unreachable. Centering is done with
+   explicit margins instead (see imageStyle in the script).
+
+   ⚠️ flex-basis:0 — .preview-body is a ROW-direction flex container, so a
+   basis of `auto` would size this box to its content (the image) and the
+   panel would clip it; basis 0 makes it exactly as wide as the panel. */
+.image-scroll {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
   padding: 12px;
+}
+
+/* Zoom toolbar: zoom out / level / zoom in / fit / 1:1.
+   Pinned bottom-left — the bottom centre is the HEIC play button and the
+   bottom right the frame counter, so the three never overlap. */
+.zoom-bar {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  background: var(--header-bg);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+.zoom-btn {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.zoom-btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.zoom-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.zoom-btn.active {
+  background: var(--accent-dim);
+  color: #fff;
+}
+
+.zoom-level {
+  min-width: 36px;
+  text-align: center;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 /* Transcode notice, pinned above the image without stealing its space. */
@@ -920,11 +1323,23 @@ watch(
   white-space: nowrap;
 }
 
+/* The picture itself.
+
+   The size comes from `imageStyle` (natural pixels × zoom), NOT from
+   max-width/max-height — a max-height:100% would squeeze a 572×7191
+   screenshot back down to a few pixels wide, which is exactly what the
+   zoom feature exists to fix. Centering is done with explicit margins
+   (also from imageStyle) so that an oversized picture stays reachable
+   from both ends.
+
+   The max-* below is only a fallback for the frames before the size is
+   known (before the image has loaded, or before the panel was measured):
+   `imageStyle` overrides them with explicit px as soon as it can. */
 .preview-image {
+  display: block;
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
-  margin: auto;
   border-radius: 2px;
 }
 
