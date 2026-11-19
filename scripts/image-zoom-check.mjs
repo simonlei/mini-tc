@@ -207,8 +207,16 @@ section("7. 静态接线：组件真的用了这个模块");
 
   // 居中必须用**显式像素 margin**，不能用 flex 的 margin:auto ——
   // 那套在内容溢出容器时会让溢出的那一侧滚不到（长图顶部够不着）。
-  check("居中用显式像素 margin", /marginLeft:\s*`\$\{mx\}px`/.test(src));
+  //
+  // ⚠️ 几何计算只有**一处**（imageGeometry）：imageStyle 与 contentSize
+  // 都从它派生。同一语义两份实现必然分叉 —— 曾经 contentSize 把这段抄了
+  // 一遍，导致下面「居中偏移算错」的变异命中 2 处、注入不进去。
+  check("居中用显式像素 margin", /marginLeft:\s*`\$\{g\.mx\}px`/.test(src));
   check("margin 是算出来的居中偏移", /const mx = Math\.max\(0, Math\.floor\(\(avail\.w - w\) \/ 2\)\)/.test(src));
+  check("几何计算只有一处（imageGeometry 是唯一来源）",
+    (src.match(/const mx = Math\.max\(0/g) || []).length === 1);
+  check("contentSize 从 imageGeometry 派生（不自己再算一遍）",
+    /const contentSize = computed\([\s\S]{0,200}?imageGeometry\.value/.test(src));
 
   // 缩放后必须能上下左右滚动 —— 滚动容器自己得是 overflow:auto，
   // 且不能是 flex 容器（flex 会裁掉溢出的起始侧）。

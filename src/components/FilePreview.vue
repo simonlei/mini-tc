@@ -33,7 +33,13 @@
            the CSS (max-width/height:100%) keeps it inside the panel, once
            zoomed it gets an explicit px size — otherwise max-height:100%
            would squeeze a 572×7191 long image back down to a few pixels wide. -->
-      <div class="image-scroll" ref="imageScrollRef" @wheel="onImageWheel">
+      <div
+        class="image-scroll"
+        :class="{ draggable: canDragImage, dragging }"
+        ref="imageScrollRef"
+        @wheel="onImageWheel"
+        @pointerdown="onImagePointerDown"
+      >
         <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
              flashes (and leaks an objectURL per frame); a canvas just gets a
              drawImage per frame, which is also cheaper than a JPEG round-trip
@@ -151,6 +157,12 @@ import {
   anchorScroll,
   MAX_SCALE,
 } from "../imageZoom.js";
+import {
+  dragStarted,
+  dragScroll,
+  canDrag,
+  IMAGE_DRAG_START_THRESHOLD,
+} from "../imageDrag.js";
 
 // mammoth converts .docx (OOXML) into HTML. We load the self-contained browser
 // bundle (NOT the Node entry, which requires `fs`/`path` and would break the
@@ -235,6 +247,9 @@ onBeforeUnmount(() => {
   // Symmetric with the addEventListener below — a leaked listener would keep
   // this whole component scope (and its preview state) alive forever.
   window.removeEventListener("keydown", onPreviewKey, true);
+  // Same for the drag listeners: a drag in flight at unmount would keep
+  // listeners on window pointing at a dead component.
+  endImageDrag();
 });
 
 // The image-zoom shortcuts are claimed on the capture phase, so they win over
@@ -431,34 +446,48 @@ const activeScale = computed(() =>
   zoomMode.value === "fit" ? fitScale.value : zoomScale.value
 );
 
-// 显示尺寸 + 居中偏移。
+// 图片几何：显示尺寸 + 居中偏移。
+//
+// ⚠️ 这是**唯一**一处几何计算 —— imageStyle（写进 DOM 的样式）与
+// contentSize（拖动时判断「能不能拖」的内容总尺寸）都从它派生。
+// 同一语义两份实现必然分叉：曾经 contentSize 把这段抄了一遍，结果
+// image-zoom 的变异臂「居中偏移算错」那个变异命中 2 处、注入不进去。
 //
 // ⚠️ 居中**不用** flex 的 margin:auto —— 那套在内容溢出容器时会让溢出的
 // 那一侧滚不到（长图的顶部/左侧够不着，这是 flex 居中的经典坑）。
 // 这里自己算：显示尺寸比可视区小就居中，大了就贴边（0 偏移），两头都够得着。
-const imageStyle = computed(() => {
+const imageGeometry = computed(() => {
   const nat = naturalSize.value;
   const avail = viewSize.value;
-  if (!nat.w || !nat.h || !avail.w || !avail.h) return {};
+  if (!nat.w || !nat.h || !avail.w || !avail.h) {
+    return { w: 0, h: 0, mx: 0, my: 0 };
+  }
   const s = activeScale.value;
   const w = Math.max(1, Math.floor(nat.w * s));
   const h = Math.max(1, Math.floor(nat.h * s));
   const mx = Math.max(0, Math.floor((avail.w - w) / 2));
   const my = Math.max(0, Math.floor((avail.h - h) / 2));
+  return { w, h, mx, my };
+});
+
+// 显示尺寸 + 居中偏移（写进 DOM 的样式）。
+const imageStyle = computed(() => {
+  const g = imageGeometry.value;
+  if (!g.w || !g.h) return {};
   const fit = zoomMode.value === "fit";
   return {
-    width: `${w}px`,
-    height: `${h}px`,
+    width: `${g.w}px`,
+    height: `${g.h}px`,
     // 适应窗口档：保留 max-* 兜底 —— 万一测量晚了一帧，也不会溢出长出
     // 一条多余的滚动条（object-fit:contain 保证同时不会变形）。
     // 放大档：必须解除约束，否则 max-height:100% 会把 7191px 高的长图重新
     // 压回容器高度，缩放等于没做。
     maxWidth: fit ? "100%" : "none",
     maxHeight: fit ? "100%" : "none",
-    marginLeft: `${mx}px`,
-    marginRight: `${mx}px`,
-    marginTop: `${my}px`,
-    marginBottom: `${my}px`,
+    marginLeft: `${g.mx}px`,
+    marginRight: `${g.mx}px`,
+    marginTop: `${g.my}px`,
+    marginBottom: `${g.my}px`,
   };
 });
 
@@ -475,6 +504,118 @@ const zoomLevelTitle = computed(() =>
     ? `适应窗口（原始大小的 ${zoomPercent(fitScale.value)}）`
     : `原始大小的 ${zoomPercent(activeScale.value)}`
 );
+
+// ── 拖动平移 ──
+//
+// 放大之后按住图片拖一下就能平移（Windows 照片查看器 / Photoshop 的手势）。
+// 滚轮也能滚，但长图上「抓图拖动」顺手得多，触控板上更是同一套肌肉记忆。
+//
+// 状态放在**普通变量**里，不进响应式系统：被拖动的 DOM 元素一旦被
+// reactive() 包成 Proxy，再调 getBoundingClientRect() 在部分引擎里会抛
+// Illegal invocation（this 变成 Proxy 而不是元素）—— 与 TabBar 同一个坑。
+let drag = null;
+
+// 内容是否溢出了可视区（决定了能不能拖、以及光标要不要变 grab）。
+// 内容总尺寸 = 图片显示尺寸 + 它的外边距（居中偏移也是内容的一部分）。
+//
+// ⚠️ 从 imageGeometry 派生，不自己再算一遍 —— 同一语义两份实现必然分叉。
+const contentSize = computed(() => {
+  const g = imageGeometry.value;
+  if (!g.w || !g.h) return { w: 0, h: 0 };
+  return { w: g.w + g.mx * 2, h: g.h + g.my * 2 };
+});
+
+// 能不能拖：内容比可视区大才拖得动。适应窗口时图片整张都在视野里，
+// 拖了也没地方去 —— 这时不该抢走「点一下」的行为。
+const canDragImage = computed(() =>
+  canDrag({
+    contentW: contentSize.value.w,
+    contentH: contentSize.value.h,
+    viewW: viewSize.value.w,
+    viewH: viewSize.value.h,
+  })
+);
+
+// 拖动中（模板要据此换光标，所以是 ref）。
+const dragging = ref(false);
+
+function onImagePointerDown(e) {
+  // 只有主键：中键是粘贴到目录，右键是菜单。
+  if (e.button !== 0) return;
+  // 拖不动的时候不接管 —— 让「点一下图片」这类行为照常。
+  if (!canDragImage.value) return;
+  // 一次只拖一个。
+  if (drag) return;
+  const el = imageScrollRef.value;
+  if (!el) return;
+  drag = {
+    el,
+    pointerId: e.pointerId == null ? 1 : e.pointerId,
+    startX: e.clientX,
+    startY: e.clientY,
+    startLeft: el.scrollLeft,
+    startTop: el.scrollTop,
+    active: false,
+  };
+  // 抓住指针：拖出面板再松手也能收到 pointerup。
+  try {
+    if (typeof el.setPointerCapture === "function") {
+      el.setPointerCapture(drag.pointerId);
+    }
+  } catch {
+    /* 抓不住也能拖：window 上的监听器照样收得到事件 */
+  }
+  window.addEventListener("pointermove", onImagePointerMove);
+  window.addEventListener("pointerup", onImagePointerUp);
+  window.addEventListener("pointercancel", onImagePointerUp);
+}
+
+function onImagePointerMove(e) {
+  if (!drag) return;
+  const dx = e.clientX - drag.startX;
+  const dy = e.clientY - drag.startY;
+  if (!drag.active) {
+    // 移动超过阈值才算「在拖」：否则一次普通的点击会被吃掉。
+    if (!dragStarted(dx, dy, IMAGE_DRAG_START_THRESHOLD)) return;
+    drag.active = true;
+    dragging.value = true;
+  }
+  // 拖动中要吃掉默认行为，否则浏览器会同时做「选中图片」并冒出一圈选中框。
+  if (typeof e.preventDefault === "function") e.preventDefault();
+  const next = dragScroll({
+    startX: drag.startX,
+    startY: drag.startY,
+    curX: e.clientX,
+    curY: e.clientY,
+    startLeft: drag.startLeft,
+    startTop: drag.startTop,
+  });
+  // ⚠️ 滚动量交给浏览器去夹（它天然被夹在 [0, maxScroll] 内），
+  // 自己再夹一遍就要维护第二份「最大值怎么算」的判断。
+  drag.el.scrollLeft = next.left;
+  drag.el.scrollTop = next.top;
+}
+
+function onImagePointerUp() {
+  if (!drag) return;
+  endImageDrag();
+}
+
+function endImageDrag() {
+  const d = drag;
+  drag = null;
+  if (d && d.el && typeof d.el.releasePointerCapture === "function") {
+    try {
+      d.el.releasePointerCapture(d.pointerId);
+    } catch {
+      /* 释放失败无所谓：状态已经清干净了 */
+    }
+  }
+  window.removeEventListener("pointermove", onImagePointerMove);
+  window.removeEventListener("pointerup", onImagePointerUp);
+  window.removeEventListener("pointercancel", onImagePointerUp);
+  dragging.value = false;
+}
 
 // 测量滚动容器的可用尺寸（去掉内边距）。
 //
@@ -513,6 +654,8 @@ function resetZoom() {
   zoomMode.value = "fit";
   zoomScale.value = 1;
   imgNatural.value = { w: 0, h: 0 };
+  // 换文件时如果正在拖，那次拖动作废（起点与新图片无关）。
+  endImageDrag();
 }
 
 // 取当前的图片元素（<img> 或 HEIC 画布）——缩放锚点计算要量它的矩形。
@@ -526,6 +669,9 @@ async function applyZoom(nextScale, cursor) {
   const el = imageScrollRef.value;
   const media = currentMediaEl();
   if (!el || !media) return;
+  // 缩放会改内容尺寸与滚动量 —— 正在拖的话，那次拖的基准（起点滚动量）
+  // 就对不上了，直接结束它（TabBar 同款：手势与状态变更不并行）。
+  endImageDrag();
   const before = media.getBoundingClientRect();
   const anchor =
     cursor || {
@@ -569,6 +715,8 @@ function zoomOut() {
 
 function zoomFit() {
   zoomMode.value = "fit";
+  // 适应窗口会把滚动量归零 —— 正在拖的话基准同样失效。
+  endImageDrag();
   const el = imageScrollRef.value;
   if (el) {
     el.scrollLeft = 0;
@@ -1215,6 +1363,27 @@ watch(previewType, async (t) => {
   min-height: 0;
   overflow: auto;
   padding: 12px;
+}
+
+/* 放大后可以按住图片拖动平移（Windows 照片查看器 / Photoshop 的手势）。
+   光标给出「可以抓」和「正在抓」的提示。
+   ⚠️ 只有内容溢出可视区时才给 grab —— 适应窗口下图片整张都在视野里，
+   拖了也没地方去，不该让用户以为能拖。 */
+.image-scroll.draggable {
+  cursor: grab;
+}
+
+.image-scroll.draggable.dragging {
+  cursor: grabbing;
+}
+
+/* 图片本身不要被浏览器当成可拖拽对象：那会拖出一个半透明的图片副本，
+   跟我们的平移手势打架（原生 drag 一旦启动，pointermove 就不归我们了）。
+   user-select 同理 —— 拖动时别选出图片来。 */
+.image-scroll img,
+.image-scroll canvas {
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 /* Zoom toolbar: zoom out / level / zoom in / fit / 1:1.

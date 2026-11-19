@@ -76,11 +76,31 @@ function sliceBetween(src, fromAnchor, toAnchor) {
 }
 
 // 缩放段的起点：第一个 ref 声明（imageScrollRef）。
-const zoomBlock = sliceBetween(
+// 缩放段的抽取边界。
+//
+// ⚠️ 源码里「缩放段」被拖动段**劈成了两半**（顺序是：
+//    imageScrollRef(418) → 拖动段(516) → measureView(624) → 缩放段续(662+)）。
+//    因为拖动段要读 imageGeometry，imageGeometry 又依赖缩放段的 activeScale。
+//
+// 所以这里抽**两段**再拼起来，跳过中间的拖动段：
+//   · 前半：从 imageScrollRef 到 let drag = null;
+//   · 后半：从 function measureView() 到 let drag 之后的下一个独立块
+//
+// ⚠️ 边界必须是**代码**而不是注释：这份源码过了 stripComments，注释内容
+// 已被替换成空格，中文锚点在剥注释后的文本里根本不存在。
+//
+// 拖动那条线由 scripts/image-drag-behavior-check.mjs 单独覆盖。
+const zoomHead = sliceBetween(
   previewStripped,
   "const imageScrollRef = ref(null);",
-  "function onImageLoad(e) {"
+  "let drag = null;"
 );
+const zoomTail = sliceBetween(
+  previewStripped,
+  "function measureView() {",
+  "\nfunction onPreviewKey(e) {"
+);
+const zoomBlock = zoomHead && zoomTail ? zoomHead + zoomTail : null;
 check("从 FilePreview.vue 抽到了缩放代码段", zoomBlock !== null && zoomBlock.length > 0);
 
 // ── jsdom 环境 ────────────────────────────────────────────────────────
@@ -187,6 +207,10 @@ const FACTORY = `
   const markHandled = () => {};
   const isImeKeydown = () => false;
   const isTypingTarget = () => false;
+  // 拖动段的函数被缩放段调用（resetZoom / applyZoom / zoomFit 都会
+  // endImageDrag()）。拖动那条线由 image-drag-behavior-check.mjs 覆盖，
+  // 这里给个空实现即可 —— 缩放的行为与拖动无关。
+  const endImageDrag = () => {};
 `;
 
 const factory = new Function(

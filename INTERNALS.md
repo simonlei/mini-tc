@@ -73,6 +73,25 @@
 
 这类失效靠人眼看不住，所以有两条判据守着：`scripts/template-ref-check.mjs`（全项目 `.vue` 扫描：每个静态 `ref="X"` 都要有同名 `ref()` 声明；`:ref="fn"` 是函数 ref，不校验）+ `scripts/image-zoom-behavior-check.mjs`（把组件里那段缩放代码**原样抽出来**塞进 jsdom 的真 DOM 里跑，验证「量尺寸 → 居中 → 缩放 → 滚轮」整条链真的通）。静态断言防「写错」，行为断言防「接不上」；后者还带一条**对照臂**（把 ref 置 null 复现事故现场），确认前面那些断言不是恒真。
 
+### 图片拖动平移
+
+放大之后可以直接**按住图片拖动**来平移画面（Windows 照片查看器 / Photoshop 的手势；触控板上更是同一套肌肉记忆）。判定与算术都在 `src/imageDrag.js`（纯函数，node 可直接 import）：
+
+- **`dragStarted(dx, dy)`** —— 位移**超过阈值**（4px）才算「在拖」，否则一次普通点击会被吃掉。用**欧氏距离**而不是逐轴比较：斜着拖（两轴都动一点）也该算拖，逐轴比较会把它判成没拖，手感很黏；而且逐轴还有更糟的后果 —— 横向差 3px、纵向差 50px 时，按逐轴会判「在拖」，可用户主观上是竖着拖了一下，那 3px 的横向抖动不该被当成意图。
+- **`dragScroll({...})`** —— 语义是**图片跟着指针走**（抓图拖动的那只手）：指针往右移 10px，图片也往右移 10px，也就是内容往左移，所以滚动量要**减**去位移。返回值**不夹制** —— 夹制交给浏览器（`scrollLeft` 天然被夹在 `[0, maxScroll]` 内），自己再夹一遍就要维护第二份「最大值怎么算」的判断，而那个判断依赖布局，纯逻辑模块里算不出来。
+- **`canDrag({...})`** —— 内容没溢出可视区时拖不动（此时图片整张都在视野里，拖了也没地方去，也不该抢走「点一下」的行为）。它同时决定光标：可拖时给 `grab`，拖动中给 `grabbing`。
+
+手势走 **Pointer Events**（`pointerdown` / `pointermove` / `pointerup`），与 `src/tabDrag.js` 的标签页排序同一套 —— 项目里的文件拖放与标签排序都已经走 pointer 事件，不引入第三种手势通道。几个必须处理的细节：
+
+- **禁掉图片的原生拖拽**（`-webkit-user-drag: none`）：原生 drag 一旦启动，`pointermove` 就不归我们了，手势直接断掉。
+- **手势与状态变更不并行**：缩放（`applyZoom`）、换文件（`resetZoom`）、适应窗口（`zoomFit`）、组件卸载（`onBeforeUnmount`）都要 `endImageDrag()` —— 这些操作会改内容尺寸或滚动量，正在拖的基准（起点滚动量）就失效了。
+- **只认主键**（`e.button !== 0` 直接返回）：中键是粘贴到目录，右键是菜单。
+- **监听器必须成对增删**：漏删 `pointermove` / `pointerup` / `pointercancel` = `window` 一直吊着整个组件作用域（与 `onBeforeUnmount` 里那句注释同一类泄漏）。
+
+⚠️ **几何计算只有一处**（`imageGeometry`）：`imageStyle`（写进 DOM 的样式）与 `contentSize`（判断能不能拖的内容总尺寸）都从它派生。同一语义两份实现必然分叉 —— 曾经 `contentSize` 把那段抄了一遍，结果 `image-zoom` 变异臂里「居中偏移算错」那个变异命中 **2 处**、注入不进去（`anchor found: 2` → 变异没注入 → 套件报 `1 missed`）。抽出 `imageGeometry` 之后这个变异才恢复成 `22 caught / 0 missed`。
+
+判据：`scripts/image-drag-check.mjs`（纯逻辑真值表 + 静态接线，60 条）、`scripts/image-drag-mutation.mjs`（19 个变异全被抓住）、`scripts/image-drag-behavior-check.mjs`（把拖动代码**原样抽出来**塞进 jsdom，用真的 PointerEvent 驱动，验证「按下 → 移动 → 松手」后滚动量真的变了）。
+
 ### HEIC / HEIF
 
 WebView2 没有原生 HEIC 解码器，走 `src/heicDecoder.js` + `src/heicDecode.worker.js`。Worker 里用 libheif 的 WebAssembly 版解码成 RGBA，主线程再 canvas 编成 JPEG 交给 `<img>`，图上标注「已转换为 JPEG」。wasm 约 2 MB，按需加载（`?worker` 导入 + `optimizeDeps.include` 登记），启动不受影响。两道上限：单文件 60 MB、解码后 5000 万像素（12MP 手机照片约需 48.8 MB RGBA 缓冲）。

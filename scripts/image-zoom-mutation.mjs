@@ -92,7 +92,7 @@ const MUTANTS = [
   {
     target: PREVIEW,
     name: "⑩b 居中改回 flex 的 margin:auto（溢出的那一侧滚不到）",
-    from: "    marginLeft: `${mx}px`,\n    marginRight: `${mx}px`,",
+    from: "    marginLeft: `${g.mx}px`,\n    marginRight: `${g.mx}px`,",
     to: "    marginLeft: \"auto\",\n    marginRight: \"auto\",",
   },
   {
