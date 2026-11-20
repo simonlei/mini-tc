@@ -180,6 +180,10 @@
           :is-dir="previewUnsupportedIsDir"
           @preview-as-text="onPreviewAsText"
         />
+        <Notepad
+          v-else-if="previewVisible && previewPanel === 'left' && previewKind === 'notepad'"
+          @close="closePreview"
+        />
         <FilePanel
           v-show="!(previewVisible && previewPanel === 'left')"
           ref="leftPanel"
@@ -220,6 +224,10 @@
           :file-name="previewFileName"
           :is-dir="previewUnsupportedIsDir"
           @preview-as-text="onPreviewAsText"
+        />
+        <Notepad
+          v-else-if="previewVisible && previewPanel === 'right' && previewKind === 'notepad'"
+          @close="closePreview"
         />
         <FilePanel
           v-show="!(previewVisible && previewPanel === 'right')"
@@ -281,6 +289,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import FilePanel from "./components/FilePanel.vue";
 import FilePreview from "./components/FilePreview.vue";
+import Notepad from "./components/Notepad.vue";
 import VideoPreview from "./components/VideoPreview.vue";
 import UnsupportedPreview from "./components/UnsupportedPreview.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
@@ -1886,10 +1895,37 @@ async function onPreviewAsText() {
   await showFilePreview(entry, path, true, panelId);
 }
 
-async function togglePreview() {
-  if (previewVisible.value) {
+// Notepad is a special preview kind: editable plain text instead of a file
+// rendered in the opposite panel. It follows the same panel / close rules as
+// Ctrl+Q, but has no source file and never follows the file-list selection.
+function isNotepadPreview() {
+  return previewKind.value === "notepad";
+}
+
+function toggleNotepad() {
+  if (previewVisible.value && isNotepadPreview()) {
     closePreview();
     return;
+  }
+  previewPanel.value = activePanel.value === "left" ? "right" : "left";
+  previewKind.value = "notepad";
+  previewFilePath.value = "";
+  previewFileName.value = "";
+  previewFileBytes.value = 0;
+  previewAsText.value = false;
+  previewUnsupportedIsDir.value = false;
+  // No video is behind a notepad; drop any armed autoplay handoff.
+  autoplayGate.arm(null);
+  previewVisible.value = true;
+}
+
+async function togglePreview() {
+  if (previewVisible.value) {
+    const fromNotepad = isNotepadPreview();
+    closePreview();
+    // Ctrl+Q over the notepad means "preview the selected file", not "toggle
+    // the current preview off" — fall through and open the file instead.
+    if (!fromNotepad) return;
   }
 
   const panel = getActivePanelRef();
@@ -1927,6 +1963,7 @@ function closePreview() {
   // restore the file-list selection to it after closing.
   const sourcePanel = previewPanel.value === "left" ? "right" : "left";
   const fileName = previewFileName.value;
+  const wasNotepad = isNotepadPreview();
 
   previewVisible.value = false;
   previewPanel.value = "";
@@ -1956,6 +1993,11 @@ function closePreview() {
       panel?.restoreByNames?.([fileName]);
       panel?.focusList?.();
     });
+  } else if (wasNotepad) {
+    // A notepad has no source file to re-select, but its textarea is being
+    // unmounted — hand the keyboard back to the file list.
+    const panel = sourcePanel === "left" ? leftPanel.value : rightPanel.value;
+    nextTick(() => panel?.focusList?.());
   }
 }
 
@@ -1977,9 +2019,11 @@ watch(
   }),
   (s) => {
     // `unsupported` is a placeholder with nothing to render, so it's not worth
-    // restoring — record "no preview" for it rather than the path.
+    // restoring — record "no preview" for it rather than the path. The notepad
+    // has no file path either, but its editable content is persisted on its
+    // own, so restoring the open panel is still meaningful.
     setPreviewRestore(
-      s.visible && (s.kind === "file" || s.kind === "video")
+      s.visible && (s.kind === "file" || s.kind === "video" || s.kind === "notepad")
         ? { ...s }
         : null
     );
@@ -2001,6 +2045,16 @@ async function restorePreview() {
   await loadViewState();
   const p = consumePreviewRestore();
   if (!p) return;
+  if (p.kind === "notepad") {
+    // No path to check and no listing to wait for: Notepad loads its own text
+    // from ~/.minitc/notepad.json. Restore just the panel it occupied and hand
+    // the keyboard to the opposite (source) file list.
+    previewPanel.value = p.panel;
+    previewKind.value = "notepad";
+    previewVisible.value = true;
+    activePanel.value = p.panel === "left" ? "right" : "left";
+    return;
+  }
   // Wait for both panels' first listing (each fires once; the listener is
   // removed as soon as both have arrived).
   await new Promise((resolve) => {
@@ -2047,6 +2101,7 @@ async function restorePreview() {
 // preview — exit the preview state. Triggered by FilePanel's `deleted` event.
 function onPanelDeleted({ panelId, remainingCount }) {
   if (!previewVisible.value) return;
+  if (isNotepadPreview()) return; // no source file backs the notepad
   const source = previewPanel.value === "left" ? "right" : "left";
   if (panelId !== source) return;
   if (remainingCount === 0) closePreview();
@@ -2060,6 +2115,7 @@ watch(
   },
   async (entry) => {
     if (!previewVisible.value) return;
+    if (isNotepadPreview()) return; // typing a note must never be replaced by a file preview
     if (!entry) return; // keep the current preview when nothing is selected (e.g. after navigating to another directory)
     // Snapshot BEFORE the first await. Every `await` below is a window in which
     // the user can keep arrowing through the list; without this guard the slow
@@ -2112,6 +2168,7 @@ watch(
 // Also update preview when active panel switches
 watch(activePanel, async () => {
   if (!previewVisible.value) return;
+  if (isNotepadPreview()) return; // the notepad stays put when focus moves between lists
 
   // Same guard as the selection watcher: switching panels is itself an async
   // sequence (resolve the new panel's entry path), and the user can switch back
@@ -2362,6 +2419,21 @@ function onGlobalKeydown(e) {
   // and return the source file list to the file that was just previewed. When
   // no preview is open, this is a no-op — Esc no longer cancels selection on
   // the file grid, so we only act while a preview is visible.
+  // Esc from the notepad's own textarea means "close the note", so it is
+  // handled BEFORE the generic typing-target guard below, which would
+  // otherwise hand Esc to the textarea / browser.
+  if (
+    matches("preview.close", e) &&
+    previewVisible.value &&
+    isNotepadPreview() &&
+    e.target?.classList?.contains("notepad-editor")
+  ) {
+    e.preventDefault();
+    markHandled(e);
+    closePreview();
+    return;
+  }
+
   // If focus is inside a text input (the source panel's filename filter or
   // address bar, which stay interactive during preview), let that input handle
   // Esc on its own (e.g. cancel the filter) instead of closing the preview.
@@ -2372,6 +2444,15 @@ function onGlobalKeydown(e) {
       closePreview();
       return;
     }
+  }
+
+  // Ctrl+E: toggle a plain-text notepad in the opposite panel. Claimed even
+  // from its textarea — Ctrl+E has no native text-editing meaning.
+  if (matches("notepad.toggle", e)) {
+    e.preventDefault();
+    markHandled(e);
+    toggleNotepad();
+    return;
   }
 
   // Ctrl+Q: Toggle file preview

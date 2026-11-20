@@ -39,6 +39,9 @@ export const SCOPES = [
 export const COMMANDS = [
   // ── 全局 ──
   { id: "preview.toggle", scope: "global", label: "切换文件预览", desc: "在另一侧面板预览选中文件", defaults: ["Ctrl+Q"] },
+  // 记事本是一种特殊的预览：内容是一份纯文本，可编辑、每秒自动保存，
+  // 存在 ~/.minitc/ 下。同样开在对侧面板，Esc / 再按一次 / Ctrl+Q 关闭。
+  { id: "notepad.toggle", scope: "global", label: "切换记事本", desc: "在对侧面板打开记事本（再按一次或 Esc 关闭，Ctrl+Q 预览文件时也会关闭）", defaults: ["Ctrl+E"] },
   { id: "edit.copy", scope: "global", label: "复制", desc: "复制所选项目到系统剪贴板", defaults: ["Ctrl+C"] },
   { id: "edit.cut", scope: "global", label: "剪切", desc: "剪切所选项目到系统剪贴板", defaults: ["Ctrl+X"] },
   { id: "edit.paste", scope: "global", label: "粘贴", desc: "把系统剪贴板内容粘贴到当前目录", defaults: ["Ctrl+V"] },
