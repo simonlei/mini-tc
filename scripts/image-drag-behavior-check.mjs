@@ -21,6 +21,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { JSDOM } from "jsdom";
 import { dragStarted, dragScroll, canDrag } from "../src/imageDrag.js";
+import { rotatedSize } from "../src/imageRotate.js";
 import mod from "./stripComments.cjs";
 
 const { stripComments } = mod;
@@ -81,8 +82,8 @@ check("抽到了拖动的三个处理函数", handlersBlock !== null && handlers
 // contentSize 抄了一遍几何，变异「居中偏移算错」就命中 2 处、注入不进去）。
 const geometryBlock = sliceBetween(
   previewSrc,
-  "const imageGeometry = computed(() => {",
-  "\nconst imageStyle = computed(() => {"
+  "function geometryFor(scale) {",
+  "\nconst frameStyle = computed(() => {"
 );
 check("抽到了生产代码里的 imageGeometry", geometryBlock !== null && geometryBlock.length > 0);
 
@@ -115,10 +116,13 @@ SCROLL.scrollTop = 0;
 const FACTORY = `
   const { ref, computed } = Vue;
   const { dragStarted, dragScroll, canDrag, IMAGE_DRAG_START_THRESHOLD } = Drag;
+  const { rotatedSize } = Rotate;
   // 外部状态：测试注入
   const viewSize = { value: { w: VIEW_W, h: VIEW_H } };
   const naturalSize = { value: { w: NAT_W, h: NAT_H } };
   const activeScale = { value: 1 };
+  // 旋转档：拖动判据只关心「内容有没有溢出」，这里固定 0°（不换宽高）。
+  const rotation = { value: 0 };
   const imageScrollRef = { value: null };
 `;
 
@@ -127,6 +131,7 @@ const FACTORY = `
 const factory = new Function(
   "Vue",
   "Drag",
+  "Rotate",
   "VIEW_W",
   "VIEW_H",
   "NAT_W",
@@ -159,6 +164,7 @@ try {
   api = factory(
     Vue,
     { dragStarted, dragScroll, canDrag },
+    { rotatedSize },
     AVAIL.w,
     AVAIL.h,
     572,
@@ -261,6 +267,7 @@ section("5. 适应窗口（内容没溢出）时不该接管");
   const fitApi = factory(
     Vue,
     { dragStarted, dragScroll, canDrag },
+    { rotatedSize },
     AVAIL.w,
     AVAIL.h,
     572,
@@ -276,6 +283,7 @@ section("5. 适应窗口（内容没溢出）时不该接管");
   const api2 = factory(
     Vue,
     { dragStarted, dragScroll, canDrag },
+    { rotatedSize },
     AVAIL.w,
     AVAIL.h,
     572,
@@ -287,6 +295,7 @@ section("5. 适应窗口（内容没溢出）时不该接管");
   const smallApi = factory(
     Vue,
     { dragStarted, dragScroll, canDrag },
+    { rotatedSize },
     AVAIL.w,
     AVAIL.h,
     100,
@@ -311,6 +320,7 @@ section("6. 缩放时结束拖动（手势与状态变更不并行）");
   const api3 = factory(
     Vue,
     { dragStarted, dragScroll, canDrag },
+    { rotatedSize },
     AVAIL.w,
     AVAIL.h,
     572,

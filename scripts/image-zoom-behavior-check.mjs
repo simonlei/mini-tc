@@ -37,6 +37,7 @@ import {
   anchorScroll,
   MAX_SCALE,
 } from "../src/imageZoom.js";
+import { rotateStep, rotatedSize } from "../src/imageRotate.js";
 import mod from "./stripComments.cjs";
 
 const { stripComments } = mod;
@@ -102,7 +103,6 @@ const zoomTail = sliceBetween(
 );
 const zoomBlock = zoomHead && zoomTail ? zoomHead + zoomTail : null;
 check("从 FilePreview.vue 抽到了缩放代码段", zoomBlock !== null && zoomBlock.length > 0);
-
 // ── jsdom 环境 ────────────────────────────────────────────────────────
 
 const dom = new JSDOM(`<!doctype html><html><body>
@@ -156,7 +156,14 @@ const NAT = { w: 572, h: 7191 };
 // 从 IMG.style 读的话测试里没人去写它，两次都是 0，锚点补偿就被架空了。
 function currentStyle() {
   try {
-    return api && api.imageStyle ? api.imageStyle.value : {};
+    const pic = api && api.pictureStyle ? api.pictureStyle.value : {};
+    const frame = api && api.frameStyle ? api.frameStyle.value : {};
+    return {
+      width: pic.width,
+      height: pic.height,
+      marginLeft: frame.marginLeft,
+      marginTop: frame.marginTop,
+    };
   } catch {
     return {};
   }
@@ -201,6 +208,7 @@ SCROLL.getBoundingClientRect = () => ({
 const FACTORY = `
   const { ref, computed, nextTick } = Vue;
   const { fitScale: computeFitScale, zoomStep, wheelScale, zoomPercent, anchorScroll, MAX_SCALE } = Zoom;
+  const { rotateStep, rotatedSize } = Rotate;
   const frameState = { value: { count: 0, width: 0, height: 0, index: 0, playing: false } };
   const previewType = { value: "image" };
   const matches = () => false;
@@ -216,16 +224,18 @@ const FACTORY = `
 const factory = new Function(
   "Vue",
   "Zoom",
+  "Rotate",
   "getComputedStyle",
   FACTORY +
     zoomBlock +
     `
   return {
     imageScrollRef, imageRef, imgNatural, zoomMode, zoomScale, viewSize,
-    naturalSize, fitScale, activeScale, imageStyle, isFit, isActual,
+    naturalSize, rotatedNatural, rotation, fitScale, activeScale,
+    frameStyle, pictureStyle, isFit, isActual,
     canZoomIn, canZoomOut, zoomLevelText,
     measureView, applyZoom, zoomIn, zoomOut, zoomFit, zoomActual, onImageWheel,
-    resetZoom,
+    resetZoom, resetRotation, rotateBy, rotateLeft, rotateRight,
   };
 `
 );
@@ -248,7 +258,7 @@ const Vue = {
 
 let api;
 try {
-  api = factory(Vue, { fitScale, zoomStep, wheelScale, zoomPercent, anchorScroll, MAX_SCALE }, dom.window.getComputedStyle);
+  api = factory(Vue, { fitScale, zoomStep, wheelScale, zoomPercent, anchorScroll, MAX_SCALE }, { rotateStep, rotatedSize }, dom.window.getComputedStyle);
 } catch (e) {
   check("缩放代码段能装配起来（依赖注入的名字都对得上）", false, [String(e && e.message)]);
   console.log(`\n${"─".repeat(50)}`);
@@ -298,11 +308,16 @@ section("1. 容器测量：量得到，尺寸不是 {0,0}");
 section("2. 适应窗口：图片居中，且整图可见");
 
 {
-  const st = api.imageStyle.value;
+  // 画面本体（<img> 的盒子）与画框（滚动容器量的占位）分两层：
+  //   · pictureStyle —— 画面本体的尺寸（未旋转比例）；
+  //   · frameStyle   —— 画框的占位与居中偏移（旋转后宽高会互换）。
+  // 旋转 0° 时两者尺寸相同。
+  const pic = api.pictureStyle.value;
+  const st = api.frameStyle.value;
   const expectW = Math.floor(NAT.w * api.fitScale.value);
   const expectH = Math.floor(NAT.h * api.fitScale.value);
-  check(`显示宽度按 fit 比例算（${expectW}px）`, st.width === `${expectW}px`, [`实际：${st.width}`]);
-  check(`显示高度按 fit 比例算（${expectH}px）`, st.height === `${expectH}px`, [`实际：${st.height}`]);
+  check(`显示宽度按 fit 比例算（${expectW}px）`, pic.width === `${expectW}px`, [`实际：${pic.width}`]);
+  check(`显示高度按 fit 比例算（${expectH}px）`, pic.height === `${expectH}px`, [`实际：${pic.height}`]);
   check(
     "适应窗口档保留 max-* 兜底",
     st.maxWidth === "100%" && st.maxHeight === "100%",
@@ -344,7 +359,7 @@ section("3. 缩放：档位、封顶、1:1");
   check("放大后 canZoomIn 为 true", api.canZoomIn.value === true);
   check(
     "放大档解除了 max-* 约束（否则长图被压回容器高度，缩放等于没做）",
-    api.imageStyle.value.maxHeight === "none" && api.imageStyle.value.maxWidth === "none"
+    api.frameStyle.value.maxHeight === "none" && api.frameStyle.value.maxWidth === "none"
   );
 
   // 继续放大到顶
@@ -362,10 +377,11 @@ section("3. 缩放：档位、封顶、1:1");
   check("超过 100% 也还是 100%（封顶生效）", Math.abs(api.activeScale.value - 1) < 1e-9);
 
   // 1:1 的显示尺寸 = 原始像素
-  const st = api.imageStyle.value;
+  const pic = api.pictureStyle.value;
+  const st = api.frameStyle.value;
   check(`1:1 显示尺寸就是原始像素（${NAT.w}×${NAT.h}）`,
-    st.width === `${NAT.w}px` && st.height === `${NAT.h}px`,
-    [`实际：${st.width} × ${st.height}`]);
+    pic.width === `${NAT.w}px` && pic.height === `${NAT.h}px`,
+    [`实际：${pic.width} × ${pic.height}`]);
   check("1:1 时 margin 归零（贴左上角，四边都够得着）",
     Number.parseFloat(st.marginLeft) === 0 && Number.parseFloat(st.marginTop) === 0);
 }
@@ -384,7 +400,7 @@ section("4. 1:1 按钮：从 fit 档点过去真的有反应（本次事故的�
   check("点 1:1 后比例 = 1", Math.abs(api.activeScale.value - 1) < 1e-9, [`实际：${api.activeScale.value}`]);
   check("点 1:1 后 isActual 为 true", api.isActual.value === true);
   check("点 1:1 后显示尺寸 = 原始像素",
-    api.imageStyle.value.width === `${NAT.w}px` && api.imageStyle.value.height === `${NAT.h}px`);
+    api.pictureStyle.value.width === `${NAT.w}px` && api.pictureStyle.value.height === `${NAT.h}px`);
 }
 
 section("5. 滚轮：Ctrl+滚轮缩放，普通滚轮不劫持，Shift+滚轮横向滚动");
@@ -476,19 +492,21 @@ section("7. 兜底那一帧与最终帧必须是同一幅画面（否则会看�
   // 最终（fit 档）：内联 width/height = fit 尺寸 + 居中 margin。
   // 两条路径必须给出同一个显示尺寸、同一个左边缘 —— 否则图片会滑动。
   api.resetZoom();
-  check("几何未就绪时走 CSS 兜底（imageStyle 为空）",
-    Object.keys(api.imageStyle.value).length === 0);
+  check("几何未就绪时走 CSS 兜底（画框与画面本体的样式都是空）",
+    Object.keys(api.frameStyle.value).length === 0 &&
+    Object.keys(api.pictureStyle.value).length === 0);
 
   api.imgNatural.value = { w: NAT.w, h: NAT.h };
   api.measureView();
-  const st = api.imageStyle.value;
+  const st = api.frameStyle.value;
+  const pic = api.pictureStyle.value;
   const availW = PANEL.w - PAD * 2;
   const availH = PANEL.h - PAD * 2;
   const s = Math.min(availW / NAT.w, availH / NAT.h, 1);
   const containW = NAT.w * s;
   const containH = NAT.h * s;
-  const finalW = Number.parseFloat(st.width);
-  const finalH = Number.parseFloat(st.height);
+  const finalW = Number.parseFloat(pic.width);
+  const finalH = Number.parseFloat(pic.height);
   check(
     `兜底 contain 的显示尺寸 == fit 档的内联尺寸（${Math.round(containW)}×${Math.round(containH)}，±1px 取整差）`,
     Math.abs(containW - finalW) <= 1 && Math.abs(containH - finalH) <= 1,
@@ -507,7 +525,7 @@ section("8. 对照臂：本次事故的形状（ref 绑不上）会让上面全�
 {
   // 这一节验证「上面那些断言真的在测功能，而不是恒真」。
   // 复现事故：ref 绑不上（名字对不上）→ measureView 量不到 → viewSize 恒 {0,0}。
-  const broken = factory(Vue, { fitScale, zoomStep, wheelScale, zoomPercent, anchorScroll, MAX_SCALE }, dom.window.getComputedStyle);
+  const broken = factory(Vue, { fitScale, zoomStep, wheelScale, zoomPercent, anchorScroll, MAX_SCALE }, { rotateStep, rotatedSize }, dom.window.getComputedStyle);
   broken.imageScrollRef.value = null; // ← 事故现场：ref 没绑上
   broken.imgNatural.value = { w: NAT.w, h: NAT.h };
   broken.measureView();
@@ -515,8 +533,9 @@ section("8. 对照臂：本次事故的形状（ref 绑不上）会让上面全�
   check("对照臂：ref 为 null 时 fitScale 退化成 1", Math.abs(broken.fitScale.value - 1) < 1e-9);
   check("对照臂：ref 为 null 时 isActual 恒 true（「1:1」永远已激活 → 点击无反应）",
     broken.isActual.value === true);
-  check("对照臂：ref 为 null 时 imageStyle 没有任何尺寸（图片不居中）",
-    Object.keys(broken.imageStyle.value).length === 0);
+  check("对照臂：ref 为 null 时画框与画面本体都没有尺寸（图片不居中）",
+    Object.keys(broken.frameStyle.value).length === 0 &&
+    Object.keys(broken.pictureStyle.value).length === 0);
   check("对照臂：ref 为 null 时 Ctrl+滚轮毫无反应", (() => {
     const b = broken.activeScale.value;
     broken.onImageWheel({

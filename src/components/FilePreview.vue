@@ -5,6 +5,13 @@
       <span class="preview-icon">{{ headerIcon }}</span>
       <span class="preview-title" :title="fileName">{{ fileName }}</span>
       <span class="preview-type-badge">{{ typeLabel }}</span>
+      <!-- 旋转只影响显示，不写文件。放在头部而不是缩放条里：缩放条已经
+           有 5 个按钮，再塞两个会把它撑到面板宽度的一半。 -->
+      <span class="rot-group" v-if="previewType === 'image' && naturalSize.w > 0">
+        <button class="rot-btn" title="向左旋转 90° (Ctrl+←)" @click="rotateLeft">左转</button>
+        <button class="rot-btn" title="向右旋转 90° (Ctrl+→)" @click="rotateRight">右转</button>
+        <span class="rot-angle" v-if="rotation !== 0" :title="`已旋转 ${angleLabel(rotation)}（只影响显示，不改文件）`">{{ angleLabel(rotation) }}</span>
+      </span>
       <button class="close-btn" @click="$emit('close')" title="关闭预览 (Ctrl+Q)">✕</button>
     </div>
 
@@ -29,10 +36,11 @@
       <div class="heic-note" v-if="heicNote">{{ heicNote }}</div>
       <!-- The scroller is a separate element so the zoom toolbar (and the
            HEIC transport controls) stay put while the picture scrolls under
-           them. The picture's own size is set by `imageStyle`: in 适应窗口 mode
-           the CSS (max-width/height:100%) keeps it inside the panel, once
-           zoomed it gets an explicit px size — otherwise max-height:100%
-           would squeeze a 572×7191 long image back down to a few pixels wide. -->
+           them. The picture's own size is set by `frameStyle` (the frame is
+           the picture's **rotated** footprint): in 适应窗口 mode the CSS
+           (max-width/height:100%) keeps it inside the panel, once zoomed it
+           gets an explicit px size — otherwise max-height:100% would squeeze
+           a 572×7191 long image back down to a few pixels wide. -->
       <div
         class="image-scroll"
         :class="{ draggable: canDragImage, dragging }"
@@ -40,27 +48,35 @@
         @wheel="onImageWheel"
         @pointerdown="onImagePointerDown"
       >
-        <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
-             flashes (and leaks an objectURL per frame); a canvas just gets a
-             drawImage per frame, which is also cheaper than a JPEG round-trip
-             through an <img>. -->
-        <canvas
-          v-if="frameState.count > 1"
-          ref="frameCanvasRef"
-          class="preview-image"
-          :style="imageStyle"
-          :width="frameState.width"
-          :height="frameState.height"
-        ></canvas>
-        <img
-          v-else
-          ref="imageRef"
-          :src="previewContent"
-          class="preview-image"
-          :style="imageStyle"
-          @load="onImageLoad"
-          @error="onImageError"
-        />
+        <!-- The frame is the picture's footprint **after** rotation (90° /
+             270° swap width and height). The picture inside keeps its own
+             unrotated proportions and is turned with a transform, so the
+             rotated image lands exactly on the frame — the frame is what
+             the scroll container measures, so 适应窗口 / centering /
+             scroll extents all describe what the user actually sees. -->
+        <div class="image-frame" :style="frameStyle">
+          <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
+               flashes (and leaks an objectURL per frame); a canvas just gets a
+               drawImage per frame, which is also cheaper than a JPEG round-trip
+               through an <img>. -->
+          <canvas
+            v-if="frameState.count > 1"
+            ref="frameCanvasRef"
+            class="preview-image"
+            :style="pictureStyle"
+            :width="frameState.width"
+            :height="frameState.height"
+          ></canvas>
+          <img
+            v-else
+            ref="imageRef"
+            :src="previewContent"
+            class="preview-image"
+            :style="pictureStyle"
+            @load="onImageLoad"
+            @error="onImageError"
+          />
+        </div>
       </div>
       <div class="zoom-bar" v-if="naturalSize.w > 0">
         <button class="zoom-btn" :disabled="!canZoomOut" title="缩小 (Ctrl+-)" @click="zoomOut">−</button>
@@ -157,6 +173,7 @@ import {
   anchorScroll,
   MAX_SCALE,
 } from "../imageZoom.js";
+import { rotateStep, rotatedSize, angleLabel } from "../imageRotate.js";
 import {
   dragStarted,
   dragScroll,
@@ -422,6 +439,9 @@ const imgNatural = ref({ w: 0, h: 0 });
 // 缩放档：'fit' 跟随窗口，'manual' 由用户定（绝对比例，不随窗口变化）。
 const zoomMode = ref("fit");
 const zoomScale = ref(1);
+// 旋转档：0 / 90 / 180 / 270。**只影响显示**，不写文件、不落盘。
+// 正角度 = 顺时针（与 CSS 的 rotate() 一致），所以右转 +90°、左转 −90°。
+const rotation = ref(0);
 // 滚动容器的可用尺寸（去掉内边距），用于算「适应窗口」与居中偏移。
 const viewSize = ref({ w: 0, h: 0 });
 
@@ -432,9 +452,17 @@ const naturalSize = computed(() =>
     : imgNatural.value
 );
 
+// 旋转后的**占位**自然尺寸：90°/270° 时宽高互换，0°/180° 时不变。
+const rotatedNatural = computed(() =>
+  rotatedSize(naturalSize.value.w, naturalSize.value.h, rotation.value)
+);
+
 // 「适应窗口」的比例。
+//
+// ⚠️ 按**旋转后**的占位算，不是原始尺寸：一张 572×7191 的竖图转 90° 之后
+// 占位变成 7191×572，若还按竖图算，「适应窗口」出来的图会横着溢出面板。
 const fitScale = computed(() =>
-  computeFitScale(naturalSize.value.w, naturalSize.value.h, viewSize.value.w, viewSize.value.h)
+  computeFitScale(rotatedNatural.value.w, rotatedNatural.value.h, viewSize.value.w, viewSize.value.h)
 );
 
 // 当前生效的比例。
@@ -446,32 +474,48 @@ const activeScale = computed(() =>
   zoomMode.value === "fit" ? fitScale.value : zoomScale.value
 );
 
-// 图片几何：显示尺寸 + 居中偏移。
+// 图片几何：给定一个缩放比例，算出画框与画面本体的尺寸、居中偏移。
 //
-// ⚠️ 这是**唯一**一处几何计算 —— imageStyle（写进 DOM 的样式）与
-// contentSize（拖动时判断「能不能拖」的内容总尺寸）都从它派生。
-// 同一语义两份实现必然分叉：曾经 contentSize 把这段抄了一遍，结果
-// image-zoom 的变异臂「居中偏移算错」那个变异命中 2 处、注入不进去。
+// ⚠️ 这是**唯一**一处几何计算 —— frameStyle（画框样式）、pictureStyle
+// （画面本体样式）、contentSize（拖动时判断「能不能拖」的内容总尺寸）
+// 和 applyZoom 的缩放锚点都从它派生。同一语义两份实现必然分叉：
+// 曾经 contentSize 把这段抄了一遍，结果 image-zoom 的变异臂
+// 「居中偏移算错」那个变异命中 2 处、注入不进去。
 //
 // ⚠️ 居中**不用** flex 的 margin:auto —— 那套在内容溢出容器时会让溢出的
 // 那一侧滚不到（长图的顶部/左侧够不着，这是 flex 居中的经典坑）。
 // 这里自己算：显示尺寸比可视区小就居中，大了就贴边（0 偏移），两头都够得着。
-const imageGeometry = computed(() => {
+//
+// ⚠️ 三个尺寸各司其职，别混：
+//   · pw/ph —— 画面本体（未旋转）的显示尺寸，写在图片元素上；
+//   · w/h   —— 旋转后的**占位**（用户看到的那个框），写在画框上；
+//   · mx/my —— 占位在可视区里的居中偏移。
+// 90°/270° 时 w/h 与 pw/ph 互换 —— 居中偏移要按占位算，否则转完的图会偏出面板。
+function geometryFor(scale) {
   const nat = naturalSize.value;
   const avail = viewSize.value;
   if (!nat.w || !nat.h || !avail.w || !avail.h) {
-    return { w: 0, h: 0, mx: 0, my: 0 };
+    return { w: 0, h: 0, mx: 0, my: 0, pw: 0, ph: 0 };
   }
-  const s = activeScale.value;
-  const w = Math.max(1, Math.floor(nat.w * s));
-  const h = Math.max(1, Math.floor(nat.h * s));
+  // 画面本体（未旋转）的显示尺寸。
+  const pw = Math.max(1, Math.floor(nat.w * scale));
+  const ph = Math.max(1, Math.floor(nat.h * scale));
+  // 旋转后的占位：90°/270° 时宽高互换，0°/180° 时不变。
+  const foot = rotatedSize(pw, ph, rotation.value);
+  const w = foot.w;
+  const h = foot.h;
   const mx = Math.max(0, Math.floor((avail.w - w) / 2));
   const my = Math.max(0, Math.floor((avail.h - h) / 2));
-  return { w, h, mx, my };
-});
+  return { w, h, mx, my, pw, ph };
+}
 
-// 显示尺寸 + 居中偏移（写进 DOM 的样式）。
-const imageStyle = computed(() => {
+const imageGeometry = computed(() => geometryFor(activeScale.value));
+
+// 画框的样式：尺寸 = 旋转后的画面占位，外加居中偏移。
+//
+// 画框是滚动容器里**唯一**参与布局的元素 —— 滚动范围、可视区大小、
+// 「适应窗口」的兜底约束全都按它算，所以它必须等于用户看到的那块画面。
+const frameStyle = computed(() => {
   const g = imageGeometry.value;
   if (!g.w || !g.h) return {};
   const fit = zoomMode.value === "fit";
@@ -491,6 +535,20 @@ const imageStyle = computed(() => {
   };
 });
 
+// 画面本体的样式：按**未旋转**的原始比例算尺寸，再整体转起来。
+//
+// transform 的旋转中心是元素自身中心，而画框用 flex 居中把它摆在正中
+// —— 转完之后画面正好铺满画框，且仍然居中。
+const pictureStyle = computed(() => {
+  const g = imageGeometry.value;
+  if (!g.pw || !g.ph) return {};
+  return {
+    width: `${g.pw}px`,
+    height: `${g.ph}px`,
+    transform: `translate(-50%, -50%) rotate(${rotation.value}deg)`,
+  };
+});
+
 const isFit = computed(() => zoomMode.value === "fit");
 const isActual = computed(() => activeScale.value >= MAX_SCALE - 1e-9);
 const canZoomIn = computed(() => activeScale.value < MAX_SCALE - 1e-9);
@@ -504,6 +562,34 @@ const zoomLevelTitle = computed(() =>
     ? `适应窗口（原始大小的 ${zoomPercent(fitScale.value)}）`
     : `原始大小的 ${zoomPercent(activeScale.value)}`
 );
+
+// ── 旋转 ──
+//
+// 只是**显示上**的旋转：不写文件、不改 EXIF、不落盘 —— 关掉预览就复原。
+// 角度取值 0 / 90 / 180 / 270，正角度 = 顺时针（与 CSS 的 rotate() 一致）。
+//
+// ⚠️ 旋转改变的是「画面占位」：90°/270° 时宽高互换。所以「适应窗口」
+// 按旋转后的占位算（rotatedNatural），居中偏移也按占位算（imageGeometry）。
+// 缩放比例本身不变 —— 比例是相对原始像素的，转一下不该改变清晰度。
+function rotateBy(dir) {
+  if (!naturalSize.value.w) return;
+  rotation.value = rotateStep(rotation.value, dir);
+  // 画面占位变了，旧的滚动位置不再对应同一块内容 → 从头看起。
+  endImageDrag();
+  const el = imageScrollRef.value;
+  if (el) {
+    el.scrollLeft = 0;
+    el.scrollTop = 0;
+  }
+}
+
+function rotateLeft() {
+  rotateBy(-1);
+}
+
+function rotateRight() {
+  rotateBy(1);
+}
 
 // ── 拖动平移 ──
 //
@@ -658,6 +744,14 @@ function resetZoom() {
   endImageDrag();
 }
 
+// 换文件后重置旋转。
+//
+// ⚠️ 旋转是**每个文件各自的状态**：上一张图竖着放，下一张可能横着放，
+// 带着上一张的角度会让人以为新图本身就是歪的。与缩放一起复位。
+function resetRotation() {
+  rotation.value = 0;
+}
+
 // 取当前的图片元素（<img> 或 HEIC 画布）——缩放锚点计算要量它的矩形。
 function currentMediaEl() {
   return imageRef.value || frameCanvasRef.value;
@@ -790,6 +884,20 @@ function onPreviewKey(e) {
     e.stopPropagation();
     markHandled(e);
     zoomActual();
+    return;
+  }
+  if (matches("image.rotateLeft", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    rotateLeft();
+    return;
+  }
+  if (matches("image.rotateRight", e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    markHandled(e);
+    rotateRight();
   }
 }
 
@@ -1065,6 +1173,8 @@ async function loadPreview() {
   // 每换一个文件，缩放档位回到「适应窗口」——上一张图的手动比例对下一张
   // （可能尺寸完全不同）没有意义。
   resetZoom();
+  // 旋转同理：上一张图的角度对下一张没有意义。
+  resetRotation();
 
   const ext = getExtension(props.fileName);
   // The shared mapping decides the preview type. `asText` is the one-shot
@@ -1296,6 +1406,40 @@ watch(previewType, async (t) => {
   color: #fff;
 }
 
+/* 旋转按钮组（头部右侧）：左转 / 右转 90°。
+   只改显示，不写文件 —— 所以按钮不做「保存」样式，也不放在底部缩放条里
+   （缩放条已经有 5 个按钮，再塞两个会被撑到面板宽度的一半）。 */
+.rot-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.rot-btn {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 1px 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.rot-btn:hover {
+  background: var(--hover);
+}
+
+/* 当前角度标签（270° 显示成 -90°，因为那是「逆时针 90°」更符合直觉）。 */
+.rot-angle {
+  font-size: 10px;
+  color: var(--text-dim);
+  min-width: 28px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .preview-body {
   flex: 1;
   overflow: hidden;
@@ -1522,12 +1666,32 @@ watch(previewType, async (t) => {
    only caps it), the box sits in the top-left corner, and the picture
    ends up off-center — that was the "first left-aligned, then centered"
    the user reported. */
+/* 画框：图片**旋转后**的画面占位。
+   滚动容器量的是它 —— 所以滚动范围、居中偏移、「适应窗口」描述的都是
+   用户真正看到的那块画面，而不是旋转前的盒子。 */
+.image-frame {
+  position: relative;
+  /* 画面本体在里面是绝对定位 + translate(-50%,-50%) 居中的：转 90° 后
+     它的盒子比画框大（盒子始终是未旋转的宽高），不裁掉就会溢出画框、
+     把滚动区域撑大。裁掉的正好是旋转后露不出来的部分。 */
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+
+/* 图片本体。 */
 .preview-image {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;
   border-radius: 2px;
+  /* 绝对定位 + translate(-50%,-50%)：无论盒子比画框大还是小，都精确居中
+     —— flex 的居中在盒子溢出时会把内容推到一边去。 */
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
 }
 
 /* PDF preview */

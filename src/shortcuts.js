@@ -157,6 +157,11 @@ export const COMMANDS = [
   { id: "image.zoomOut", scope: "image", label: "缩小图片", desc: "缩小预览中的图片", defaults: ["Ctrl+-"] },
   { id: "image.zoomFit", scope: "image", label: "图片适应窗口", desc: "缩回整图可见", defaults: ["Ctrl+0"] },
   { id: "image.zoomActual", scope: "image", label: "图片原始大小", desc: "按 1:1 显示原始像素", defaults: ["Ctrl+1"] },
+  // 旋转只是显示上的变换，不写文件（也不改 EXIF）—— 关掉预览就复原。
+  // ⚠️ 用 Ctrl+方向键而不是裸方向键：裸方向键在文件列表里是上下移动，
+  // 预览开着时抢走它会让列表没法翻。
+  { id: "image.rotateLeft", scope: "image", label: "图片左转 90°", desc: "把预览中的图片逆时针转 90°（只改显示）", defaults: ["Ctrl+ArrowLeft"] },
+  { id: "image.rotateRight", scope: "image", label: "图片右转 90°", desc: "把预览中的图片顺时针转 90°（只改显示）", defaults: ["Ctrl+ArrowRight"] },
 ];
 
 export const COMMAND_MAP = Object.fromEntries(COMMANDS.map((c) => [c.id, c]));

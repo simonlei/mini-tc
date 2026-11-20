@@ -63,9 +63,9 @@
 
 **居中不用 flex 的 `margin:auto` / `justify-content:center`。** 那套在内容溢出容器时会让溢出的**起始侧**滚不到（长图的顶部/左侧够不着，这是 flex 居中的经典坑）。这里自己算：显示尺寸比可视区小就居中，大了就贴边（0 偏移），两头都够得着。同理，滚动容器 `.image-scroll` 也不能是 flex 容器。
 
-**「适应窗口」与「放大」共用同一套 px 几何**（`imageStyle` 统一算 width/height/margin），否则两档之间的衔接处会差一截、锚点补偿也就对不上。适应档额外保留 `max-width/max-height:100%` 兜底：万一测量晚了一帧，也不会溢出长出一条多余的滚动条。
+**「适应窗口」与「放大」共用同一套 px 几何**（`geometryFor()` 统一算尺寸与居中偏移），否则两档之间的衔接处会差一截、锚点补偿也就对不上。适应档额外保留 `max-width/max-height:100%` 兜底：万一测量晚了一帧，也不会溢出长出一条多余的滚动条。
 
-**兜底那一帧必须已经是「适应窗口 + 居中」，否则图片会从左上角滑到中间。** 几何要等两样东西：天然像素（只有 `<img>` 的 `load` 事件才知道）与可视区尺寸（要量过一次容器）；在那之前图片走 CSS 兜底。兜底是 `width/height:100%` + `object-fit:contain` —— 盒子铺满可视区，内容按 fit 比例缩放并居中，**与 `imageStyle` 的 fit 档（同样尺寸、同样居中 margin）画出的是同一幅画面**，所以图片一解码出来就在最终位置上，看不到任何跳动。
+**兜底那一帧必须已经是「适应窗口 + 居中」，否则图片会从左上角滑到中间。** 几何要等两样东西：天然像素（只有 `<img>` 的 `load` 事件才知道）与可视区尺寸（要量过一次容器）；在那之前图片走 CSS 兜底。兜底是 `width/height:100%` + `object-fit:contain` —— 盒子铺满可视区，内容按 fit 比例缩放并居中，**与 fit 档（同样尺寸、同样居中 margin）画出的是同一幅画面**，所以图片一解码出来就在最终位置上，看不到任何跳动。
 
 ⚠️ 兜底**不能**用 `max-width/max-height:100%`：那只是「上限」，盒子会缩回图片自身大小（`max-width` 不撑满）并贴在左上角 —— 那正是用户报的「先靠左对齐、再跳到居中」。⚠️ 反过来也别把图片**藏起来**等几何就绪（`visibility:hidden` + 一个 `imageReady` 标志）：那样虽然不跳，但用户要多等一到两帧才看到图，切换图片明显变慢。兜底画对了就不用藏。判据：`scripts/image-zoom-check.mjs` 的 7b 小节（静态：兜底必须是 width/height:100% + contain，且不得藏图）+ `scripts/image-zoom-behavior-check.mjs` 的第 7 节（行为：兜底 contain 的显示尺寸与左/上边缘 == fit 档的内联尺寸与居中 margin，±1px）。
 
@@ -76,6 +76,27 @@
 ⚠️ **模板的 `ref="X"` 必须和 `<script setup>` 里声明的变量名完全一致。** Vue 3 的 `<script setup>` 是按**变量名**绑定模板 ref 的：名字对不上时 ref 恒为 `null`，**不报任何错**（没 warning、没异常、控制台干净）。踩过的坑：模板写 `ref="imageScrollRef"`、脚本声明 `imgScrollRef` —— 于是一个 `null` 引出三个用户可见症状：`measureView()` 量不到容器 → `viewSize` 永远 `{0,0}` → 图片没有显式宽高也没有居中 margin（贴左上角）；`fitScale` 退化成 `1` →「1:1」按钮永远处于已激活态、点击无反应；滚轮里 `if (!el) return` → `Ctrl+滚轮` 完全没反应。**编译能过、类型检查能过、单测能过，只有真机点一下才发现不对。**
 
 这类失效靠人眼看不住，所以有两条判据守着：`scripts/template-ref-check.mjs`（全项目 `.vue` 扫描：每个静态 `ref="X"` 都要有同名 `ref()` 声明；`:ref="fn"` 是函数 ref，不校验）+ `scripts/image-zoom-behavior-check.mjs`（把组件里那段缩放代码**原样抽出来**塞进 jsdom 的真 DOM 里跑，验证「量尺寸 → 居中 → 缩放 → 滚轮」整条链真的通）。静态断言防「写错」，行为断言防「接不上」；后者还带一条**对照臂**（把 ref 置 null 复现事故现场），确认前面那些断言不是恒真。
+
+### 图片旋转
+
+预览标题栏右侧的「左转 / 右转」把图片转 90°。**只影响显示**：不写文件、不改 EXIF、不落盘 —— 关掉预览就复原，换文件时角度复位（与缩放档一起）。
+
+**算术全在 `src/imageRotate.js`**（纯函数）：`normalizeRotation()`（规整到 0/90/180/270）、`rotateStep()`（走一步）、`rotatedSize()`（旋转后的**占位**尺寸）、`angleLabel()`（270° 显示成 `-90°`）。角度约定跟 CSS 一致 —— **正角度 = 顺时针**，所以「右转」= +90°、「左转」= −90°。
+
+⚠️ **三个尺寸各司其职，别混**（`geometryFor()` 的返回值）：
+- `pw/ph` —— **画面本体**（未旋转比例）的显示尺寸，写在图片元素上；
+- `w/h` —— 旋转后的**占位**（用户看到的那个框），写在画框 `.image-frame` 上；
+- `mx/my` —— 占位在可视区里的居中偏移。
+
+90°/270° 时 `w/h` 与 `pw/ph` 互换。于是 DOM 上是**两层**：`.image-frame` 承担布局与滚动范围（尺寸 = 旋转后的占位），里面的 `.preview-image` 保持自己的未旋转比例、用 `transform: rotate()` 整体转起来。
+
+⚠️ **「适应窗口」必须按旋转后的占位算**，否则一张 572×7191 的竖图转 90° 后占位变成 7191×572，仍按竖图算就会横着溢出面板。同理居中偏移也按占位算。
+
+⚠️ **缩放比例相对原始像素，旋转不改变它** —— 转一下不该让画面变糊。所以画面本体的尺寸只跟缩放有关，与角度无关。
+
+快捷键是 `Ctrl+←` / `Ctrl+→`（`image.rotateLeft` / `image.rotateRight`）。⚠️ **不用裸方向键**：裸方向键在文件列表里是上下移动，预览开着时抢走它会让列表没法翻；也不用 `Ctrl+[` / `Ctrl+]`（WebView 里 `Ctrl+[` 是「后退」类绑定，且 `[` `]` 要按 Shift）。
+
+判据：`scripts/image-rotate-check.mjs`（纯函数真值表 + 静态接线 + 「不许写盘」断言）+ `scripts/image-rotate-mutation.mjs`（21 个变异臂，逐个确认断言有分辨力）+ `scripts/image-rotate-behavior-check.mjs`（把组件里那段几何与旋转代码**原样抽出来**塞进 jsdom 跑，验证「角度变了 → transform 真的落到 DOM 上 → 占位与 `rotatedSize` 一致 → 居中偏移对得上」）。
 
 ### 图片拖动平移
 
@@ -92,7 +113,7 @@
 - **只认主键**（`e.button !== 0` 直接返回）：中键是粘贴到目录，右键是菜单。
 - **监听器必须成对增删**：漏删 `pointermove` / `pointerup` / `pointercancel` = `window` 一直吊着整个组件作用域（与 `onBeforeUnmount` 里那句注释同一类泄漏）。
 
-⚠️ **几何计算只有一处**（`imageGeometry`）：`imageStyle`（写进 DOM 的样式）与 `contentSize`（判断能不能拖的内容总尺寸）都从它派生。同一语义两份实现必然分叉 —— 曾经 `contentSize` 把那段抄了一遍，结果 `image-zoom` 变异臂里「居中偏移算错」那个变异命中 **2 处**、注入不进去（`anchor found: 2` → 变异没注入 → 套件报 `1 missed`）。抽出 `imageGeometry` 之后这个变异才恢复成 `22 caught / 0 missed`。
+⚠️ **几何计算只有一处**（`geometryFor()` → `imageGeometry`）：`frameStyle`（画框的占位与居中偏移）、`pictureStyle`（画面本体的尺寸与 transform）与 `contentSize`（判断能不能拖的内容总尺寸）都从它派生。同一语义两份实现必然分叉 —— 曾经 `contentSize` 把那段抄了一遍，结果 `image-zoom` 变异臂里「居中偏移算错」那个变异命中 **2 处**、注入不进去（`anchor found: 2` → 变异没注入 → 套件报 `1 missed`）。抽出 `imageGeometry` 之后这个变异才恢复成 `22 caught / 0 missed`。
 
 判据：`scripts/image-drag-check.mjs`（纯逻辑真值表 + 静态接线，60 条）、`scripts/image-drag-mutation.mjs`（19 个变异全被抓住）、`scripts/image-drag-behavior-check.mjs`（把拖动代码**原样抽出来**塞进 jsdom，用真的 PointerEvent 驱动，验证「按下 → 移动 → 松手」后滚动量真的变了）。
 
