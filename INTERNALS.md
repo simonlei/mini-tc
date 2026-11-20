@@ -65,6 +65,10 @@
 
 **「适应窗口」与「放大」共用同一套 px 几何**（`imageStyle` 统一算 width/height/margin），否则两档之间的衔接处会差一截、锚点补偿也就对不上。适应档额外保留 `max-width/max-height:100%` 兜底：万一测量晚了一帧，也不会溢出长出一条多余的滚动条。
 
+**兜底那一帧必须已经是「适应窗口 + 居中」，否则图片会从左上角滑到中间。** 几何要等两样东西：天然像素（只有 `<img>` 的 `load` 事件才知道）与可视区尺寸（要量过一次容器）；在那之前图片走 CSS 兜底。兜底是 `width/height:100%` + `object-fit:contain` —— 盒子铺满可视区，内容按 fit 比例缩放并居中，**与 `imageStyle` 的 fit 档（同样尺寸、同样居中 margin）画出的是同一幅画面**，所以图片一解码出来就在最终位置上，看不到任何跳动。
+
+⚠️ 兜底**不能**用 `max-width/max-height:100%`：那只是「上限」，盒子会缩回图片自身大小（`max-width` 不撑满）并贴在左上角 —— 那正是用户报的「先靠左对齐、再跳到居中」。⚠️ 反过来也别把图片**藏起来**等几何就绪（`visibility:hidden` + 一个 `imageReady` 标志）：那样虽然不跳，但用户要多等一到两帧才看到图，切换图片明显变慢。兜底画对了就不用藏。判据：`scripts/image-zoom-check.mjs` 的 7b 小节（静态：兜底必须是 width/height:100% + contain，且不得藏图）+ `scripts/image-zoom-behavior-check.mjs` 的第 7 节（行为：兜底 contain 的显示尺寸与左/上边缘 == fit 档的内联尺寸与居中 margin，±1px）。
+
 **键盘快捷键登记在 `src/shortcuts.js`**（`image.*` 作用域），组件用 `matches()` + `markHandled()` 认领 —— 与视频预览同一套做法（window 捕获阶段）。⚠️ 键名必须与 `eventKeyName` 的产出**完全一致**：`CODE_KEYS` 把 `Equal` 映成 `"="`、`Minus` 映成 `"-"`、数字键落到 `e.key`（`"0"` / `"1"`）。写成 `"Ctrl+Equal"` 这种物理键名会永远匹配不上，**而且不报错** —— 快捷键静默失效，最难查的一类 bug。
 
 ⚠️ 这个组件同时渲染文本 / PDF / Word，`image.*` 的命令**只在图片预览时**认领（`previewType !== "image"` 直接返回），否则按 `Ctrl+=` 会误伤别的预览。

@@ -155,6 +155,30 @@ const MUTANTS = [
     from: '  if (previewType.value !== "image") return;',
     to: "  // 不检查预览类型",
   },
+  {
+    target: PREVIEW,
+    name: "⑲ 兜底改回 max-width/max-height（盒子缩回图片自身大小 → 贴左上角）",
+    from: "  width: 100%;\n  height: 100%;\n  object-fit: contain;",
+    to: "  max-width: 100%;\n  max-height: 100%;\n  object-fit: contain;",
+  },
+  {
+    target: PREVIEW,
+    name: "⑳ 兜底去掉 object-fit（内容被拉伸，且不再居中）",
+    from: "  width: 100%;\n  height: 100%;\n  object-fit: contain;",
+    to: "  width: 100%;\n  height: 100%;",
+  },
+  {
+    target: PREVIEW,
+    name: "㉑ 兜底去掉 height:100%（只铺满宽度 → 高度塌成 auto）",
+    from: "  width: 100%;\n  height: 100%;\n  object-fit: contain;",
+    to: "  width: 100%;\n  object-fit: contain;",
+  },
+  {
+    target: PREVIEW,
+    name: "㉒ 又把图片藏起来等几何就绪（不跳了，但切换图片慢一帧）",
+    from: ".preview-image {\n  display: block;\n  width: 100%;",
+    to: ".preview-image {\n  display: block;\n  visibility: hidden;\n  width: 100%;",
+  },
 ];
 
 let caught = 0;

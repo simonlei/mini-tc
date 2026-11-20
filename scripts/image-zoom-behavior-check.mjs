@@ -467,7 +467,42 @@ section("6. 缩小：缩到底回到适应窗口");
   check("回到 fit 后 isFit 为 true", api.isFit.value === true);
 }
 
-section("7. 对照臂：本次事故的形状（ref 绑不上）会让上面全废");
+section("7. 兜底那一帧与最终帧必须是同一幅画面（否则会看到跳动）");
+
+{
+  // 兜底（几何未就绪）：图片盒 = 可视区 100%×100%，object-fit:contain →
+  //   内容尺寸 = min(availW/natW, availH/natH) 封顶 1（contain 不放大），
+  //   居中于盒内。
+  // 最终（fit 档）：内联 width/height = fit 尺寸 + 居中 margin。
+  // 两条路径必须给出同一个显示尺寸、同一个左边缘 —— 否则图片会滑动。
+  api.resetZoom();
+  check("几何未就绪时走 CSS 兜底（imageStyle 为空）",
+    Object.keys(api.imageStyle.value).length === 0);
+
+  api.imgNatural.value = { w: NAT.w, h: NAT.h };
+  api.measureView();
+  const st = api.imageStyle.value;
+  const availW = PANEL.w - PAD * 2;
+  const availH = PANEL.h - PAD * 2;
+  const s = Math.min(availW / NAT.w, availH / NAT.h, 1);
+  const containW = NAT.w * s;
+  const containH = NAT.h * s;
+  const finalW = Number.parseFloat(st.width);
+  const finalH = Number.parseFloat(st.height);
+  check(
+    `兜底 contain 的显示尺寸 == fit 档的内联尺寸（${Math.round(containW)}×${Math.round(containH)}，±1px 取整差）`,
+    Math.abs(containW - finalW) <= 1 && Math.abs(containH - finalH) <= 1,
+    [`contain ${containW.toFixed(1)}×${containH.toFixed(1)} vs fit ${finalW}×${finalH}`]
+  );
+  check("兜底 contain 的左边缘 == fit 档的居中 margin（±1px）",
+    Math.abs((availW - containW) / 2 - Number.parseFloat(st.marginLeft)) <= 1,
+    [`contain ${((availW - containW) / 2).toFixed(1)} vs fit ${st.marginLeft}`]);
+  check("兜底 contain 的上边缘 == fit 档的居中 margin（±1px）",
+    Math.abs((availH - containH) / 2 - Number.parseFloat(st.marginTop)) <= 1,
+    [`contain ${((availH - containH) / 2).toFixed(1)} vs fit ${st.marginTop}`]);
+}
+
+section("8. 对照臂：本次事故的形状（ref 绑不上）会让上面全废");
 
 {
   // 这一节验证「上面那些断言真的在测功能，而不是恒真」。

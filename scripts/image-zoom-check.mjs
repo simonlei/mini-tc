@@ -239,6 +239,35 @@ section("7. 静态接线：组件真的用了这个模块");
   check("Shift+滚轮做横向滚动", /shiftKey/.test(src) && /scrollLeft\s*\+=/.test(src));
 }
 
+section("7b. 兜底那一帧必须已经是「适应窗口 + 居中」（否则用户看到先靠左再居中）");
+
+{
+  // 几何要等两样东西：天然像素（只有 <img> 的 load 事件才知道）与可视区
+  // 尺寸。在那之前图片走 CSS 兜底 —— 兜底必须和最终几何**画出同一幅画面**，
+  // 否则图片会从左上角滑到中间（用户报的那个现象）。
+  //
+  // 做法：兜底盒子铺满可视区（width/height:100%）+ object-fit:contain →
+  // 内容按 fit 比例缩放并居中 —— 与 imageStyle 的 fit 档（同样尺寸、同样
+  // 居中 margin）是同一幅画面。
+  //
+  // ⚠️ 这里**不能**用 max-width/max-height:100%：那只是「上限」，盒子会缩回
+  // 图片自身大小并贴在左上角 —— 那正是「先靠左对齐」的那一帧。
+  check("兜底盒子铺满可视区（width:100% + height:100%）",
+    /\.preview-image\s*\{[^}]*width:\s*100%[^}]*height:\s*100%/s.test(src));
+  check("兜底用 object-fit:contain（内容按比例缩放并居中，不拉伸）",
+    /\.preview-image\s*\{[^}]*object-fit:\s*contain/s.test(src));
+  check("兜底不能用 max-width/max-height（盒子会缩回图片自身大小 → 贴左上角）",
+    !/\.preview-image\s*\{[^}]*max-width/s.test(src) &&
+    !/\.preview-image\s*\{[^}]*max-height/s.test(src));
+
+  // ⚠️ 反过来也不能把图片**藏起来**等几何就绪：那样虽然不跳，但用户要多等
+  // 一到两帧才看到图（切换图片明显变慢）。兜底正确就不用藏。
+  check("图片不因几何未就绪而被藏起来（藏起来会让切换图片慢一帧）",
+    !/pending:\s*!imageReady/.test(src) &&
+    !/\.preview-image\.pending/.test(src) &&
+    !/\.preview-image\s*\{[^}]*visibility:\s*hidden/s.test(src));
+}
+
 section("8. 快捷键：注册在表里，且键名真的能匹配上");
 
 {

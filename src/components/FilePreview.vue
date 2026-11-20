@@ -1506,13 +1506,26 @@ watch(previewType, async (t) => {
    (also from imageStyle) so that an oversized picture stays reachable
    from both ends.
 
-   The max-* below is only a fallback for the frames before the size is
-   known (before the image has loaded, or before the panel was measured):
-   `imageStyle` overrides them with explicit px as soon as it can. */
+   ⚠️ The fallback below is NOT a rough approximation — it is **exactly**
+   what the "fit window" frame renders, so the picture never jumps:
+
+   The box is the whole viewport (100% × 100%) and `object-fit: contain`
+   puts the image inside it, scaled to fit and centered (contain does not
+   upscale). That is precisely the fit-scale geometry `imageStyle`
+   computes: floor(nat × min(avail/nat, 1)) at margin (avail − size)/2.
+   So the frame before the size is known (image not decoded yet, or the
+   panel not measured yet) already shows the picture centered at its
+   final size — the user never sees it slide over from the top-left.
+
+   ⚠️ It must be width/height:100%, NOT max-width/max-height:100%.
+   With max-* the box shrinks to the image's own size (max-width:100%
+   only caps it), the box sits in the top-left corner, and the picture
+   ends up off-center — that was the "first left-aligned, then centered"
+   the user reported. */
 .preview-image {
   display: block;
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
   object-fit: contain;
   border-radius: 2px;
 }
