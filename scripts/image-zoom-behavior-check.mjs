@@ -233,7 +233,7 @@ const factory = new Function(
     imageScrollRef, imageRef, imgNatural, zoomMode, zoomScale, viewSize,
     naturalSize, rotatedNatural, rotation, fitScale, activeScale,
     frameStyle, pictureStyle, isFit, isActual,
-    canZoomIn, canZoomOut, zoomLevelText,
+    canZoomIn, canZoomOut, zoomLevelText, geometryPending,
     measureView, applyZoom, zoomIn, zoomOut, zoomFit, zoomActual, onImageWheel,
     resetZoom, resetRotation, rotateBy, rotateLeft, rotateRight,
   };
@@ -486,38 +486,77 @@ section("6. 缩小：缩到底回到适应窗口");
 section("7. 兜底那一帧与最终帧必须是同一幅画面（否则会看到跳动）");
 
 {
-  // 兜底（几何未就绪）：图片盒 = 可视区 100%×100%，object-fit:contain →
-  //   内容尺寸 = min(availW/natW, availH/natH) 封顶 1（contain 不放大），
-  //   居中于盒内。
-  // 最终（fit 档）：内联 width/height = fit 尺寸 + 居中 margin。
-  // 两条路径必须给出同一个显示尺寸、同一个左边缘 —— 否则图片会滑动。
-  api.resetZoom();
-  check("几何未就绪时走 CSS 兜底（画框与画面本体的样式都是空）",
-    Object.keys(api.frameStyle.value).length === 0 &&
-    Object.keys(api.pictureStyle.value).length === 0);
+  // 兜底机制写在 CSS 里。这里**不复制一份语义**，而是从组件源码读出
+  // 「兜底会不会把小图放大」，再拿它跟最终几何比 —— 改了 CSS 判据跟着变，
+  // 不会出现「测试里的副本还停在旧语义」的分叉。
+  //
+  // ⚠️ 关键事实（Chromium 157 实测）：`object-fit: contain` 会**放大**小图
+  // 并铺满盒子 —— 10×10 的图在 200×200 盒子里被画成 200×200。上一版兜底
+  // 用的就是 contain，于是比面板小的图会「先占满面板、再缩回 1:1」。
+  // 兜底必须只封顶不放大（max-*）。
+  const styleSrc = (previewStripped.match(/<style[^>]*>([\s\S]*?)<\/style>/) || [null, ""])[1];
+  function cssRule(css, selector) {
+    const re = /([^{}]+)\{([^}]*)\}/g;
+    let m;
+    while ((m = re.exec(css))) {
+      const sels = m[1].trim().split(/\s*,\s*/);
+      if (sels.includes(selector)) return m[2];
+    }
+    return null;
+  }
+  const fbBody = cssRule(styleSrc, ".image-frame.fallback .preview-image");
+  check("组件里有兜底规则（.image-frame.fallback .preview-image）", fbBody !== null);
+  const fb = fbBody || "";
+  // 会不会放大：contain 铺满盒子会；max-* 只封顶不会。
+  const fallbackUpscales = /object-fit:\s*contain/.test(fb);
 
-  api.imgNatural.value = { w: NAT.w, h: NAT.h };
-  api.measureView();
-  const st = api.frameStyle.value;
-  const pic = api.pictureStyle.value;
   const availW = PANEL.w - PAD * 2;
   const availH = PANEL.h - PAD * 2;
-  const s = Math.min(availW / NAT.w, availH / NAT.h, 1);
-  const containW = NAT.w * s;
-  const containH = NAT.h * s;
-  const finalW = Number.parseFloat(pic.width);
-  const finalH = Number.parseFloat(pic.height);
-  check(
-    `兜底 contain 的显示尺寸 == fit 档的内联尺寸（${Math.round(containW)}×${Math.round(containH)}，±1px 取整差）`,
-    Math.abs(containW - finalW) <= 1 && Math.abs(containH - finalH) <= 1,
-    [`contain ${containW.toFixed(1)}×${containH.toFixed(1)} vs fit ${finalW}×${finalH}`]
-  );
-  check("兜底 contain 的左边缘 == fit 档的居中 margin（±1px）",
-    Math.abs((availW - containW) / 2 - Number.parseFloat(st.marginLeft)) <= 1,
-    [`contain ${((availW - containW) / 2).toFixed(1)} vs fit ${st.marginLeft}`]);
-  check("兜底 contain 的上边缘 == fit 档的居中 margin（±1px）",
-    Math.abs((availH - containH) / 2 - Number.parseFloat(st.marginTop)) <= 1,
-    [`contain ${((availH - containH) / 2).toFixed(1)} vs fit ${st.marginTop}`]);
+
+  // 兜底那一帧的显示尺寸：可视区里按「铺满（会放大）」还是「只封顶」算。
+  function fallbackSize(natW, natH) {
+    const raw = Math.min(availW / natW, availH / natH);
+    const s = fallbackUpscales ? raw : Math.min(raw, 1);
+    return { w: natW * s, h: natH * s };
+  }
+
+  // 两个场景都要跑：**比面板大**的（长图）与**比面板小**的（小图）。
+  // 只测长图的话，「兜底放大」这一支永远走不到 —— 小图才是出问题的那个。
+  const SCENARIOS = [
+    { name: "长图 572×7191（比面板大）", nat: { w: 572, h: 7191 } },
+    { name: "小图 120×90（比面板小）", nat: { w: 120, h: 90 } },
+  ];
+
+  for (const sc of SCENARIOS) {
+    api.resetZoom();
+    api.imgNatural.value = { w: sc.nat.w, h: sc.nat.h };
+    api.measureView();
+    const st = api.frameStyle.value;
+    const pic = api.pictureStyle.value;
+    const finalW = Number.parseFloat(pic.width);
+    const finalH = Number.parseFloat(pic.height);
+    const fbSize = fallbackSize(sc.nat.w, sc.nat.h);
+
+    check(`${sc.name}：兜底的显示尺寸 == fit 档的内联尺寸（±1px）`,
+      Math.abs(fbSize.w - finalW) <= 1 && Math.abs(fbSize.h - finalH) <= 1,
+      [`兜底 ${fbSize.w.toFixed(1)}×${fbSize.h.toFixed(1)} vs fit ${finalW}×${finalH}`]);
+    check(`${sc.name}：兜底的左边缘 == fit 档的居中 margin（±1px）`,
+      Math.abs((availW - fbSize.w) / 2 - Number.parseFloat(st.marginLeft)) <= 1,
+      [`兜底 ${((availW - fbSize.w) / 2).toFixed(1)} vs fit ${st.marginLeft}`]);
+    check(`${sc.name}：兜底的上边缘 == fit 档的居中 margin（±1px）`,
+      Math.abs((availH - fbSize.h) / 2 - Number.parseFloat(st.marginTop)) <= 1,
+      [`兜底 ${((availH - fbSize.h) / 2).toFixed(1)} vs fit ${st.marginTop}`]);
+    check(`${sc.name}：兜底不放大（显示尺寸不超过原始像素）`,
+      fbSize.w <= sc.nat.w + 1 && fbSize.h <= sc.nat.h + 1,
+      [`兜底 ${fbSize.w.toFixed(1)}×${fbSize.h.toFixed(1)} vs 原始 ${sc.nat.w}×${sc.nat.h}`]);
+  }
+
+  // 兜底态的开关：几何算不出来时为 true（CSS 兜底接管），算出后为 false。
+  api.resetZoom();
+  check("几何未就绪时 geometryPending 为 true（走 CSS 兜底）", api.geometryPending.value === true);
+  api.imgNatural.value = { w: NAT.w, h: NAT.h };
+  api.measureView();
+  check("几何就绪后 geometryPending 为 false（用内联尺寸）", api.geometryPending.value === false);
 }
 
 section("8. 对照臂：本次事故的形状（ref 绑不上）会让上面全废");

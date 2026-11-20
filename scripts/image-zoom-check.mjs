@@ -239,29 +239,65 @@ section("7. 静态接线：组件真的用了这个模块");
   check("Shift+滚轮做横向滚动", /shiftKey/.test(src) && /scrollLeft\s*\+=/.test(src));
 }
 
-section("7b. 兜底那一帧必须已经是「适应窗口 + 居中」（否则用户看到先靠左再居中）");
+section("7b. 兜底那一帧必须与最终几何画出同一幅画面（否则会看到跳动）");
 
 {
   // 几何要等两样东西：天然像素（只有 <img> 的 load 事件才知道）与可视区
-  // 尺寸。在那之前图片走 CSS 兜底 —— 兜底必须和最终几何**画出同一幅画面**，
-  // 否则图片会从左上角滑到中间（用户报的那个现象）。
+  // 尺寸。在那之前图片走 CSS 兜底 —— 兜底必须和最终几何**画出同一幅画面**。
   //
-  // 做法：兜底盒子铺满可视区（width/height:100%）+ object-fit:contain →
-  // 内容按 fit 比例缩放并居中 —— 与 imageStyle 的 fit 档（同样尺寸、同样
-  // 居中 margin）是同一幅画面。
+  // ⚠️ 兜底**不能**用 object-fit:contain：contain 会**放大**小图并把它铺满
+  // 盒子（Chromium 157 实测：10×10 的图在 200×200 盒子里被画成 200×200，
+  // 角落像素是图的红而不是底色）。用户看到的就是「先占满面板、再缩回
+  // 1:1」—— 那正是本次修的现象。上一版把兜底从 max-* 换成 contain 就是
+  // 栽在这个前提上（注释里写着「contain does not upscale」，是错的）。
   //
-  // ⚠️ 这里**不能**用 max-width/max-height:100%：那只是「上限」，盒子会缩回
-  // 图片自身大小并贴在左上角 —— 那正是「先靠左对齐」的那一帧。
-  check("兜底盒子铺满可视区（width:100% + height:100%）",
-    /\.preview-image\s*\{[^}]*width:\s*100%[^}]*height:\s*100%/s.test(src));
-  check("兜底用 object-fit:contain（内容按比例缩放并居中，不拉伸）",
-    /\.preview-image\s*\{[^}]*object-fit:\s*contain/s.test(src));
-  check("兜底不能用 max-width/max-height（盒子会缩回图片自身大小 → 贴左上角）",
-    !/\.preview-image\s*\{[^}]*max-width/s.test(src) &&
-    !/\.preview-image\s*\{[^}]*max-height/s.test(src));
+  // 兜底要用 max-*：只封顶、不放大。小图保持 1:1（= 最终 fit 档的尺寸），
+  // 大图按比例缩到刚好装下（也是最终 fit 档的尺寸）—— 两种都同画面。
+  const styleSrc = (src.match(/<style[^>]*>([\s\S]*?)<\/style>/) || [null, ""])[1];
+  // 取出某条 CSS 规则（选择器精确匹配）的声明体。
+  // ⚠️ 不能直接正则扫全文：模板里的 Vue 绑定（:class="{ ... }"）也有花括号。
+  function cssRule(css, selector) {
+    const re = /([^{}]+)\{([^}]*)\}/g;
+    let m;
+    while ((m = re.exec(css))) {
+      const sels = m[1].trim().split(/\s*,\s*/);
+      if (sels.includes(selector)) return m[2];
+    }
+    return null;
+  }
+  const fb = cssRule(styleSrc, ".image-frame.fallback .preview-image");
+  check("兜底规则存在（.image-frame.fallback .preview-image）", fb !== null);
+  const fbBody = fb || "";
+  check("兜底用 max-width/max-height（只封顶，不放大）",
+    /max-width:\s*100%/.test(fbBody) && /max-height:\s*100%/.test(fbBody),
+    [`兜底规则：${fbBody}`]);
+  check("兜底盒尺寸交给图片自身（width:auto + height:auto，不是 100%）",
+    /^\s*width:\s*auto/m.test(fbBody) && /^\s*height:\s*auto/m.test(fbBody) &&
+    !/^\s*width:\s*100%/m.test(fbBody) && !/^\s*height:\s*100%/m.test(fbBody),
+    [`兜底规则：${fbBody}`]);
+  check("兜底不能用 object-fit:contain（会把小图放大铺满 → 先占满面板再缩小）",
+    !/object-fit:\s*contain/.test(fbBody),
+    [`兜底规则：${fbBody}`]);
+
+  // 兜底态必须真的接在「几何算不出来」这个状态上 —— 规则再对，接线断了
+  // 也等于没有（这正是上一次事故的形状：ref 绑不上，一切静默失效）。
+  check("兜底态由几何算不出来驱动（geometryPending 看 imageGeometry）",
+    /const geometryPending = computed\([\s\S]{0,120}?imageGeometry\.value/.test(src));
+  check("画框接上了兜底态的 class",
+    /class="image-frame"[^>]*:class="\{\s*fallback:\s*geometryPending\s*\}"/s.test(src));
+
+  // 已知几何那一档，画面本体**不能**有 max-*：转 90° 时画面本体的盒子比
+  // 画框大（盒子始终是未旋转的宽高），被 max-* 掐住就会被压扁变形。
+  const picRule = cssRule(styleSrc, ".preview-image");
+  check("已知几何那一档的画面本体没有 max-*（转 90° 会被压扁）",
+    picRule !== null && !/max-width/.test(picRule) && !/max-height/.test(picRule),
+    [`画面本体规则：${picRule}`]);
+  check("画面本体带 object-fit:contain（盒与图比例万一不一致也不变形）",
+    picRule !== null && /object-fit:\s*contain/.test(picRule),
+    [`画面本体规则：${picRule}`]);
 
   // ⚠️ 反过来也不能把图片**藏起来**等几何就绪：那样虽然不跳，但用户要多等
-  // 一到两帧才看到图（切换图片明显变慢）。兜底正确就不用藏。
+  // 一到两帧才看到图（切换图片明显变慢）。兜底画对了就不用藏。
   check("图片不因几何未就绪而被藏起来（藏起来会让切换图片慢一帧）",
     !/pending:\s*!imageReady/.test(src) &&
     !/\.preview-image\.pending/.test(src) &&

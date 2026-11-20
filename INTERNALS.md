@@ -65,9 +65,13 @@
 
 **「适应窗口」与「放大」共用同一套 px 几何**（`geometryFor()` 统一算尺寸与居中偏移），否则两档之间的衔接处会差一截、锚点补偿也就对不上。适应档额外保留 `max-width/max-height:100%` 兜底：万一测量晚了一帧，也不会溢出长出一条多余的滚动条。
 
-**兜底那一帧必须已经是「适应窗口 + 居中」，否则图片会从左上角滑到中间。** 几何要等两样东西：天然像素（只有 `<img>` 的 `load` 事件才知道）与可视区尺寸（要量过一次容器）；在那之前图片走 CSS 兜底。兜底是 `width/height:100%` + `object-fit:contain` —— 盒子铺满可视区，内容按 fit 比例缩放并居中，**与 fit 档（同样尺寸、同样居中 margin）画出的是同一幅画面**，所以图片一解码出来就在最终位置上，看不到任何跳动。
+**兜底那一帧必须与最终帧画出同一幅画面，否则用户会看到跳动。** 几何要等两样东西：天然像素（只有 `<img>` 的 `load` 事件才知道）与可视区尺寸（要量过一次容器）；在那之前图片走 CSS 兜底（画框上的 `.fallback` 类，几何算不出来时加上）。
 
-⚠️ 兜底**不能**用 `max-width/max-height:100%`：那只是「上限」，盒子会缩回图片自身大小（`max-width` 不撑满）并贴在左上角 —— 那正是用户报的「先靠左对齐、再跳到居中」。⚠️ 反过来也别把图片**藏起来**等几何就绪（`visibility:hidden` + 一个 `imageReady` 标志）：那样虽然不跳，但用户要多等一到两帧才看到图，切换图片明显变慢。兜底画对了就不用藏。判据：`scripts/image-zoom-check.mjs` 的 7b 小节（静态：兜底必须是 width/height:100% + contain，且不得藏图）+ `scripts/image-zoom-behavior-check.mjs` 的第 7 节（行为：兜底 contain 的显示尺寸与左/上边缘 == fit 档的内联尺寸与居中 margin，±1px）。
+⚠️ 兜底**只能封顶、不能放大**：用 `max-width/max-height:100%`（盒尺寸交给图片自身，`width:auto; height:auto`）。小图保持 1:1（= fit 档的尺寸），大图按比例缩到刚好装下（也是 fit 档的尺寸）—— 两种都与 fit 档（同样尺寸、同样居中 margin）画出同一幅画面，图片一解码出来就在最终位置上。
+
+⚠️⚠️ **兜底不能用 `object-fit:contain`**：contain 会**放大**小图并把它铺满盒子（Chromium 157 实测：10×10 的图在 200×200 盒子里被画成 200×200，角落像素是图的红而不是底色）。于是比面板小的图会「先占满面板、再缩回 1:1」—— 用户报的视觉残留。上一版兜底（`width/height:100%` + contain）就是栽在这个前提上：注释里写着「contain does not upscale」，**是错的**（`object-fit: scale-down` 这个取值的存在本身就说明 contain 会放大；scale-down 才是「contain 但不放大」，但它要 Safari 15.4+，所以这里用 max-*）。
+
+⚠️ 也别把图片**藏起来**等几何就绪（`visibility:hidden` + 一个 `imageReady` 标志）：那样虽然不跳，但用户要多等一到两帧才看到图，切换图片明显变慢。兜底画对了就不用藏。判据：`scripts/image-zoom-check.mjs` 的 7b 小节（静态：兜底必须是 max-* + `width/height:auto`，不得 contain、不得藏图，且兜底态要真的接在 `geometryPending` 上）+ `scripts/image-zoom-behavior-check.mjs` 的第 7 节（行为：**长图与小图两个场景**下，兜底的显示尺寸与左/上边缘 == fit 档的内联尺寸与居中 margin，±1px，且兜底不放大）。变异臂 31 条全中。
 
 **键盘快捷键登记在 `src/shortcuts.js`**（`image.*` 作用域），组件用 `matches()` + `markHandled()` 认领 —— 与视频预览同一套做法（window 捕获阶段）。⚠️ 键名必须与 `eventKeyName` 的产出**完全一致**：`CODE_KEYS` 把 `Equal` 映成 `"="`、`Minus` 映成 `"-"`、数字键落到 `e.key`（`"0"` / `"1"`）。写成 `"Ctrl+Equal"` 这种物理键名会永远匹配不上，**而且不报错** —— 快捷键静默失效，最难查的一类 bug。
 

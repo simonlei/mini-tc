@@ -37,10 +37,11 @@
       <!-- The scroller is a separate element so the zoom toolbar (and the
            HEIC transport controls) stay put while the picture scrolls under
            them. The picture's own size is set by `frameStyle` (the frame is
-           the picture's **rotated** footprint): in 适应窗口 mode the CSS
-           (max-width/height:100%) keeps it inside the panel, once zoomed it
-           gets an explicit px size — otherwise max-height:100% would squeeze
-           a 572×7191 long image back down to a few pixels wide. -->
+           the picture's **rotated** footprint): once the geometry is known
+           it gets an explicit px size — otherwise max-height:100% would
+           squeeze a 572×7191 long image back down to a few pixels wide.
+           Before that, the frame carries a fallback class that selects the
+           CSS fallback rule (see the stylesheet). -->
       <div
         class="image-scroll"
         :class="{ draggable: canDragImage, dragging }"
@@ -54,7 +55,9 @@
              rotated image lands exactly on the frame — the frame is what
              the scroll container measures, so 适应窗口 / centering /
              scroll extents all describe what the user actually sees. -->
-        <div class="image-frame" :style="frameStyle">
+        <!-- 兜底态 = 几何未就绪（还没拿到自然像素，或可视区还没量到）：
+             那几帧走 CSS 兜底，兜底必须与最终几何画出同一幅画面。 -->
+        <div class="image-frame" :class="{ fallback: geometryPending }" :style="frameStyle">
           <!-- Animated HEIC plays on a canvas. Swapping an <img> src per frame
                flashes (and leaks an objectURL per frame); a canvas just gets a
                drawImage per frame, which is also cheaper than a JPEG round-trip
@@ -510,6 +513,20 @@ function geometryFor(scale) {
 }
 
 const imageGeometry = computed(() => geometryFor(activeScale.value));
+
+// 几何未就绪 → 走 CSS 兜底（.image-frame.fallback）。
+//
+// ⚠️ 判据是**几何算不出来**，不是「图片还没 load」：几何要等两样东西 ——
+// 天然像素（只有 <img> 的 load 事件才知道）与可视区尺寸（要量过一次容器）。
+// 少一样都算不出来，两者都到齐才有内联尺寸。
+//
+// 兜底必须与最终几何画出**同一幅画面**，否则用户会看到「先一个样、
+// 再跳成另一个样」。这正是 79c9e80 之前的现象（先靠左对齐再居中），
+// 也是它之后的现象（先占满面板再缩回 1:1）—— 两次都栽在「兜底画的不是
+// 最终那幅画」上。见 CSS 里 .image-frame.fallback 的注释。
+const geometryPending = computed(
+  () => !imageGeometry.value.w || !imageGeometry.value.h
+);
 
 // 画框的样式：尺寸 = 旋转后的画面占位，外加居中偏移。
 //
@@ -1643,29 +1660,25 @@ watch(previewType, async (t) => {
 
 /* The picture itself.
 
-   The size comes from `imageStyle` (natural pixels × zoom), NOT from
+   The size comes from `pictureStyle` (natural pixels × zoom), NOT from
    max-width/max-height — a max-height:100% would squeeze a 572×7191
    screenshot back down to a few pixels wide, which is exactly what the
    zoom feature exists to fix. Centering is done with explicit margins
-   (also from imageStyle) so that an oversized picture stays reachable
+   (also from pictureStyle) so that an oversized picture stays reachable
    from both ends.
 
-   ⚠️ The fallback below is NOT a rough approximation — it is **exactly**
-   what the "fit window" frame renders, so the picture never jumps:
+   ⚠️ The fallback (`.image-frame.fallback` below) must draw **exactly**
+   what the "fit window" frame draws, so the picture never jumps.
 
-   The box is the whole viewport (100% × 100%) and `object-fit: contain`
-   puts the image inside it, scaled to fit and centered (contain does not
-   upscale). That is precisely the fit-scale geometry `imageStyle`
-   computes: floor(nat × min(avail/nat, 1)) at margin (avail − size)/2.
-   So the frame before the size is known (image not decoded yet, or the
-   panel not measured yet) already shows the picture centered at its
-   final size — the user never sees it slide over from the top-left.
-
-   ⚠️ It must be width/height:100%, NOT max-width/max-height:100%.
-   With max-* the box shrinks to the image's own size (max-width:100%
-   only caps it), the box sits in the top-left corner, and the picture
-   ends up off-center — that was the "first left-aligned, then centered"
-   the user reported. */
+   ⚠️⚠️ Do NOT use `object-fit: contain` for that fallback. `contain`
+   **upscales** a picture smaller than the box and fills the box with it.
+   Measured in Chromium 157: a 10×10 SVG in a 200×200 box is painted at
+   200×200 (the corner pixel is picture-red, not background). So for any
+   picture smaller than the panel the user saw it **fill the panel first
+   and then shrink to 1:1** once the geometry arrived — the "visual
+   residue" that was reported. `scale-down` (contain-or-none) is the
+   correct fit-only variant, but it needs Safari 15.4+, so the fallback
+   uses max-* instead: max-* only caps, it never enlarges. */
 /* 画框：图片**旋转后**的画面占位。
    滚动容器量的是它 —— 所以滚动范围、居中偏移、「适应窗口」描述的都是
    用户真正看到的那块画面，而不是旋转前的盒子。 */
@@ -1692,6 +1705,24 @@ watch(previewType, async (t) => {
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
+}
+
+/* 兜底态：几何未就绪（自然像素或可视区尺寸还差一样）的那几帧。
+   画框这时铺满可视区，画面本体用 max-* —— **只封顶、不放大**：
+     · 小图（比面板小）→ 保持 1:1，正好是最终 fit 档的尺寸；
+     · 大图（比面板大）→ 按比例缩到刚好装下，也就是最终 fit 档的尺寸。
+   两种情况都与 fit 档（floor(nat × min(avail/nat, 1))）画出同一幅画面，
+   所以图片一解码出来就在最终位置上，看不到任何跳动。
+
+   ⚠️ 这里**不能**用 object-fit:contain —— contain 会把小图放大铺满盒子，
+   用户看到的就是「先占满面板、再缩回 1:1」（Chromium 实测，见上）。
+   ⚠️ 也**不能**把图片藏起来等几何就绪（visibility:hidden）：那样虽然不跳，
+   但用户要多等一到两帧才看到图，切换图片明显变慢。兜底画对了就不用藏。 */
+.image-frame.fallback .preview-image {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
 }
 
 /* PDF preview */
